@@ -18,7 +18,9 @@ use tower_http::{
 };
 
 use crate::{
-    handlers::{agenthub, auth, cluster, config, health, sandboxes, snapshots, store, templates},
+    handlers::{
+        agenthub, auth, cluster, config, health, sandboxes, snapshots, store, templates, terminal,
+    },
     middleware::{auth::unified_auth, rate_limit::rate_limit},
     state::AppState,
 };
@@ -58,10 +60,13 @@ pub fn build_router(state: AppState) -> Router {
             ),
         SNAPSHOT_LONG_ROUTE_TIMEOUT,
     );
+    let terminal_router =
+        apply_ws_layers(Router::new().nest("/cubeapi/v1", build_terminal_router()));
 
     Router::new()
         .merge(standard_router)
         .merge(snapshot_long_router)
+        .merge(terminal_router)
         .with_state(state)
 }
 
@@ -359,6 +364,33 @@ fn apply_http_layers(router: Router<AppState>, timeout: Duration) -> Router<AppS
             .layer(TimeoutLayer::new(timeout))
             .layer(CompressionLayer::new())
             .layer(CorsLayer::permissive()),
+    )
+}
+
+/// Layers for the WebSocket terminal route: identical to `apply_http_layers`
+/// but WITHOUT `TimeoutLayer` — a response timeout would kill the long-lived
+/// hijacked connection (sessions legitimately stay open for hours; the
+/// handler enforces its own idle timeout instead).
+///
+/// Auth is also deliberately not applied here: browsers cannot set headers
+/// on WebSocket handshakes, so the handler validates a `token` query param
+/// itself (mirroring the callback / session logic of `unified_auth`).
+fn apply_ws_layers(router: Router<AppState>) -> Router<AppState> {
+    router.layer(
+        ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(TraceLayer::new_for_http())
+            .layer(CompressionLayer::new())
+            .layer(CorsLayer::permissive()),
+    )
+}
+
+/// Interactive terminal WebSocket. Long-lived by nature, so it lives on its
+/// own router without the 30 s `TimeoutLayer` (see `apply_ws_layers`).
+fn build_terminal_router() -> Router<AppState> {
+    Router::new().route(
+        "/sandboxes/:sandboxID/terminal/ws",
+        get(terminal::terminal_ws),
     )
 }
 

@@ -4,6 +4,7 @@
 
 use crate::cubemaster::CubeMasterClient;
 use crate::db::AgentHubStore;
+use crate::handlers::terminal::TerminalSessionTracker;
 use crate::logging::ArcLogger;
 use crate::services::AppServices;
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
@@ -32,6 +33,10 @@ pub struct AppState {
 
     /// Optional database-backed AgentHub instance store.
     pub agenthub_store: Option<AgentHubStore>,
+
+    /// Live interactive-terminal session counters backing the per-sandbox
+    /// concurrent-session cap on the terminal WebSocket endpoint.
+    pub terminal_sessions: TerminalSessionTracker,
 }
 
 impl AppState {
@@ -73,6 +78,7 @@ impl AppState {
             logger,
             config: Arc::new(config),
             agenthub_store,
+            terminal_sessions: TerminalSessionTracker::default(),
         }
     }
 }

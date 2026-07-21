@@ -79,7 +79,55 @@ If your deployment has authentication turned on, the Dashboard needs an API key 
 The admin who enabled auth generated it. See [Authentication](./authentication.md) for the full flow.
 :::
 
-## 4. Keyboard shortcuts
+## 4. Web Terminal
+
+The Dashboard ships with a built-in **interactive terminal**, so you can drop into a running sandbox's shell straight from the browser — no SDK, no SSH.
+
+### 4.1 Open a terminal
+
+Two entry points, both disabled unless the sandbox is in the **running** state (hover the button for a tooltip explaining why):
+
+- **Sandbox detail page** — the **Open Terminal** button in the header.
+- **Sandboxes list** — the terminal icon in the row actions.
+
+<!-- TODO: screenshot: terminal dialog -->
+![Web Terminal dialog](../assets/webui-terminal.png)
+
+### 4.2 What you get
+
+The dialog is a full [xterm.js](https://xtermjs.org/) terminal running a `/bin/bash` login shell as **root inside the sandbox**:
+
+- ANSI colors and cursor control (vim, htop, and friends work)
+- Copy/paste — `Ctrl+Shift+V` or right-click to paste; selecting text copies natively
+- Scrollback, window-resize sync, fullscreen toggle, and font-size `+`/`-` controls
+
+### 4.3 Sessions, reconnect, and idle timeout
+
+- **Multiple sessions** — each terminal opens its own shell; sessions to different sandboxes can coexist.
+- **Per-sandbox session cap** — a sandbox accepts at most 8 concurrent terminal sessions; further connections are rejected. Tune it with the CubeAPI env var `TERMINAL_MAX_SESSIONS_PER_SANDBOX` (default `8`).
+- **Reconnect** — on an abnormal disconnect, shell exit, or error, the dialog shows the status and offers a **Reconnect** button.
+- **Idle timeout** — a session with no input and no shell output for 30 minutes is terminated server-side; any activity resets the timer, so a session streaming output (`tail -f`, a long build) is not cut off just because you are not typing. Tune it with the CubeAPI env var `TERMINAL_IDLE_TIMEOUT_SECS` (seconds, default `1800`).
+- **Transport limits** — client WebSocket messages are capped at 64 KiB, and server-side writes carry a 10-second deadline.
+
+### 4.4 How it works
+
+Browser xterm.js ⇄ WSS ⇄ CubeAPI (`GET /cubeapi/v1/sandboxes/{sandboxID}/terminal/ws`) ⇄ CubeProxy ⇄ `envd` (port `49983`), which hosts the PTY inside the sandbox. When your deployment is behind TLS, the transport rides the same HTTPS/WSS encryption. The shell runs **root inside the sandbox only** — the same permission boundary as SDK `exec` — and is not a path to the host.
+
+### 4.5 Auth and audit
+
+- **Auth enabled** (auth callback / WebUI session login): the terminal requires the same login session; unauthorized users get `401` and can't open a session. See [Authentication](./authentication.md). Note that in WebUI-session mode the terminal endpoint enforces the session check **itself** — the other sandbox REST APIs (pause/resume/kill, etc.) are currently not session-protected in that mode, so the terminal is stricter than they are. The session credential travels in the `Sec-WebSocket-Protocol` subprotocol header (`cube-terminal.<token>`), not in the URL — tokens never appear in URLs, server access logs, or browser history. Non-browser API clients may pass `token` as a query parameter instead, but note that query tokens can land in logs.
+- **Origin check** — CubeAPI rejects WebSocket upgrade requests whose `Origin` host does not match the request host, so cross-origin browser connections get `403`.
+- **Auth disabled (open mode)**: anyone who can reach the Dashboard can open a terminal into any running sandbox — treat Dashboard access accordingly.
+- **Audit** — CubeAPI logs session open / close / timeout events with timestamp, user identity (when available), client IP, sandbox ID, and shell PID. Rejected attempts (bad token, origin mismatch, sandbox not found or not running, session limit exceeded) are audited too, with the reason and client IP.
+
+### 4.6 Known limitations
+
+- Sandboxes created with public-traffic restriction (`allowPublicTraffic=false` / traffic access token) can't use the web terminal — the traffic token isn't recoverable after creation, so the dialog shows a connection error.
+- Terminal access authenticates the user but does **not** authorize per sandbox — any authenticated user can open a terminal on any sandbox. This matches the sandbox API's current posture (no per-user sandbox ownership yet) and is tracked as future multi-tenancy work.
+- The sandbox image must include `envd` (all standard templates do).
+- Multi-container sandboxes: the shell lands in the sandbox's default environment; use normal in-sandbox tools (e.g. `docker exec`) to reach specific containers.
+
+## 5. Keyboard shortcuts
 
 The Dashboard is keyboard-friendly. The big three:
 
@@ -90,7 +138,7 @@ The Dashboard is keyboard-friendly. The big three:
 | `R` | Refetch every visible data panel |
 | `Esc` | Close any open modal or the Command Palette |
 
-## 5. Personalize it
+## 6. Personalize it
 
 Open **Settings** in the left rail:
 
@@ -100,7 +148,7 @@ Open **Settings** in the left rail:
 
 The Command Palette's ⌘K input box and the topbar have quick toggles for the same.
 
-## 6. FAQ
+## 7. FAQ
 
 **Why a separate Dashboard, not just curl?**
 Most operations (create-from-image, version matrix, node triage) are easier to discover and visualize in a UI. For automation, the Dashboard is just a thin client — every page is a call to `/cubeapi/v1/*`, which is the same E2B-compatible REST API you can hit with `curl` or the E2B SDK.
@@ -117,7 +165,7 @@ Yes — set `WEB_UI_ENABLE=0` (or unset) in `.env`. The cluster keeps running; y
 **Is the Dashboard open source? Can I run my own build?**
 Yes — it lives in `web/` of the repo, built with Vite + React + TypeScript + Tailwind. See [Self-Build Deployment](./self-build-deploy.md) and the [`web/README.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/web/README.md) for details.
 
-## 7. Next steps
+## 8. Next steps
 
 - [Quick Start](./quickstart.md) — if you haven't installed yet, get to a running Dashboard in minutes
 - [Service Management](./service-management.md) — how to start/stop/restart the `cube-sandbox-webui.service` container

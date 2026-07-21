@@ -79,7 +79,55 @@ Dashboard 是一个静态前端，由 **控制节点** 上的 nginx 容器托管
 开启鉴权的人会生成它。完整流程见 [鉴权](./authentication.md)。
 :::
 
-## 4. 键盘快捷键
+## 4. Web 终端
+
+Dashboard 内置了 **交互式 Web 终端**，你可以直接从浏览器进入运行中沙箱的 Shell——不需要 SDK，也不需要 SSH。
+
+### 4.1 打开终端
+
+有两个入口，只有在沙箱处于 **运行中（running）** 状态时可用（鼠标悬停按钮会提示原因）：
+
+- **沙箱详情页** — 页头的 **Open Terminal** 按钮。
+- **Sandboxes 列表** — 行操作里的终端图标。
+
+<!-- TODO: screenshot: terminal dialog -->
+![Web 终端弹窗](../assets/webui-terminal.png)
+
+### 4.2 终端能力
+
+弹窗是一个完整的 [xterm.js](https://xtermjs.org/) 终端，在沙箱内以 **root** 身份运行 `/bin/bash` 登录 Shell：
+
+- ANSI 颜色与光标控制（vim、htop 等都能正常用）
+- 复制 / 粘贴——`Ctrl+Shift+V` 或右键粘贴；选中文字即原生复制
+- 滚动回退、窗口大小同步、全屏切换、字体大小 `+`/`-` 调节
+
+### 4.3 会话管理、重连与空闲超时
+
+- **多会话** — 每次打开终端都会启动独立 Shell；不同沙箱的会话可以并存。
+- **单沙箱会话上限** — 每个沙箱最多同时容纳 8 个终端会话，超出的连接会被拒绝。可通过 CubeAPI 环境变量 `TERMINAL_MAX_SESSIONS_PER_SANDBOX` 调整（默认 `8`）。
+- **重连** — 异常断开、Shell 退出或出错时，弹窗会显示明确状态并提供 **Reconnect（重连）** 按钮。
+- **空闲超时** — 30 分钟既没有任何输入也没有任何 Shell 输出的会话会被服务端终止；任何活动都会重置计时器，所以 `tail -f`、长时间构建等持续输出会话不会因没敲键盘而被断开。可通过 CubeAPI 环境变量 `TERMINAL_IDLE_TIMEOUT_SECS` 调整（单位秒，默认 `1800`）。
+- **传输限制** — 客户端 WebSocket 消息上限为 64 KiB；服务端写入带有 10 秒超时。
+
+### 4.4 工作原理
+
+浏览器 xterm.js ⇄ WSS ⇄ CubeAPI（`GET /cubeapi/v1/sandboxes/{sandboxID}/terminal/ws`）⇄ CubeProxy ⇄ `envd`（端口 `49983`），由 envd 在沙箱内托管 PTY。部署启用 TLS 时，传输链路复用同一套 HTTPS/WSS 加密。Shell 只是 **沙箱内的 root**——与 SDK `exec` 的权限边界一致——并不能借此访问宿主机。
+
+### 4.5 鉴权与审计
+
+- **开启鉴权时**（auth callback / WebUI 会话登录）：终端要求相同的登录会话，未授权用户会收到 `401`，无法建立会话。详见 [鉴权](./authentication.md)。注意在 WebUI 会话模式下，终端端点是**自行强制**校验会话的——目前沙箱的其他 REST API（pause/resume/kill 等）在该模式下并未做会话保护，终端比它们更严格。会话凭证通过 `Sec-WebSocket-Protocol` 子协议头（`cube-terminal.<token>`）传输，而不是 URL——令牌不会出现在 URL、服务端访问日志或浏览器历史记录中。非浏览器 API 客户端也可以改用 `token` 查询参数，但请注意查询参数中的令牌可能落入日志。
+- **Origin 校验** — CubeAPI 会拒绝 `Origin` 主机与请求主机不一致的 WebSocket 升级请求，跨源的浏览器连接将收到 `403`。
+- **未开启鉴权（开放模式）**：任何能访问 Dashboard 的人都能对任意运行中的沙箱打开终端——请据此控制 Dashboard 的访问范围。
+- **审计** — CubeAPI 会记录会话打开 / 关闭 / 超时事件，包含时间戳、用户身份（可用时）、客户端 IP、沙箱 ID 和 Shell PID。被拒绝的尝试（令牌错误、Origin 不匹配、沙箱不存在或未运行、超出会话上限）同样会被审计，并记录原因和客户端 IP。
+
+### 4.6 已知限制
+
+- 创建时限制了公网访问的沙箱（`allowPublicTraffic=false` / 流量访问令牌）无法使用 Web 终端——流量令牌在创建后不可恢复，弹窗会显示连接错误。
+- 终端访问只做用户身份认证，**不做**按沙箱的授权——任何已认证用户都能对任意沙箱打开终端。这与当前沙箱 API 的权限模型一致（尚无按用户的沙箱归属），已纳入未来的多租户工作。
+- 沙箱镜像必须包含 `envd`（所有标准模板都已包含）。
+- 多容器沙箱：Shell 落在沙箱的默认环境中；要进入特定容器，请使用沙箱内的常规工具（如 `docker exec`）。
+
+## 5. 键盘快捷键
 
 Dashboard 对键盘很友好。最常用的三个：
 
@@ -90,7 +138,7 @@ Dashboard 对键盘很友好。最常用的三个：
 | `R` | 刷新所有可见数据面板 |
 | `Esc` | 关闭弹窗或 Command Palette |
 
-## 5. 个性化
+## 6. 个性化
 
 打开左侧栏的 **Settings**：
 
@@ -100,7 +148,7 @@ Dashboard 对键盘很友好。最常用的三个：
 
 顶栏右上角和 ⌘K 输入框里也有同样的快捷开关。
 
-## 6. 常见问题
+## 7. 常见问题
 
 **为什么还要单独做个 Dashboard，不能直接用 curl 吗？**
 绝大多数操作（从镜像创建模板、看版本矩阵、排查节点）在 UI 里更容易发现和理解。Dashboard 本质上只是 CubeAPI 的一个轻量客户端——每个页面背后都是一次 `/cubeapi/v1/*` 请求，这跟 E2B SDK、`curl` 调的是同一个 E2B 兼容 REST API。
@@ -117,7 +165,7 @@ Dashboard 对键盘很友好。最常用的三个：
 **Dashboard 是开源的吗？我能自己构建吗？**
 可以——它在仓库的 `web/` 目录里，用 Vite + React + TypeScript + Tailwind 构建。详见 [本地构建部署](./self-build-deploy.md) 和 [`web/README.md`](https://github.com/TencentCloud/CubeSandbox/blob/master/web/README.md)。
 
-## 7. 下一步
+## 8. 下一步
 
 - [快速开始](./quickstart.md) — 如果你还没安装，几分钟到能跑的 Dashboard
 - [服务管理与日志](./service-management.md) — 如何启停 / 重启 `cube-sandbox-webui.service` 容器

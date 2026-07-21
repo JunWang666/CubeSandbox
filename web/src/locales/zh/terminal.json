@@ -1,0 +1,19 @@
+{
+  "title": "终端",
+  "openTerminal": "打开终端",
+  "openDisabled": "仅沙盒运行中时可打开终端",
+  "status": {
+    "connecting": "连接中…",
+    "ready": "已连接",
+    "disconnected": "已断开",
+    "exited": "终端已退出",
+    "error": "连接出错"
+  },
+  "exitCode": "Shell 已退出，退出码 {{code}}",
+  "reconnect": "重新连接",
+  "close": "关闭",
+  "fullscreen": "切换全屏",
+  "fontSizeIncrease": "放大字体",
+  "fontSizeDecrease": "缩小字体",
+  "pasteHint": "选中即复制 · Ctrl+Shift+V 或右键粘贴"
+}

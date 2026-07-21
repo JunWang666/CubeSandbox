@@ -3921,9 +3921,10 @@ pub(crate) fn tokenized_gateway_url(url: String, token: Option<String>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
     use std::{
         fs as test_fs,
-        os::unix::fs as unix_fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3990,6 +3991,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn remove_openclaw_snapshot_unlinks_leaf_symlink_only() {
         let root = temp_test_dir("symlink-leaf");
         let outside = temp_test_dir("symlink-target");

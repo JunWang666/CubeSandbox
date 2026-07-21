@@ -111,6 +111,14 @@ impl SandboxService {
             .collect())
     }
 
+    /// Raw CubeMaster status for a sandbox. Used by liveness gates (the
+    /// terminal WebSocket endpoint) that must distinguish Running from
+    /// stopped/error states — unlike `sandbox_state_from_status`, which
+    /// collapses every non-paused status to Running for API responses.
+    pub async fn get_sandbox_status(&self, sandbox_id: &str) -> AppResult<SandboxStatus> {
+        Ok(self.fetch_sandbox_detail(sandbox_id).await?.status)
+    }
+
     pub async fn get_sandbox(&self, sandbox_id: &str) -> AppResult<SandboxDetail> {
         let d = self.fetch_sandbox_detail(sandbox_id).await?;
         let summary = self.fetch_sandbox_summary(sandbox_id, &d.host_id).await?;

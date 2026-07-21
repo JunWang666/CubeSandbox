@@ -71,6 +71,27 @@ pub struct ServerConfig {
     /// Example: mysql://cube:cube_pass@127.0.0.1:3306/cube_mvp
     #[serde(default = "default_database_url")]
     pub database_url: Option<String>,
+
+    /// Base URL of CubeProxy used to reach envd inside sandboxes via
+    /// Host-header routing (`<port>-<sandboxID>.<domain>`).
+    ///
+    /// Env var: `AGENTHUB_SANDBOX_PROXY_URL` (default "http://127.0.0.1").
+    /// Shared with the AgentHub envd path so both agree on the proxy address.
+    #[serde(default = "default_sandbox_proxy_url")]
+    pub sandbox_proxy_url: String,
+
+    /// Idle timeout for interactive terminal WebSocket sessions, in seconds.
+    /// A session with no client message and no shell output for this long
+    /// is closed (and its shell killed); any activity resets the timer.
+    /// Env var: `TERMINAL_IDLE_TIMEOUT_SECS` (default 1800).
+    #[serde(default = "default_terminal_idle_timeout_secs")]
+    pub terminal_idle_timeout_secs: u64,
+
+    /// Maximum concurrent interactive terminal WebSocket sessions per
+    /// sandbox. New connections beyond the cap are rejected with 429.
+    /// Env var: `TERMINAL_MAX_SESSIONS_PER_SANDBOX` (default 8).
+    #[serde(default = "default_terminal_max_sessions_per_sandbox")]
+    pub terminal_max_sessions_per_sandbox: usize,
 }
 
 fn default_bind() -> String {
@@ -108,6 +129,24 @@ fn default_database_url() -> Option<String> {
     std::env::var("DATABASE_URL")
         .ok()
         .or_else(default_cube_sandbox_mysql_url)
+}
+
+fn default_sandbox_proxy_url() -> String {
+    std::env::var("AGENTHUB_SANDBOX_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1".to_string())
+}
+
+fn default_terminal_idle_timeout_secs() -> u64 {
+    std::env::var("TERMINAL_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800)
+}
+
+fn default_terminal_max_sessions_per_sandbox() -> usize {
+    std::env::var("TERMINAL_MAX_SESSIONS_PER_SANDBOX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
 }
 
 fn default_cube_sandbox_mysql_url() -> Option<String> {
@@ -148,6 +187,9 @@ impl Default for ServerConfig {
             log_prefix: default_log_prefix(),
             auth_callback_url: None,
             database_url: default_database_url(),
+            sandbox_proxy_url: default_sandbox_proxy_url(),
+            terminal_idle_timeout_secs: default_terminal_idle_timeout_secs(),
+            terminal_max_sessions_per_sandbox: default_terminal_max_sessions_per_sandbox(),
         }
     }
 }
