@@ -27,9 +27,12 @@
 //   selects none — while the token-bearing entry is never selected, so the
 //   token is not echoed back.
 // - Origin check: when an `Origin` header is present (browsers always send
-//   one on WebSocket handshakes) its host[:port] must match the request
-//   `Host` header; a mismatch is rejected with 403 before the upgrade.
-//   Clients that send no Origin (curl, python, CLI) are unaffected.
+//   one on WebSocket handshakes) its hostname must match the request `Host`
+//   header; explicit ports must match as well, with a port-less `Host` read
+//   as the Origin scheme's default port (80/443) so a proxy cannot widen
+//   the check to arbitrary same-host services by stripping the port. A
+//   mismatch is rejected with 403 before the upgrade. Clients that send no
+//   Origin (curl, python, CLI) are unaffected.
 // - Session cap: at most `terminal_max_sessions_per_sandbox` concurrent
 //   sessions per sandbox (default 8); beyond the cap → 429.
 // - Frame cap: browser WebSocket messages and frames are capped at 64 KiB;
@@ -77,6 +80,15 @@ const ENVD_BASIC_AUTH: &str = "Basic cm9vdDo=";
 const ENVD_STREAM_TIMEOUT_MS: &str = "86400000"; // 24 h
 /// How long to wait for envd's start event before giving up on the session.
 const START_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for one envd HTTP call (Start / SendInput / Update /
+/// SendSignal) — *not* the long-lived Start stream, only the request up to
+/// the response headers. Without it a hung envd (or a hung CubeProxy in
+/// front of it) parks the awaiting `select!` branch in `pump_loop` forever:
+/// the idle timer, disconnect detection and output reads all stop, leaking
+/// the session slot and the sandbox shell. Once the deadline fires the
+/// caller takes the normal error path (log / `teardown_session`) and the
+/// pump keeps going or exits.
+const ENVD_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Subprotocol prefix browsers use to carry the auth token
 /// (`Sec-WebSocket-Protocol: cube-terminal.<token>`).
 const TOKEN_SUBPROTOCOL_PREFIX: &str = "cube-terminal.";
@@ -199,6 +211,50 @@ impl Drop for TerminalSessionGuard {
     }
 }
 
+/// Auth credential offered on the WebSocket handshake, mirroring the
+/// Bearer / X-API-Key split of `middleware::auth::unified_auth`: the
+/// `cube-terminal.<token>` subprotocol (then the `token` query fallback)
+/// maps to Bearer; the `X-API-Key` header maps to an API key.
+#[derive(Debug)]
+enum TerminalCredential {
+    /// `cube-terminal.<token>` subprotocol or `token` query param.
+    Bearer(String),
+    /// `X-API-Key: <key>` header.
+    ApiKey(String),
+}
+
+impl TerminalCredential {
+    /// The raw credential string, whichever transport it arrived on.
+    fn secret(&self) -> &str {
+        match self {
+            TerminalCredential::Bearer(token) => token,
+            TerminalCredential::ApiKey(key) => key,
+        }
+    }
+}
+
+/// Pull the auth credential out of the WebSocket handshake. Bearer
+/// (subprotocol, then query param — see `handshake_token`) takes priority
+/// over `X-API-Key`, exactly as in `unified_auth`; a Bearer value that
+/// trims to empty falls through to the header.
+fn handshake_credential(
+    headers: &HeaderMap,
+    query_token: Option<String>,
+) -> Option<TerminalCredential> {
+    if let Some(token) = handshake_token(headers, query_token) {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(TerminalCredential::Bearer(token.to_string()));
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| TerminalCredential::ApiKey(k.to_string()))
+}
+
 /// Pull the auth token out of the WebSocket handshake: the
 /// `cube-terminal.<token>` subprotocol (browser path) wins; the `token`
 /// query param is the documented fallback for non-browser clients.
@@ -247,11 +303,18 @@ fn offered_token_subprotocol(headers: &HeaderMap) -> bool {
 
 /// CSRF guard for browser clients: when an `Origin` header is present, its
 /// hostname must match the request `Host` header (compared
-/// case-insensitively); when both sides carry an explicit port, the ports
-/// must match too. A missing port on either side (the scheme default, or a
-/// proxy that strips the port from `Host` — e.g. nginx `proxy_set_header
-/// Host $host`) falls back to hostname-only comparison. Clients that send no
-/// Origin header (curl, python, CLI) are not checked.
+/// case-insensitively). Port rules:
+///
+/// - both sides carry an explicit port → the ports must match;
+/// - a port-less Origin (the scheme default) matches on hostname alone;
+/// - an explicit Origin port against a port-less Host (a proxy that strips
+///   the port from `Host`, e.g. nginx `proxy_set_header Host $host`) only
+///   matches when the port equals the Origin scheme's default (80/443) —
+///   anything else could be a different service merely sharing the
+///   hostname. Proxies listening on a non-default port must forward the
+///   full authority instead (`proxy_set_header Host $http_host`).
+///
+/// Clients that send no Origin header (curl, python, CLI) are not checked.
 fn origin_matches_host(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
         return true;
@@ -259,7 +322,7 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    let Some(authority) = origin_authority(origin) else {
+    let Some((scheme, authority)) = origin_parts(origin) else {
         return false;
     };
     if authority.eq_ignore_ascii_case(host) {
@@ -282,19 +345,35 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
     }
     match (o_port, h_port) {
         (Some(a), Some(b)) => a == b,
-        // One side port-less: hostname match is enough (see doc comment).
-        _ => true,
+        // Port-less Origin: scheme default, hostname match is enough.
+        (None, _) => true,
+        // Explicit Origin port vs port-less Host: the Host then *means* the
+        // scheme default port, so only that port may match (see doc
+        // comment).
+        (Some(port), None) => port.parse::<u16>().ok() == scheme_default_port(scheme),
     }
 }
 
-/// `scheme://authority/path` → `authority` (None for malformed values).
-fn origin_authority(origin: &str) -> Option<&str> {
-    let (_, rest) = origin.split_once("://")?;
+/// Default port for Origin schemes that imply one.
+fn scheme_default_port(scheme: &str) -> Option<u16> {
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("ws") {
+        Some(80)
+    } else if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss") {
+        Some(443)
+    } else {
+        None
+    }
+}
+
+/// `scheme://authority/path` → `(scheme, authority)` (None for malformed
+/// values).
+fn origin_parts(origin: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = origin.split_once("://")?;
     let authority = rest.split('/').next()?;
     if authority.is_empty() {
         None
     } else {
-        Some(authority)
+        Some((scheme, authority))
     }
 }
 
@@ -332,8 +411,8 @@ pub async fn terminal_ws(
         ));
     }
 
-    let token = handshake_token(&headers, query.token);
-    let user = match authenticate(&state, token.as_deref(), uri.path()).await {
+    let credential = handshake_credential(&headers, query.token);
+    let user = match authenticate(&state, credential.as_ref(), uri.path()).await {
         Ok(user) => user,
         Err(err) => {
             audit_log(
@@ -449,17 +528,19 @@ pub async fn terminal_ws(
     }))
 }
 
-/// Validate the handshake token (subprotocol or query param, see
-/// `handshake_token`) against whichever auth backend is configured,
-/// mirroring the middleware chain used for plain HTTP routes: auth
-/// callback first, then the simple API key (`cube_api_key`), then open
-/// mode. Returns the authenticated identity when one is known.
+/// Validate the handshake credential (subprotocol or query token mapped to
+/// Bearer, or the `X-API-Key` header — see `handshake_credential`) against
+/// whichever auth backend is configured, mirroring `unified_auth`: auth
+/// callback first (forwarding the credential on the same header the client
+/// used), then the simple API key (`cube_api_key`), then open mode.
+/// Returns the authenticated identity when one is known.
 async fn authenticate(
     state: &AppState,
-    token: Option<&str>,
+    credential: Option<&TerminalCredential>,
     request_path: &str,
 ) -> AppResult<Option<String>> {
-    let token = token.map(str::trim).filter(|t| !t.is_empty());
+    const MISSING_CREDENTIAL: &str = "Missing authentication token (cube-terminal subprotocol, \
+         token query parameter, or X-API-Key header)";
 
     if let Some(callback_url) = state
         .config
@@ -467,24 +548,26 @@ async fn authenticate(
         .as_deref()
         .filter(|u| !u.is_empty())
     {
-        let token = token.ok_or_else(|| {
-            AppError::Unauthorized(
-                "Missing authentication token (cube-terminal subprotocol or token query parameter)"
-                    .to_string(),
-            )
-        })?;
-        let resp = state
+        let credential =
+            credential.ok_or_else(|| AppError::Unauthorized(MISSING_CREDENTIAL.to_string()))?;
+        let req = state
             .http_client
             .post(callback_url)
-            .header("Authorization", format!("Bearer {}", token))
             .header("X-Request-Path", request_path)
-            .header("X-Request-Method", "GET")
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, callback_url = %callback_url, "auth callback request failed");
-                AppError::Internal(anyhow::anyhow!("Auth callback unreachable: {}", e))
-            })?;
+            .header("X-Request-Method", "GET");
+        // Forward the credential on the same header the client used, like
+        // `unified_auth` does, so the callback sees no behavioral difference
+        // between the terminal and the plain HTTP routes.
+        let req = match credential {
+            TerminalCredential::Bearer(token) => {
+                req.header("Authorization", format!("Bearer {}", token))
+            }
+            TerminalCredential::ApiKey(key) => req.header("X-API-Key", key),
+        };
+        let resp = req.send().await.map_err(|e| {
+            tracing::error!(error = %e, callback_url = %callback_url, "auth callback request failed");
+            AppError::Internal(anyhow::anyhow!("Auth callback unreachable: {}", e))
+        })?;
         if resp.status().as_u16() == 200 {
             // The callback only answers allow/deny; the caller's identity is
             // not known to CubeAPI in this mode.
@@ -501,13 +584,9 @@ async fn authenticate(
         .as_deref()
         .filter(|k| !k.is_empty())
     {
-        let token = token.ok_or_else(|| {
-            AppError::Unauthorized(
-                "Missing authentication token (cube-terminal subprotocol or token query parameter)"
-                    .to_string(),
-            )
-        })?;
-        if token != expected_key {
+        let credential =
+            credential.ok_or_else(|| AppError::Unauthorized(MISSING_CREDENTIAL.to_string()))?;
+        if credential.secret() != expected_key {
             return Err(AppError::Unauthorized(
                 "Invalid API key or token".to_string(),
             ));
@@ -634,19 +713,27 @@ fn envd_url(state: &AppState, method: &str) -> String {
 /// envelope. Failures are best-effort by design — a 404 simply means the
 /// process already exited — so callers log and carry on.
 async fn envd_unary(state: &AppState, host: &str, method: &str, body: Value) -> AppResult<()> {
-    let resp = state
-        .http_client
-        .post(envd_url(state, method))
-        .header("Host", host)
-        .header("Content-Type", "application/json")
-        .header("Connect-Protocol-Version", "1")
-        .header("Authorization", ENVD_BASIC_AUTH)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("envd {} request failed: {}", method, e))
-        })?;
+    let resp = tokio::time::timeout(
+        ENVD_CALL_TIMEOUT,
+        state
+            .http_client
+            .post(envd_url(state, method))
+            .header("Host", host)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .header("Authorization", ENVD_BASIC_AUTH)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Internal(anyhow::anyhow!(
+            "envd {} request timed out after {:?}",
+            method,
+            ENVD_CALL_TIMEOUT
+        ))
+    })?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("envd {} request failed: {}", method, e)))?;
 
     if !resp.status().is_success() {
         return Err(AppError::Internal(anyhow::anyhow!(
@@ -679,21 +766,30 @@ async fn envd_start(
     });
     let body = connect_envelope(&serde_json::to_vec(&payload).map_err(anyhow::Error::from)?);
 
-    let resp = state
-        .http_client
-        .post(envd_url(state, "Start"))
-        .header("Host", host)
-        .header("Content-Type", CONNECT_JSON)
-        .header("Connect-Protocol-Version", "1")
-        .header("Connect-Content-Encoding", "identity")
-        .header("Connect-Timeout-Ms", ENVD_STREAM_TIMEOUT_MS)
-        .header("Authorization", ENVD_BASIC_AUTH)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("envd terminal start request failed: {}", e))
-        })?;
+    let resp = tokio::time::timeout(
+        ENVD_CALL_TIMEOUT,
+        state
+            .http_client
+            .post(envd_url(state, "Start"))
+            .header("Host", host)
+            .header("Content-Type", CONNECT_JSON)
+            .header("Connect-Protocol-Version", "1")
+            .header("Connect-Content-Encoding", "identity")
+            .header("Connect-Timeout-Ms", ENVD_STREAM_TIMEOUT_MS)
+            .header("Authorization", ENVD_BASIC_AUTH)
+            .body(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Internal(anyhow::anyhow!(
+            "envd terminal start request timed out after {:?}",
+            ENVD_CALL_TIMEOUT
+        ))
+    })?
+    .map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("envd terminal start request failed: {}", e))
+    })?;
 
     if !resp.status().is_success() {
         return Err(AppError::Internal(anyhow::anyhow!(
@@ -1181,6 +1277,8 @@ mod tests {
     struct MockEnvd {
         spy: Arc<Mutex<EnvdSpy>>,
         stream_tx: Arc<Mutex<Option<FrameTx>>>,
+        /// When set, SendInput never responds, simulating a hung envd.
+        hang_send_input: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockEnvd {
@@ -1223,6 +1321,14 @@ mod tests {
         AxumState(mock): AxumState<MockEnvd>,
         Json(body): Json<Value>,
     ) -> Json<Value> {
+        if mock
+            .hang_send_input
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // A hung envd never answers; the client's ENVD_CALL_TIMEOUT is
+            // what unblocks the session.
+            std::future::pending::<()>().await;
+        }
         mock.spy.lock().await.send_input.push(body.clone());
         // Echo the input back as PTY output, like a real shell would.
         if let Some(pty) = body.get("input").and_then(|i| i.get("pty")).cloned() {
@@ -1253,7 +1359,10 @@ mod tests {
     }
 
     async fn spawn_mock_envd() -> (String, MockEnvd) {
-        let mock = MockEnvd::default();
+        spawn_mock_envd_with(MockEnvd::default()).await
+    }
+
+    async fn spawn_mock_envd_with(mock: MockEnvd) -> (String, MockEnvd) {
         let app = Router::new()
             .route("/process.Process/Start", post(envd_start_handler))
             .route("/process.Process/SendInput", post(envd_send_input_handler))
@@ -1804,12 +1913,21 @@ mod tests {
         // Exact match, case-insensitive host.
         assert!(check(Some("http://example.com:8443"), "example.com:8443"));
         assert!(check(Some("https://EXAMPLE.com"), "example.com"));
-        // nginx-style port-less Host vs ported Origin (one-click webui proxy).
-        assert!(check(Some("http://example.com:12088"), "example.com"));
-        // Port-less Origin vs ported Host.
+        // Port-less Origin (scheme default) matches on hostname alone.
         assert!(check(Some("http://example.com"), "example.com:3000"));
+        // An explicit port equal to the scheme default is the same as
+        // port-less, even against a port-less Host.
+        assert!(check(Some("http://example.com:80"), "example.com"));
+        assert!(check(Some("https://example.com:443"), "example.com"));
+        // An explicit non-default Origin port vs a port-less Host must NOT
+        // match: a proxy that strips the port (`proxy_set_header Host
+        // $host`) must not widen the check to other same-host services.
+        // Such proxies must forward the full authority (`Host $http_host`).
+        assert!(!check(Some("http://example.com:12088"), "example.com"));
+        assert!(!check(Some("https://example.com:80"), "example.com"));
         // Both ported: ports must agree.
         assert!(!check(Some("http://example.com:12088"), "example.com:3000"));
+        assert!(check(Some("http://example.com:12088"), "example.com:12088"));
         // Different hostnames never match, even port-less.
         assert!(!check(Some("http://evil.com"), "example.com"));
         assert!(!check(Some("http://example.com.evil.com"), "example.com"));
@@ -1925,5 +2043,170 @@ mod tests {
         // The oversized payload must never reach envd.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(mock.spy.lock().await.send_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hung_envd_call_times_out_and_the_pump_survives() {
+        let hanging = MockEnvd::default();
+        hanging
+            .hang_send_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (proxy_url, mock) = spawn_mock_envd_with(hanging).await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let app = spawn_app(test_config(&proxy_url, &master_url)).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("websocket upgrade should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        // This input hangs inside envd forever. The envd call deadline
+        // (ENVD_CALL_TIMEOUT) must bound the stall: afterwards the pump
+        // must keep pumping instead of wedging the select loop (idle timer,
+        // disconnect detection, output reads).
+        let input_b64 = BASE64.encode("echo hi\n");
+        ws.send(tungstenite::Message::Text(
+            json!({"type": "input", "data": input_b64}).to_string(),
+        ))
+        .await
+        .expect("send input");
+
+        // Shell output produced while SendInput is stuck must still be
+        // delivered once the deadline fires.
+        mock.push_frame(json!({"event": {"data": {"pty": BASE64.encode("tick")}}}))
+            .await;
+        let msg = tokio::time::timeout(ENVD_CALL_TIMEOUT + Duration::from_secs(15), ws.next())
+            .await
+            .expect("pump must recover after the envd call deadline")
+            .expect("ws stream ended unexpectedly")
+            .expect("ws read error");
+        let tungstenite::Message::Text(text) = msg else {
+            panic!("expected text message, got {:?}", msg);
+        };
+        let output: Value = serde_json::from_str(&text).expect("message JSON");
+        assert_eq!(output["type"], json!("output"));
+
+        // And teardown still reaps the shell afterwards.
+        ws.close(None).await.expect("close websocket");
+        let signal =
+            wait_for_recorded(first_of(&mock.spy, |s| s.send_signal.first().cloned())).await;
+        assert_eq!(signal["signal"], json!("SIGNAL_SIGKILL"));
+    }
+
+    #[tokio::test]
+    async fn handshake_is_rate_limited_when_auth_is_configured() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.cube_api_key = Some("secret-key".to_string());
+        // One request per second per key: the first handshake drains the
+        // bucket, the second must be rejected with 429 before reaching the
+        // handler — the terminal route carries the same rate limit as the
+        // other sandbox routes.
+        config.rate_limit_per_sec = 1;
+        let app = spawn_app(config).await;
+
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=wrong-key")).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=wrong-key")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_auth_accepts_x_api_key_header() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let (callback_url, captured) = spawn_auth_callback(StatusCode::OK).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        let app = spawn_app(config).await;
+
+        // Non-browser client style: an X-API-Key header and no token
+        // anywhere else.
+        let request =
+            tungstenite::ClientRequestBuilder::new(ws_url(&app, "").parse().expect("uri"))
+                .with_header("X-API-Key", "good-key");
+        let (mut ws, _resp) = connect_async(request)
+            .await
+            .expect("x-api-key handshake should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        // The callback received the credential on X-API-Key (not Bearer),
+        // exactly like unified_auth forwards it for the HTTP routes.
+        let guard = captured.lock().await;
+        let header = |name: &str| {
+            guard
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(header("x-api-key").as_deref(), Some("good-key"));
+        assert_eq!(header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn bearer_token_takes_priority_over_x_api_key() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let (callback_url, captured) = spawn_auth_callback(StatusCode::OK).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        let app = spawn_app(config).await;
+
+        // Both credential transports present: Bearer wins, mirroring
+        // unified_auth's extraction order.
+        let request = tungstenite::ClientRequestBuilder::new(
+            ws_url(&app, "?token=good-token").parse().expect("uri"),
+        )
+        .with_header("X-API-Key", "other-key");
+        let (mut ws, _resp) = connect_async(request)
+            .await
+            .expect("handshake should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        let guard = captured.lock().await;
+        let header = |name: &str| {
+            guard
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            header("authorization").as_deref(),
+            Some("Bearer good-token")
+        );
+        assert_eq!(header("x-api-key"), None);
+    }
+
+    #[tokio::test]
+    async fn simple_key_auth_accepts_x_api_key_header() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.cube_api_key = Some("secret-key".to_string());
+        let app = spawn_app(config).await;
+
+        // Wrong key → 401 before upgrade.
+        let request =
+            tungstenite::ClientRequestBuilder::new(ws_url(&app, "").parse().expect("uri"))
+                .with_header("X-API-Key", "wrong-key");
+        expect_upgrade_error(connect_async(request).await, StatusCode::UNAUTHORIZED);
+
+        // Matching key → upgrade succeeds with no token param at all.
+        let request =
+            tungstenite::ClientRequestBuilder::new(ws_url(&app, "").parse().expect("uri"))
+                .with_header("X-API-Key", "secret-key");
+        let (mut ws, _resp) = connect_async(request)
+            .await
+            .expect("x-api-key handshake should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
     }
 }

@@ -115,8 +115,8 @@ Dashboard 内置了 **交互式 Web 终端**，你可以直接从浏览器进入
 
 ### 4.5 鉴权与审计
 
-- **开启鉴权时**（auth callback / WebUI 会话登录）：终端要求相同的登录会话，未授权用户会收到 `401`，无法建立会话。详见 [鉴权](./authentication.md)。注意在 WebUI 会话模式下，终端端点是**自行强制**校验会话的——目前沙箱的其他 REST API（pause/resume/kill 等）在该模式下并未做会话保护，终端比它们更严格。会话凭证通过 `Sec-WebSocket-Protocol` 子协议头（`cube-terminal.<token>`）传输，而不是 URL——令牌不会出现在 URL、服务端访问日志或浏览器历史记录中。非浏览器 API 客户端也可以改用 `token` 查询参数，但请注意查询参数中的令牌可能落入日志。
-- **Origin 校验** — CubeAPI 会拒绝 `Origin` 主机与请求主机不一致的 WebSocket 升级请求，跨源的浏览器连接将收到 `403`。
+- **开启鉴权时**（auth callback / WebUI 会话登录）：终端要求相同的登录会话，未授权用户会收到 `401`，无法建立会话。详见 [鉴权](./authentication.md)。注意在 WebUI 会话模式下，终端端点是**自行强制**校验会话的——目前沙箱的其他 REST API（pause/resume/kill 等）在该模式下并未做会话保护，终端比它们更严格。会话凭证通过 `Sec-WebSocket-Protocol` 子协议头（`cube-terminal.<token>`）传输，而不是 URL——令牌不会出现在 URL、服务端访问日志或浏览器历史记录中。非浏览器 API 客户端也可以改用 `token` 查询参数——CubeAPI 自身的请求日志会对终端路由剔除查询字符串，但前置代理仍可能记录它。
+- **Origin 校验** — CubeAPI 会拒绝 `Origin` 主机与请求主机不一致的 WebSocket 升级请求，跨源的浏览器连接将收到 `403`。端口规则：`Origin` 不带端口（即 scheme 默认端口）时仅按主机名匹配；`Origin` 带显式端口时必须与请求 `Host` 的端口一致——`Host` 不带端口时按 scheme 默认端口（80/443）处理。如果在**非默认端口**上用反向代理前置 CubeAPI，请转发完整的 authority 以保留端口（nginx 用 `proxy_set_header Host $http_host;`）；`proxy_set_header Host $host;` 会丢掉端口，导致非默认端口的 Origin 被拒绝。
 - **未开启鉴权（开放模式）**：任何能访问 Dashboard 的人都能对任意运行中的沙箱打开终端——请据此控制 Dashboard 的访问范围。
 - **审计** — CubeAPI 会记录会话打开 / 关闭 / 超时事件，包含时间戳、用户身份（可用时）、客户端 IP、沙箱 ID 和 Shell PID。被拒绝的尝试（令牌错误、Origin 不匹配、沙箱不存在或未运行、超出会话上限）同样会被审计，并记录原因和客户端 IP。
 
