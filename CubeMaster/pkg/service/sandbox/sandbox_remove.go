@@ -22,6 +22,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
+	volrefcount "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/refcount"
 	"github.com/tencentcloud/CubeSandbox/cubelog"
 )
 
@@ -34,6 +35,18 @@ func DestroySandbox(ctx context.Context, req *types.DeleteCubeSandboxReq) (rsp *
 			RetMsg:  errorcode.ErrorCode_Success.String(),
 		},
 	}
+	if req.SandboxID == "" {
+		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
+		rsp.Ret.RetMsg = "should provide sandbox id"
+		return
+	}
+	// Resolve before config-dependent work so invalid / ambiguous IDs fail fast.
+	if ret := normalizeSandboxIDInReq(ctx, &req.SandboxID); ret != nil {
+		rsp.Ret = ret
+		return
+	}
+	rsp.SandboxID = req.SandboxID
+
 	destroyReq := &cubebox.DestroyCubeSandboxRequest{
 		RequestID:   req.RequestID,
 		SandboxID:   req.SandboxID,
@@ -83,11 +96,6 @@ func DestroySandbox(ctx context.Context, req *types.DeleteCubeSandboxReq) (rsp *
 		}
 	}()
 	if config.GetConfig().Common.MockCreateDirect {
-		return
-	}
-	if req.SandboxID == "" {
-		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
-		rsp.Ret.RetMsg = "should provide sandbox id"
 		return
 	}
 
@@ -190,6 +198,9 @@ func callCubelet(ctx context.Context, callEp string, req *cubebox.DestroyCubeSan
 			log.G(ctx).Errorf("Destroy error:%+v", rsp)
 			return ret.Err(errorcode.MasterCode(rsp.GetRet().GetRetCode()), rsp.GetRet().GetRetMsg())
 		}
+		// Apply any node-level volume ref-count transitions (1→0) reported by
+		// Cubelet so the volume DB releases the reference held by this node.
+		volrefcount.ApplyFromExtInfo(ctx, rsp.GetExtInfo())
 	}
 
 	err := localcache.DeleteSandboxProxyMap(ctx, req.GetSandboxID())

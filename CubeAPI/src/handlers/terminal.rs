@@ -5,20 +5,19 @@
 //
 // Bridges a browser WebSocket to the envd PTY stream inside a running
 // sandbox (envd listens on ENVD_PORT and speaks Connect-RPC, reached through
-// CubeProxy via Host-header routing — the same wire protocol as
-// `agenthub::run_envd_command` and the Go SDK's `pty.go`).
+// CubeProxy via Host-header routing — the same wire protocol as the Go
+// SDK's `pty.go`).
 //
 // Sandboxes created with `allowPublicTraffic = false` require CubeProxy's
-// `e2b-traffic-access-token` header. Like `run_envd_command`, this endpoint
-// does not send one: the token is only handed out at sandbox create time
-// (CubeProxy enforces it against Redis directly), so terminal access to such
-// sandboxes is rejected by the proxy and surfaces as an error frame.
+// `e2b-traffic-access-token` header. This endpoint does not send one: the
+// token is only handed out at sandbox create time (CubeProxy enforces it
+// against Redis directly), so terminal access to such sandboxes is rejected
+// by the proxy and surfaces as an error frame.
 //
 // Hardening notes:
 //
-// - Auth token transport: browsers pass the session token as a WebSocket
-//   subprotocol (`Sec-WebSocket-Protocol: cube-terminal.<token>`; session
-//   tokens are hex UUIDs, which are valid subprotocol characters) alongside
+// - Auth token transport: browsers pass the auth token as a WebSocket
+//   subprotocol (`Sec-WebSocket-Protocol: cube-terminal.<token>`) alongside
 //   the token-free base protocol `cube-terminal`. The `token` query param
 //   remains as a documented fallback for non-browser clients (CLI scripts,
 //   curl) that can set arbitrary handshake headers anyway; the subprotocol
@@ -65,7 +64,7 @@ use crate::{
     state::AppState,
 };
 
-/// envd's Connect-RPC port inside every sandbox (same as agenthub).
+/// envd's Connect-RPC port inside every sandbox.
 const ENVD_PORT: u16 = 49983;
 /// Connect-RPC streaming content type.
 const CONNECT_JSON: &str = "application/connect+json";
@@ -453,8 +452,8 @@ pub async fn terminal_ws(
 /// Validate the handshake token (subprotocol or query param, see
 /// `handshake_token`) against whichever auth backend is configured,
 /// mirroring the middleware chain used for plain HTTP routes: auth
-/// callback first, then the WebUI session store, then open mode.
-/// Returns the authenticated identity when one is known.
+/// callback first, then the simple API key (`cube_api_key`), then open
+/// mode. Returns the authenticated identity when one is known.
 async fn authenticate(
     state: &AppState,
     token: Option<&str>,
@@ -496,19 +495,26 @@ async fn authenticate(
         ));
     }
 
-    if let Some(store) = &state.agenthub_store {
+    if let Some(expected_key) = state
+        .config
+        .cube_api_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+    {
         let token = token.ok_or_else(|| {
             AppError::Unauthorized(
                 "Missing authentication token (cube-terminal subprotocol or token query parameter)"
                     .to_string(),
             )
         })?;
-        let username = store.validate_session(token).await.map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("failed to validate session: {}", e))
-        })?;
-        return username
-            .map(Some)
-            .ok_or_else(|| AppError::Unauthorized("invalid or expired session".to_string()));
+        if token != expected_key {
+            return Err(AppError::Unauthorized(
+                "Invalid API key or token".to_string(),
+            ));
+        }
+        // Simple-key mode only proves knowledge of the shared key; the
+        // caller's identity is not known to CubeAPI in this mode.
+        return Ok(None);
     }
 
     Ok(None)
@@ -1330,7 +1336,6 @@ mod tests {
         ServerConfig {
             cubemaster_url: master_url.to_string(),
             sandbox_proxy_url: proxy_url.to_string(),
-            database_url: None,
             ..Default::default()
         }
     }

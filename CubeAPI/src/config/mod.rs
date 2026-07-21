@@ -54,29 +54,33 @@ pub struct ServerConfig {
     ///
     /// An HTTP 200 response grants access; any other status code returns 401 to the client.
     ///
-    /// **Security note**: Multiple HTTP methods (e.g. GET/POST/DELETE/PATCH) are mounted
-    /// on the same path (e.g. `/templates/:id`). Callbacks that only whitelist by path
-    /// cannot distinguish read from write/delete operations. Always validate both
-    /// `X-Request-Path` **and** `X-Request-Method` in your callback implementation.
-    ///
     /// When unset (default), all requests are allowed through without authentication.
     ///
     /// CLI flag: --auth-callback-url  |  Env var: AUTH_CALLBACK_URL
     #[serde(default)]
     pub auth_callback_url: Option<String>,
 
-    /// Optional MySQL database URL used by AgentHub persistence.
+    /// Built-in simple API key for lightweight authentication.
     ///
-    /// Env var: `DATABASE_URL`. When unset, built from `CUBE_SANDBOX_MYSQL_*`.
-    /// Example: mysql://cube:cube_pass@127.0.0.1:3306/cube_mvp
-    #[serde(default = "default_database_url")]
-    pub database_url: Option<String>,
+    /// When `auth_callback_url` is unset and this field is set, every request
+    /// (except /health) must carry either:
+    ///   - `Authorization: Bearer <token>`, or
+    ///   - `X-API-Key: <key>`
+    ///
+    /// The extracted credential is compared as a string against this value.
+    /// A match grants access; a mismatch or missing credential returns 401.
+    ///
+    /// This is mutually exclusive with `auth_callback_url`: when both are set,
+    /// `auth_callback_url` (callback mode) takes priority.
+    ///
+    /// Env var: CUBE_API_KEY
+    #[serde(default)]
+    pub cube_api_key: Option<String>,
 
     /// Base URL of CubeProxy used to reach envd inside sandboxes via
     /// Host-header routing (`<port>-<sandboxID>.<domain>`).
     ///
-    /// Env var: `AGENTHUB_SANDBOX_PROXY_URL` (default "http://127.0.0.1").
-    /// Shared with the AgentHub envd path so both agree on the proxy address.
+    /// Env var: `SANDBOX_PROXY_URL` (default "http://127.0.0.1").
     #[serde(default = "default_sandbox_proxy_url")]
     pub sandbox_proxy_url: String,
 
@@ -125,14 +129,8 @@ fn default_log_dir() -> String {
 fn default_log_prefix() -> String {
     "cube-api".to_string()
 }
-fn default_database_url() -> Option<String> {
-    std::env::var("DATABASE_URL")
-        .ok()
-        .or_else(default_cube_sandbox_mysql_url)
-}
-
 fn default_sandbox_proxy_url() -> String {
-    std::env::var("AGENTHUB_SANDBOX_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1".to_string())
+    std::env::var("SANDBOX_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1".to_string())
 }
 
 fn default_terminal_idle_timeout_secs() -> u64 {
@@ -147,19 +145,6 @@ fn default_terminal_max_sessions_per_sandbox() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8)
-}
-
-fn default_cube_sandbox_mysql_url() -> Option<String> {
-    let host = std::env::var("CUBE_SANDBOX_MYSQL_HOST").ok()?;
-    let port = std::env::var("CUBE_SANDBOX_MYSQL_PORT").unwrap_or_else(|_| "3306".to_string());
-    let user = std::env::var("CUBE_SANDBOX_MYSQL_USER").ok()?;
-    let password = std::env::var("CUBE_SANDBOX_MYSQL_PASSWORD").ok()?;
-    let database = std::env::var("CUBE_SANDBOX_MYSQL_DB").ok()?;
-
-    Some(format!(
-        "mysql://{}:{}@{}:{}/{}",
-        user, password, host, port, database
-    ))
 }
 
 impl ServerConfig {
@@ -186,7 +171,7 @@ impl Default for ServerConfig {
             log_dir: default_log_dir(),
             log_prefix: default_log_prefix(),
             auth_callback_url: None,
-            database_url: default_database_url(),
+            cube_api_key: std::env::var("CUBE_API_KEY").ok().filter(|s| !s.is_empty()),
             sandbox_proxy_url: default_sandbox_proxy_url(),
             terminal_idle_timeout_secs: default_terminal_idle_timeout_secs(),
             terminal_max_sessions_per_sandbox: default_terminal_max_sessions_per_sandbox(),

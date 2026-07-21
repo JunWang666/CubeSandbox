@@ -4,6 +4,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ENV IMAGE_ROOT=/opt/cube-image
 ENV TOOLBOX_ROOT=/usr/local/services/cubetoolbox
 ENV CUBE_COMPONENT=cubelet
+ENV PATH="/usr/local/services/cubetoolbox/cube-shim/bin:${PATH}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -23,6 +24,13 @@ RUN apt-get update \
       xfsprogs \
       iputils-ping \
     && rm -rf /var/lib/apt/lists/*
+
+# Volume plugin host tools (cosfs / coscmd / jq). Injected into the build
+# context by build-cube-images.sh from deploy/scripts/docker-install-volume-deps.sh.
+COPY docker-install-volume-deps.sh /tmp/docker-install-volume-deps.sh
+RUN chmod +x /tmp/docker-install-volume-deps.sh \
+    && /tmp/docker-install-volume-deps.sh \
+    && rm -f /tmp/docker-install-volume-deps.sh
 
 COPY package/Cubelet ${IMAGE_ROOT}/Cubelet
 COPY scripts/component-entrypoint.sh /usr/local/bin/component-entrypoint.sh

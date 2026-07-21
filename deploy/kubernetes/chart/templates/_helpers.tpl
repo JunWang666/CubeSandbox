@@ -99,6 +99,8 @@ tolerations:
 {{- end -}}
 
 {{- define "cube.pvmPlacement" -}}
+{{- $root := . -}}
+{{- $gateEnabled := eq (include "cube.startupGateEnabled" .) "true" -}}
 {{- with .Values.placement.pvm.nodeSelector }}
 nodeSelector:
   {{- toYaml . | nindent 2 }}
@@ -107,10 +109,48 @@ nodeSelector:
 affinity:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .Values.placement.pvm.tolerations }}
+{{- if .Values.placement.pvm.tolerations }}
 tolerations:
-  {{- toYaml . | nindent 2 }}
+  {{- toYaml .Values.placement.pvm.tolerations | nindent 2 }}
+  {{- if $gateEnabled }}
+  - key: {{ $root.Values.bootstrap.pvmHostKernel.startupGate.taintKey }}
+    operator: Exists
+    effect: {{ $root.Values.bootstrap.pvmHostKernel.startupGate.effect }}
+  {{- end }}
+{{- else if $gateEnabled }}
+tolerations:
+  - key: {{ $root.Values.bootstrap.pvmHostKernel.startupGate.taintKey }}
+    operator: Exists
+    effect: {{ $root.Values.bootstrap.pvmHostKernel.startupGate.effect }}
 {{- end }}
+{{- end -}}
+
+{{/* Shared env for cube-node-pvm init + hold (fingerprint + gate identity). */}}
+{{- define "cube.pvmHostCommonEnv" -}}
+- name: NODE_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: spec.nodeName
+- name: POD_NAMESPACE
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.namespace
+- name: HOST_ROOT
+  value: /host
+- name: STATE_DIR
+  value: {{ .Values.hostPaths.bootstrapState | quote }}
+- name: PVM_ENABLED
+  value: "1"
+- name: DESIRED_KERNEL_PATTERN
+  value: {{ .Values.bootstrap.pvmHostKernel.desiredKernelPattern | quote }}
+- name: KERNEL_BOOT_ARGS
+  value: {{ .Values.bootstrap.pvmHostKernel.bootArgs | quote }}
+- name: STARTUP_GATE_ENABLED
+  value: {{ ternary "true" "false" .Values.bootstrap.pvmHostKernel.startupGate.enabled | quote }}
+- name: STARTUP_GATE_TAINT_KEY
+  value: {{ .Values.bootstrap.pvmHostKernel.startupGate.taintKey | quote }}
+- name: STARTUP_GATE_TAINT_EFFECT
+  value: {{ .Values.bootstrap.pvmHostKernel.startupGate.effect | quote }}
 {{- end -}}
 
 {{/* Proxy Service FQDN and cluster-DNS enablement helpers. */}}
@@ -121,6 +161,15 @@ tolerations:
 {{- else -}}
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "cube.releaseIdentityHash" -}}
+{{- printf "%s/%s" .Release.Namespace .Release.Name | sha256sum | trunc 10 -}}
+{{- end -}}
+
+{{- define "cube.nodeClusterRoleName" -}}
+{{- $base := include "cube.fullname" . | trunc 41 | trimSuffix "-" -}}
+{{- printf "cube-node-%s-%s" $base (include "cube.releaseIdentityHash" .) -}}
 {{- end -}}
 
 {{- define "cube.masterName" -}}
@@ -137,6 +186,164 @@ tolerations:
 
 {{- define "cube.webuiName" -}}
 {{- printf "%s-webui" (include "cube.fullname" .) -}}
+{{- end -}}
+
+{{- define "cube.opsName" -}}
+{{- printf "%s-ops" (include "cube.fullname" .) -}}
+{{- end -}}
+
+{{- define "cube.opsEnabled" -}}
+{{- $ops := default dict .Values.cubeOps -}}
+{{- if and .Values.controlPlane.enabled (dig "enabled" true $ops) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsFQDN" -}}
+{{- printf "%s.%s.svc.%s" (include "cube.opsName" .) .Release.Namespace (include "cube.clusterDomain" .) -}}
+{{- end -}}
+
+{{- define "cube.opsUpstream" -}}
+{{- $override := dig "opsUpstream" "" (default dict .Values.webui) | trimSuffix "/" -}}
+{{- if $override -}}
+{{- $override -}}
+{{- else -}}
+{{- printf "http://%s:%v" (include "cube.opsFQDN" .) .Values.cubeOps.service.port -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.webuiProxyUpstream" -}}
+{{- $override := dig "proxyUpstream" "" (default dict .Values.webui) | trimSuffix "/" -}}
+{{- if $override -}}
+{{- $override -}}
+{{- else if eq (include "cube.proxyEnabled" .) "true" -}}
+{{- printf "http://%s:%v" (include "cube.proxyServiceFQDN" .) .Values.cubeProxy.ports.http.containerPort -}}
+{{- else -}}
+{{- "" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+WebUI OpenResty config: static SPA + /opsapi|/cubeapi/v1/SDK → CubeOps, optional /sandbox/ → CubeProxy.
+Rendered into cube-webui-config and checksum'd so edits roll the CloneSet.
+*/}}
+{{- define "cube.webuiNginxConf" -}}
+{{- $opsUpstream := include "cube.opsUpstream" . -}}
+{{- $proxyUpstream := include "cube.webuiProxyUpstream" . -}}
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /usr/local/openresty/nginx/conf/mime.types;
+    default_type application/octet-stream;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json application/xml;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      '';
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        location = /cubeapi {
+            return 308 /cubeapi/;
+        }
+
+        {{- if $proxyUpstream }}
+        location ^~ /sandbox/ {
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 7206s;
+            proxy_send_timeout 7206s;
+
+            proxy_pass {{ $proxyUpstream }};
+        }
+        {{- end }}
+
+        location /opsapi/ {
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+
+            proxy_pass {{ $opsUpstream }}/api/;
+        }
+
+        location /cubeapi/v1/ {
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+
+            rewrite ^/cubeapi/v1/(.*)$ /api/v1/sdk/$1 break;
+            proxy_pass {{ $opsUpstream }};
+        }
+
+        location = /health {
+            proxy_pass {{ $opsUpstream }}/health;
+        }
+
+        location ~ ^/(sandboxes|v2/sandboxes|templates|snapshots) {
+            if ($http_authorization = "") {
+                return 418;
+            }
+            add_header Vary "Authorization" always;
+            add_header Cache-Control "no-store" always;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+
+            rewrite ^/(.*)$ /api/v1/sdk/$1 break;
+            proxy_pass {{ $opsUpstream }};
+        }
+
+        error_page 418 = @spa_fallback;
+        location @spa_fallback {
+            root /usr/share/nginx/html;
+            try_files /index.html =404;
+            add_header Vary "Authorization" always;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        }
+
+        location /assets/ {
+            try_files $uri =404;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+}
 {{- end -}}
 
 {{- define "cube.nodeName" -}}
@@ -348,7 +555,7 @@ iptables -t mangle -S "${chain}" | grep -q -- "--dport 443"
 {{- end -}}
 
 {{- define "cube.secretEnabled" -}}
-{{- if or (and .Values.controlPlane.enabled (or .Values.controlPlane.master.enabled .Values.controlPlane.api.enabled)) (eq (include "cube.proxyEnabled" .) "true") (eq (include "cube.mysqlBuiltinEnabled" .) "true") (eq (include "cube.redisBuiltinEnabled" .) "true") -}}true{{- else -}}false{{- end -}}
+{{- if or (and .Values.controlPlane.enabled (or .Values.controlPlane.master.enabled .Values.controlPlane.api.enabled (eq (include "cube.opsEnabled" .) "true"))) (eq (include "cube.proxyEnabled" .) "true") (eq (include "cube.mysqlBuiltinEnabled" .) "true") (eq (include "cube.redisBuiltinEnabled" .) "true") -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 
 {{/*
@@ -375,10 +582,38 @@ change bind without editing multiple places.
 {{- end -}}
 
 {{/*
-cube-node always uses OpenKruise Advanced DaemonSet (hard dependency).
+cube-node / installer / bootstrap always use OpenKruise Advanced DaemonSet
+(hard dependency). Do NOT change this to apps/v1 — that would break InPlace
+and the other compute-plane ADS workloads.
 */}}
 {{- define "cube.nodeDaemonSetAPIVersion" -}}
 apps.kruise.io/v1beta1
+{{- end -}}
+
+{{/*
+cube-node-pvm uses a native apps/v1 DaemonSet so Pod creation does not depend
+on kruise-manager (see docs/PVM-NATIVE-DS-MIGRATION-PLAN.md).
+*/}}
+{{- define "cube.nodePvmDaemonSetAPIVersion" -}}
+apps/v1
+{{- end -}}
+
+{{- define "cube.cloneSetAPIVersion" -}}
+apps.kruise.io/v1alpha1
+{{- end -}}
+
+{{- define "cube.cloneSetUpdateStrategy" -}}
+updateStrategy:
+  {{- toYaml .Values.controlPlane.cloneSetUpdateStrategy | nindent 2 }}
+{{- end -}}
+
+{{- define "cube.startupGateEnabled" -}}
+{{- if and .Values.cubeNode.enabled .Values.bootstrap.pvmHostKernel.enabled .Values.bootstrap.pvmHostKernel.startupGate.enabled -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "cube.pvmPriorityClassName" -}}
+{{- $base := include "cube.fullname" . | trunc 42 | trimSuffix "-" -}}
+{{- default (printf "cube-pvm-%s-%s" $base (include "cube.releaseIdentityHash" .)) .Values.bootstrap.pvmHostKernel.startupGate.priorityClassName -}}
 {{- end -}}
 
 {{/*

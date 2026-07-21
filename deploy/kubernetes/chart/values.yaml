@@ -16,7 +16,7 @@ global:
   # exactly as declared. Set to e.g. "my-registry.example.com/cubesandbox"
   # to mirror all images into a private registry without editing each entry
   # individually. Applies to the pvmHostBootstrap / nodeInit / node / master
-  # / api / cubemastercli / proxy / lifecycleManager / cubeEgress /
+  # / api / ops / cubemastercli / proxy / lifecycleManager / cubeEgress /
   # cubeEgressNet / webui / cubelet / networkAgent / cubeShim / cubeKernel /
   # cubeGuest / waitNodePrep / pause entries but not to third-party images such as mysql /
   # redis / docker-in-docker / alpine/k8s.
@@ -82,6 +82,11 @@ images:
 
   api:
     repository: ccr.ccs.tencentyun.com/cubesandbox-chart/cube-api
+    tag: v0.5.1
+    pullPolicy: Always
+
+  ops:
+    repository: ccr.ccs.tencentyun.com/cubesandbox-chart/cube-ops
     tag: v0.5.1
     pullPolicy: Always
 
@@ -167,7 +172,6 @@ placement:
   # Control-plane components run only on dedicated control nodes.
   controlPlane:
     nodeSelector:
-      cube.tencent.com/role: control
       cube.tencent.com/cube-control: "true"
     tolerations:
       - key: cube.tencent.com/control
@@ -180,7 +184,6 @@ placement:
   # so non-PVM compute nodes never pull cube-pvm-host-bootstrap.
   compute:
     nodeSelector:
-      cube.tencent.com/role: compute
       cube.tencent.com/cube-node: "true"
     affinity: {}
     tolerations:
@@ -193,7 +196,6 @@ placement:
   # and do not pull the PVM bootstrap image (mixed-cluster safe).
   pvm:
     nodeSelector:
-      cube.tencent.com/role: compute
       cube.tencent.com/cube-node: "true"
       cube.tencent.com/allow-pvm-bootstrap: "true"
     affinity: {}
@@ -214,6 +216,11 @@ externalControlPlane:
 controlPlane:
   enabled: true
   namespaceScoped: true
+  # OpenKruise CloneSet is required for all stateless control-plane workloads.
+  cloneSetUpdateStrategy:
+    type: InPlaceIfPossible
+    maxUnavailable: 1
+    maxSurge: 0
 
   master:
     enabled: true
@@ -318,8 +325,8 @@ cubemastercli:
   resources: {}
 
 webui:
-  # One-click enables WebUI by default on host port 12088. In Kubernetes the
-  # chart delivers it as a Service on port 12088 and proxies /cubeapi to CubeAPI.
+  # Dashboard nginx. Proxies /opsapi and WebUI SDK paths to CubeOps.
+  # CubeAPI is a separate Service for external E2B SDK clients.
   enabled: true
   replicas: 1
   podAnnotations: {}
@@ -328,8 +335,37 @@ webui:
     port: 12088
     targetPort: 80
     annotations: {}
-  # Empty upstream uses the chart-managed CubeAPI Service.
-  upstream: ""
+  # Optional overrides (empty = chart-managed Service FQDNs).
+  opsUpstream: ""
+  proxyUpstream: ""
+  resources: {}
+
+cubeOps:
+  # Stateful ops/admin backend (JWT) + WebUI SDK proxy to CubeMaster.
+  # Required when webui.enabled=true.
+  enabled: true
+  replicas: 1
+  podAnnotations: {}
+  bind: "0.0.0.0:3010"
+  # Empty uses cubeProxy.domain for CUBE_API_SANDBOX_DOMAIN.
+  sandboxDomain: ""
+  service:
+    type: ClusterIP
+    port: 3010
+  env: []
+  probes:
+    readiness:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 12
+    liveness:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      failureThreshold: 6
   resources: {}
 
 lifecycleManager:
@@ -474,8 +510,15 @@ cubeNode:
     autoDetectEthName: true
     # Leave empty to keep auto-detection. Set to pin Cubelet eth_name.
     ethName: ""
-    # Leave empty to use packaged Cubelet config.toml CIDR. Set to patch cidr.
-    cidr: ""
+    # Cubevs/sandbox CIDR patched into Cubelet config.toml (CUBE_SANDBOX_NETWORK_CIDR).
+    # Default 172.16.0.0/18 keeps the historical /18 size while avoiding the common
+    # cluster Service CIDR 192.168.0.0/16 (and typical host LAN 192.168.x). Prefer a
+    # non-overlapping private range if this collides with your VPC (often 172.16/12).
+    # Empty falls back to the packaged Cubelet config.toml CIDR (192.168.0.0/18).
+    # Helm pre-install/pre-upgrade Hook fails fast when this overlaps Service CIDR.
+    cidr: "172.16.0.0/18"
+    # Skip host-network conflict checks (cube-node-init) and the Service CIDR
+    # preflight Hook. Use only when you accept blackhole / routing risk.
     cidrSkipConflictCheck: false
 
   dns:
@@ -570,6 +613,7 @@ cubeNodeInstaller:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
+      rollingUpdateType: Standard
       maxUnavailable: 1
   terminationGracePeriodSeconds: 15
   resources:
@@ -588,7 +632,6 @@ cubeNodeBootstrap:
   # Bump only when intentionally invalidating all nodes' prep fingerprint
   # (forces wait-node-prep to re-block until bootstrap rewrites sentinel).
   prepGeneration: "1"
-  waitTimeoutSeconds: "600"
   # How long wait-pvm-host polls pvm-host-ready on PVM-labeled nodes.
   pvmWaitTimeoutSeconds: "900"
   # Resources for Big Pod wait-node-prep sidecar.
@@ -601,6 +644,7 @@ cubeNodeBootstrap:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
+      rollingUpdateType: Standard
       maxUnavailable: 1
   terminationGracePeriodSeconds: 30
   resources:
@@ -610,8 +654,9 @@ cubeNodeBootstrap:
     limits:
       memory: "256Mi"
 
-# PVM host-kernel DaemonSet (only on placement.pvm). Bumping pvmHostBootstrap
-# recreates this DS only — not bootstrap or Big Pod.
+# PVM host-kernel DaemonSet (native apps/v1; only on placement.pvm).
+# Bumping pvmHostBootstrap recreates this DS only — not bootstrap or Big Pod.
+# Do not set rollingUpdateType here (ADS-only; validate rejects it).
 cubeNodePvm:
   podAnnotations: {}
   updateStrategy:
@@ -640,11 +685,6 @@ cubeProxy:
   domain: cube.app
   podAnnotations: {}
   replicas: 1
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
   # Optional hint for external clients / docs (not used for in-cluster DNS).
   advertiseIP: ""
   # When true, Helm patches cluster CoreDNS so *.cubeProxy.domain rewrites to
@@ -792,7 +832,8 @@ cubeEgress:
   network:
     enabled: true
     ingressInterface: cube-dev
-    tproxyOnIP: 192.168.0.1
+    # Must match cube-dev gateway (first usable IP of cubeNode.network.cidr).
+    tproxyOnIP: 172.16.0.1
     initialWaitSeconds: 300
     reapplyIntervalSeconds: 30
     probes:
@@ -868,6 +909,19 @@ bootstrap:
       leaseTTLSeconds: 900
       maxConcurrent: 1
       maxCount: 1
+    startupGate:
+      enabled: true
+      taintKey: cube.tencent.com/pvm-not-ready
+      effect: NoSchedule
+      manager: script
+      reconcileIntervalSeconds: 30
+      # Empty derives a release-scoped name, avoiding cross-release ownership conflicts.
+      priorityClassName: ""
+      priorityClassCreate: true
+      priorityValue: 1000000
+      requirePreflight: true
+      preflightTimeoutSeconds: 900
+      drainTimeoutSeconds: 300
 
   nodeInit:
     enabled: true
