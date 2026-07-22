@@ -67,6 +67,16 @@ Cube API Server sends a `POST` to your callback URL with the following headers:
 
 The two credential headers are mutually exclusive. Your callback receives whichever one the client sent.
 
+## Callback Response: Operator Identity (Optional)
+
+On an allow decision (HTTP 200), your callback may include the response header:
+
+| Header | Value |
+|--------|-------|
+| `X-Auth-User` | The authenticated operator's identity (e.g. username or email) |
+
+Today this header is consumed by the **web terminal** endpoint for audit attribution: its session audit log records the operator alongside the sandbox ID, container, and client IP. When the header is absent and the credential is a Bearer JWT, the terminal falls back to the token's `username` / `sub` / `preferred_username` / `name` claim (parsed *after* your callback has authorized the token — never for the auth decision itself). In simple-key and no-auth deployments no identity is available and the audit field stays empty.
+
 ::: warning Validate both path **and** method
 Multiple HTTP methods are mounted on the same path — for example, `/templates/:id` handles `GET` (read), `POST` (rebuild), `DELETE` (delete), and `PATCH` (update). A callback that only whitelists by path cannot distinguish a read from a destructive operation: a caller with read-only access could escalate to delete or overwrite a template.
 

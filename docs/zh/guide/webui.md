@@ -135,7 +135,7 @@ Dashboard 内置了 **交互式 Web 终端**，你可以直接从浏览器进入
 - **Origin 校验** — CubeAPI 会拒绝 `Origin` 主机与请求主机不一致的 WebSocket 升级请求，跨源的浏览器连接将收到 `403`。端口规则：`Origin` 不带端口（即 scheme 默认端口）时仅按主机名匹配；`Origin` 带显式端口时必须与请求 `Host` 的端口一致——`Host` 不带端口时按 scheme 默认端口（80/443）处理。如果在**非默认端口**上用反向代理前置 CubeAPI，请转发完整的 authority 以保留端口（nginx 用 `proxy_set_header Host $http_host;`）；`proxy_set_header Host $host;` 会丢掉端口，导致非默认端口的 Origin 被拒绝。
 - **反向代理要求** — 终端是长连接 WebSocket，前置代理必须使用 HTTP/1.1 并转发 `Upgrade`/`Connection` 头（`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade;`），且 `proxy_read_timeout` 必须大于服务端空闲超时——随附的 nginx 配置（one-click 与 Helm）按默认 1800 秒空闲超时设置为 `7206s`。两套随附配置都会把 `/cubeapi/v1/sandboxes/*/terminal/ws` 直接代理到 CubeAPI；其余 `/cubeapi/v1/*` SDK 请求仍走 CubeOps（CubeOps 没有终端路由）。
 - **可调参数（CubeAPI 环境变量）** — `SANDBOX_PROXY_URL`：CubeAPI 经 CubeProxy 连接沙箱内 envd 时使用的 CubeProxy 基础地址（默认 `http://127.0.0.1`，在 CubeProxy 共享宿主机网络的 one-click 部署中无需修改；Helm chart 会自动将其设置为 CubeProxy Service 地址）。`TERMINAL_IDLE_TIMEOUT_SECS` 与 `TERMINAL_MAX_SESSIONS_PER_SANDBOX` 见 §4.3；`TERMINAL_MAX_SESSIONS_GLOBAL` 限制所有沙箱的并发终端会话总数（默认 `128`，超出后以 `429` 拒绝）。
-- **审计** — CubeAPI 会记录会话打开 / 关闭 / 超时事件，包含时间戳、用户身份（可用时）、客户端 IP、沙箱 ID、目标容器（选择了非默认容器时）和 Shell PID。被拒绝的尝试（令牌错误、Origin 不匹配、沙箱不存在或未运行、超出会话上限）同样会被审计，并记录原因和客户端 IP。
+- **审计** — CubeAPI 会记录会话打开 / 关闭 / 超时事件，包含时间戳、用户身份（来源见下）、客户端 IP、沙箱 ID、目标容器（选择了非默认容器时）和 Shell PID。被拒绝的尝试（令牌错误、Origin 不匹配、沙箱不存在或未运行、超出会话上限）同样会被审计，并记录原因和客户端 IP。操作人身份取自鉴权回调可选的 `X-Auth-User` 响应头，缺失时回退到已授权 Bearer JWT 的 `username` / `sub` claim（CubeOps 登录令牌携带 `username`）；simple-key 与未开启鉴权的部署中该字段为空——见[鉴权](./authentication.md#回调响应操作人身份可选)。
 
 ### 4.7 已知限制
 

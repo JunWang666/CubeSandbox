@@ -67,6 +67,11 @@
 //   inherits the same platform-wide posture as the other sandbox actions
 //   (pause/resume/kill). Proper per-sandbox authorization is future
 //   cross-API multi-tenancy work.
+//   Audit attribution: in callback mode the operator identity comes from the
+//   callback's `X-Auth-User` response header, falling back to the
+//   unverified username/sub claims of the already-authorized Bearer JWT;
+//   simple-key and open modes have no identity, so their audit `user`
+//   field stays empty.
 // - Orphan reaping depends on envd's `ProcessSelector.tag` support (present
 //   in e2b-dev/infra envd 2026.16, which the CubeSandbox base image builds).
 //   Sandboxes running an older envd reject the tag reconnect, so a shell
@@ -81,7 +86,10 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -126,6 +134,13 @@ const TOKEN_SUBPROTOCOL_PREFIX: &str = "cube-terminal.";
 const TERMINAL_SUBPROTOCOL: &str = "cube-terminal";
 /// Browser WebSocket message/frame size cap (64 KiB).
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
+/// Response header an auth callback may set on its 200 response to name the
+/// operator the request was authorized for (audit attribution only).
+const AUTH_USER_HEADER: &str = "x-auth-user";
+/// Defensive cap on operator identity strings before they enter tracing
+/// fields — a compromised or buggy identity source must not spray
+/// unbounded text into the audit log.
+const MAX_IDENTITY_LEN: usize = 128;
 /// envd Connect-RPC frame size cap (4 MiB). A frame header claiming more than
 /// this is treated as a stream error — envd PTY chunks are 16 KiB, so
 /// anything near the cap is already pathological.
@@ -714,7 +729,14 @@ pub async fn terminal_ws(
 /// whichever auth backend is configured, mirroring `unified_auth`: auth
 /// callback first (forwarding the credential on the same header the client
 /// used), then the simple API key (`cube_api_key`), then open mode.
-/// Returns the authenticated identity when one is known.
+///
+/// Returns the operator identity when one is known, for the audit trail:
+/// - callback mode: the callback's `X-Auth-User` response header (the
+///   callback is the authorizing party, so an identity it vouches for is
+///   inherently trusted), falling back to the unverified claims of the
+///   already-authorized Bearer JWT (see `jwt_identity`);
+/// - simple-key mode: no identity — a shared key proves no individual;
+/// - open mode: no identity — there is no credential at all.
 async fn authenticate(
     state: &AppState,
     credential: Option<&TerminalCredential>,
@@ -770,9 +792,9 @@ async fn authenticate(
                 AppError::Internal(anyhow::anyhow!("Auth callback unreachable: {}", e))
             })?;
         if resp.status().as_u16() == 200 {
-            // The callback only answers allow/deny; the caller's identity is
-            // not known to CubeAPI in this mode.
-            return Ok(None);
+            // The callback authorized the request; attribute the session to
+            // the operator it names, else to the authorized token's claims.
+            return Ok(callback_identity(&resp).or_else(|| jwt_identity(credential)));
         }
         return Err(AppError::Unauthorized(
             "Authentication rejected by callback".to_string(),
@@ -798,6 +820,54 @@ async fn authenticate(
     }
 
     Ok(None)
+}
+
+/// Trim, reject empty, and defensively truncate an operator identity
+/// string before it enters a tracing field.
+fn sanitize_identity(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_IDENTITY_LEN).collect())
+}
+
+/// Operator identity named by the auth callback via the `X-Auth-User`
+/// response header — the preferred source: the callback is the authorizing
+/// party, so an identity it vouches for is inherently trusted.
+fn callback_identity(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(AUTH_USER_HEADER)?
+        .to_str()
+        .ok()
+        .and_then(sanitize_identity)
+}
+
+/// Best-effort operator identity from a Bearer credential that looks like a
+/// JWT (three `.`-separated segments): base64url-decode the payload and take
+/// the first non-empty string among `username`, `sub`, `preferred_username`,
+/// `name`. The signature is NOT verified — this is audit attribution only,
+/// and it is safe because the callback already authorized the request based
+/// on this very token: logging a claimed identity grants the caller no
+/// additional privilege. A non-JWT token, an undecodable payload, or a
+/// payload without usable claims all yield None — never an error, the
+/// request is never rejected over identity extraction.
+fn jwt_identity(credential: &TerminalCredential) -> Option<String> {
+    let TerminalCredential::Bearer(token) = credential else {
+        return None;
+    };
+    let mut segments = token.split('.');
+    let (Some(_header), Some(payload), Some(_signature)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return None;
+    };
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    ["username", "sub", "preferred_username", "name"]
+        .iter()
+        .filter_map(|key| claims.get(key).and_then(Value::as_str))
+        .find_map(sanitize_identity)
 }
 
 /// Whether `value` survives being placed into an HTTP header verbatim:
@@ -1826,6 +1896,15 @@ mod tests {
     type CapturedHeaders = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn spawn_auth_callback(status: StatusCode) -> (String, CapturedHeaders) {
+        spawn_auth_callback_with_headers(status, &[]).await
+    }
+
+    /// Mock auth callback that also sets the given response headers (e.g.
+    /// `X-Auth-User`) on its response.
+    async fn spawn_auth_callback_with_headers(
+        status: StatusCode,
+        response_headers: &'static [(&'static str, &'static str)],
+    ) -> (String, CapturedHeaders) {
         let captured: CapturedHeaders = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         let handler = move |req: axum::http::Request<Body>| {
@@ -1835,10 +1914,11 @@ mod tests {
                 for (k, v) in req.headers() {
                     guard.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
                 }
-                axum::http::Response::builder()
-                    .status(status)
-                    .body(Body::empty())
-                    .expect("callback response")
+                let mut builder = axum::http::Response::builder().status(status);
+                for (k, v) in response_headers {
+                    builder = builder.header(*k, *v);
+                }
+                builder.body(Body::empty()).expect("callback response")
             }
         };
         let url = spawn_server(Router::new().route("/auth", post(handler))).await;
@@ -2461,6 +2541,102 @@ mod tests {
                 .expect_err("sidecar without endpoint must 409");
             assert!(matches!(err, AppError::Conflict(_)));
         }
+    }
+
+    // ── Operator identity extraction (audit attribution) ─────────────────
+
+    /// Build an AppState pointing at the given auth callback (the
+    /// proxy/master URLs are irrelevant to `authenticate`).
+    async fn auth_state(callback_url: &str) -> AppState {
+        let mut config = test_config("http://127.0.0.1:1", "http://127.0.0.1:1");
+        config.auth_callback_url = Some(callback_url.to_string());
+        AppState::new(config, arc(NoopLogger)).await
+    }
+
+    /// CubeOps-style JWT assembled by hand: three base64url segments with a
+    /// dummy signature — the identity extractor never verifies signatures.
+    fn unsigned_jwt(payload: Value) -> String {
+        format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+        )
+    }
+
+    #[tokio::test]
+    async fn authenticate_uses_callback_x_auth_user_header() {
+        let (url, _) =
+            spawn_auth_callback_with_headers(StatusCode::OK, &[("x-auth-user", "bob")]).await;
+        let state = auth_state(&url).await;
+        let credential = TerminalCredential::Bearer("plain-token".to_string());
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("callback 200 authorizes");
+        assert_eq!(user.as_deref(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn authenticate_falls_back_to_jwt_username_claim() {
+        let (url, _) = spawn_auth_callback(StatusCode::OK).await;
+        let state = auth_state(&url).await;
+        let token = unsigned_jwt(json!({"username": "alice", "sub": "alice", "exp": 1}));
+        let credential = TerminalCredential::Bearer(token);
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("callback 200 authorizes");
+        assert_eq!(user.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn authenticate_falls_back_to_jwt_sub_claim() {
+        let (url, _) = spawn_auth_callback(StatusCode::OK).await;
+        let state = auth_state(&url).await;
+        let token = unsigned_jwt(json!({"sub": "carol", "exp": 1}));
+        let credential = TerminalCredential::Bearer(token);
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("callback 200 authorizes");
+        assert_eq!(user.as_deref(), Some("carol"));
+    }
+
+    #[tokio::test]
+    async fn authenticate_without_identity_source_still_allows() {
+        let (url, _) = spawn_auth_callback(StatusCode::OK).await;
+        let state = auth_state(&url).await;
+
+        // Not a JWT at all.
+        let credential = TerminalCredential::Bearer("not-a-jwt".to_string());
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("identity failure must not reject the request");
+        assert_eq!(user, None);
+
+        // JWT-shaped, but the payload segment is not decodable base64url.
+        let credential = TerminalCredential::Bearer("aaa.!!!.bbb".to_string());
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("identity failure must not reject the request");
+        assert_eq!(user, None);
+
+        // API-key credentials carry no identity either.
+        let credential = TerminalCredential::ApiKey("some-key".to_string());
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("identity failure must not reject the request");
+        assert_eq!(user, None);
+    }
+
+    #[tokio::test]
+    async fn authenticate_prefers_callback_header_over_jwt_claims() {
+        let (url, _) =
+            spawn_auth_callback_with_headers(StatusCode::OK, &[("x-auth-user", "bob")]).await;
+        let state = auth_state(&url).await;
+        let token = unsigned_jwt(json!({"username": "alice"}));
+        let credential = TerminalCredential::Bearer(token);
+        let user = authenticate(&state, Some(&credential), "/x")
+            .await
+            .expect("callback 200 authorizes");
+        assert_eq!(user.as_deref(), Some("bob"));
     }
 
     #[tokio::test]
