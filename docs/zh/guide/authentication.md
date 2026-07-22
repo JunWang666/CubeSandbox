@@ -75,7 +75,9 @@ Cube API Server 向回调地址发送的 `POST` 请求包含以下 header：
 |--------|---|
 | `X-Auth-User` | 已认证操作人的身份标识（如用户名或邮箱） |
 
-目前该响应头由 **Web 终端**端点消费，用于审计归因：终端会话的审计日志会把操作人与沙箱 ID、目标容器、客户端 IP 一并记录。当响应头缺失且凭证是 Bearer JWT 时，终端会回退解析 token 中的 `username` / `sub` / `preferred_username` / `name` claim（解析发生在你的回调已放行该 token **之后**，绝不参与鉴权决策本身）。simple-key 与未开启鉴权的部署中没有身份概念，审计字段保持为空。
+目前该响应头由 **Web 终端**端点消费，用于审计归因：终端会话的审计日志会把操作人与沙箱 ID、目标容器、客户端 IP 一并记录。当响应头缺失且凭证是 Bearer JWT 时，终端会在你的回调放行该 token **之后**解析其中的 `username` / `sub` / `preferred_username` / `name` claim（绝不参与鉴权决策本身），并单独记录为 `claimed_user`（`identity_source=unverified_jwt_claim`）——这是调用者自称的参考值而非已验证身份；权威的 `user` 字段（`identity_source=auth_callback`）只由 `X-Auth-User` 填充。simple-key 与未开启鉴权的部署中没有身份概念，两个字段均保持为空。
+
+**内置验证端点：** CubeOps 自带开箱可用的回调 `POST /api/v1/auth/verify`，它校验 WebUI 登录 JWT 并通过 `X-Auth-User` 返回验签后的用户名。随附部署会自动接线——one-click 默认导出 `AUTH_CALLBACK_URL=http://127.0.0.1:3010/api/v1/auth/verify`（可用自己的 URL 覆盖，或设为 `off` 关闭鉴权）；Helm chart 的 `controlPlane.api.authCallbackUrl` 默认 `"auto"`（指向 CubeOps Service；`"off"` 关闭鉴权）。未配置任何鉴权后端时，终端端点默认拒绝连接，除非显式设置 `TERMINAL_ALLOW_UNAUTHENTICATED=true`。
 
 ::: warning 必须同时校验路径**和**方法
 同一路径上挂载了多个 HTTP 方法——例如 `/templates/:id` 同时处理 `GET`（读取）、`POST`（重建）、`DELETE`（删除）和 `PATCH`（更新）。如果回调仅按路径白名单授权，则读权限可能被放大为删除或覆写操作：持有只读凭证的调用方发送 `DELETE` 请求时，路径匹配不会拦截它。
