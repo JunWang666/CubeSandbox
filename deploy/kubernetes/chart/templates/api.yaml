@@ -59,6 +59,13 @@ spec:
               value: {{ .Values.mysql.database | quote }}
             - name: CUBE_API_SANDBOX_DOMAIN
               value: {{ .Values.controlPlane.api.sandboxDomain | quote }}
+            {{- if eq (include "cube.proxyEnabled" .) "true" }}
+            # Web terminal reaches envd inside sandboxes through CubeProxy
+            # (Host-header routing); the default http://127.0.0.1 only works
+            # for one-click where CubeProxy shares the host network.
+            - name: SANDBOX_PROXY_URL
+              value: {{ printf "http://%s:%v" (include "cube.proxyServiceFQDN" .) .Values.cubeProxy.ports.http.containerPort | quote }}
+            {{- end }}
             {{- with .Values.controlPlane.api.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

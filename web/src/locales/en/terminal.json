@@ -1,5 +1,6 @@
 {
   "title": "Terminal",
+  "description": "Interactive shell session for sandbox {{id}}",
   "openTerminal": "Open Terminal",
   "openDisabled": "Terminal is available only while the sandbox is running",
   "status": {

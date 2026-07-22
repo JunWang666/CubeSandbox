@@ -1,5 +1,6 @@
 {
   "title": "终端",
+  "description": "沙盒 {{id}} 的交互式 Shell 会话",
   "openTerminal": "打开终端",
   "openDisabled": "仅沙盒运行中时可打开终端",
   "status": {

@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
-import { getSessionToken } from '@/lib/session';
+import { ensureFreshToken } from '@/lib/api';
 
 export type TerminalStatus = 'connecting' | 'ready' | 'disconnected' | 'exited' | 'error';
 
@@ -62,8 +62,7 @@ function buildWsUrl(sandboxID: string, cols: number, rows: number): string {
 // when offered subprotocols go unanswered), so the token is never echoed
 // back. Returns undefined for auth-disabled deployments (empty token) so
 // the WebSocket is constructed without protocols.
-function wsProtocols(): string[] | undefined {
-  const token = getSessionToken();
+function wsProtocols(token: string | null): string[] | undefined {
   return token ? [BASE_SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX + token] : undefined;
 }
 
@@ -93,6 +92,10 @@ export function useTerminal(sandboxID: string, open: boolean): TerminalSession {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const [status, setStatus] = useState<TerminalStatus>('connecting');
+  // Mirror of `status` readable from timeouts/ws handlers without an updater,
+  // so side effects (ws.close, setErrorMessage) stay out of setState updaters —
+  // React may invoke updaters twice under StrictMode.
+  const statusRef = useRef<TerminalStatus>('connecting');
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [session, setSession] = useState(0);
@@ -112,14 +115,19 @@ export function useTerminal(sandboxID: string, open: boolean): TerminalSession {
     if (!open || !containerEl) return;
     const container = containerEl;
 
-    setStatus('connecting');
+    const updateStatus = (next: TerminalStatus) => {
+      statusRef.current = next;
+      setStatus(next);
+    };
+    updateStatus('connecting');
     setExitCode(null);
     setErrorMessage(null);
 
     const term = new Terminal({
       cursorBlink: true,
       fontSize,
-      fontFamily: '"JetBrains Mono Variable", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace',
+      fontFamily:
+        '"JetBrains Mono Variable", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace',
       theme: {
         background: '#0b0e14',
         foreground: '#d6deeb',
@@ -163,129 +171,147 @@ export function useTerminal(sandboxID: string, open: boolean): TerminalSession {
           /* clipboard permission denied */
         });
     };
-    container.addEventListener('contextmenu', onContextMenu);
 
     let closedByUs = false;
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(buildWsUrl(sandboxID, term.cols, term.rows), wsProtocols());
-    } catch (err) {
-      setErrorMessage(String(err));
-      setStatus('error');
-      return () => {
-        term.dispose();
-        termRef.current = null;
-        fitRef.current = null;
-      };
-    }
-
-    // Watchdog: if the handshake neither succeeds nor fails promptly (e.g. a
-    // stalled proxy), surface an error with a reconnect option instead of
-    // spinning on "connecting" forever.
-    const watchdog = window.setTimeout(() => {
-      setStatus((prev) => {
-        if (prev !== 'connecting') return prev;
-        setErrorMessage(null);
-        ws.close();
-        return 'error';
-      });
-    }, CONNECT_TIMEOUT_MS);
-
-    const sendResizeNow = (cols: number, rows: number) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-      }
-    };
-
-    // Trailing-edge debounce: coalesce a burst of resizes (window drags) into
-    // one message carrying the final size, sent 100 ms after the burst settles.
+    let ws: WebSocket | null = null;
+    let watchdog: number | undefined;
     let resizeTimer: number | undefined;
     let pendingResize: { cols: number; rows: number } | null = null;
-    const sendResize = (cols: number, rows: number) => {
-      pendingResize = { cols, rows };
-      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(() => {
-        resizeTimer = undefined;
-        const pending = pendingResize;
-        pendingResize = null;
-        if (pending) sendResizeNow(pending.cols, pending.rows);
-      }, RESIZE_DEBOUNCE_MS);
-    };
+    let inputDisposable: { dispose(): void } | null = null;
+    let resizeDisposable: { dispose(): void } | null = null;
+    let observer: ResizeObserver | null = null;
 
-    const inputDisposable = term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', data: encodeBase64(data) }));
-      }
-    });
-    const resizeDisposable = term.onResize(({ cols, rows }) => sendResize(cols, rows));
+    // Connect asynchronously: refresh the access token first so a long-idle
+    // page does not fail the WS handshake on an expired token (the HTTP layer
+    // auto-refreshes on 401, but the subprotocol token bypasses it).
+    void (async () => {
+      const token = await ensureFreshToken();
+      if (closedByUs) return;
 
-    const observer = new ResizeObserver(() => {
       try {
-        fit.fit();
-      } catch {
-        /* container not laid out yet */
-      }
-    });
-    observer.observe(container);
-
-    ws.onopen = () => {
-      // Tell the server the initial size right away; any resize fired while
-      // the socket was still CONNECTING was dropped by sendResizeNow's
-      // readyState guard (and its debounced replay may also have raced ahead).
-      if (resizeTimer !== undefined) {
-        window.clearTimeout(resizeTimer);
-        resizeTimer = undefined;
-        pendingResize = null;
-      }
-      sendResizeNow(term.cols, term.rows);
-    };
-    ws.onmessage = (event) => {
-      let msg: { type?: string; data?: string; code?: number; message?: string };
-      try {
-        msg = JSON.parse(String(event.data));
-      } catch {
+        ws = new WebSocket(buildWsUrl(sandboxID, term.cols, term.rows), wsProtocols(token));
+      } catch (err) {
+        setErrorMessage(String(err));
+        updateStatus('error');
         return;
       }
-      switch (msg.type) {
-        case 'ready':
-          setStatus('ready');
-          term.focus();
-          break;
-        case 'output':
-          if (typeof msg.data === 'string') term.write(decodeBase64(msg.data));
-          break;
-        case 'exit':
-          setExitCode(typeof msg.code === 'number' ? msg.code : null);
-          setStatus('exited');
-          break;
-        case 'error':
-          setErrorMessage(msg.message ?? null);
-          setStatus('error');
-          break;
-      }
-    };
-    ws.onclose = () => {
-      if (closedByUs) return;
-      setStatus((prev) => (prev === 'exited' || prev === 'error' ? prev : 'disconnected'));
-    };
-    ws.onerror = () => {
-      if (closedByUs) return;
-      setStatus((prev) => (prev === 'ready' ? prev : 'error'));
-    };
+      const socket = ws;
+      // Server frames are JSON text; ask for ArrayBuffer (not Blob) on any
+      // stray binary frame so onmessage can detect and ignore it cheaply.
+      socket.binaryType = 'arraybuffer';
+
+      container.addEventListener('contextmenu', onContextMenu);
+
+      // Watchdog: if the handshake neither succeeds nor fails promptly (e.g. a
+      // stalled proxy), surface an error with a reconnect option instead of
+      // spinning on "connecting" forever.
+      watchdog = window.setTimeout(() => {
+        if (statusRef.current !== 'connecting') return;
+        setErrorMessage(null);
+        socket.close();
+        updateStatus('error');
+      }, CONNECT_TIMEOUT_MS);
+
+      const sendResizeNow = (cols: number, rows: number) => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'resize', cols, rows }));
+        }
+      };
+
+      // Trailing-edge debounce: coalesce a burst of resizes (window drags) into
+      // one message carrying the final size, sent 100 ms after the burst settles.
+      const sendResize = (cols: number, rows: number) => {
+        pendingResize = { cols, rows };
+        if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+        resizeTimer = window.setTimeout(() => {
+          resizeTimer = undefined;
+          const pending = pendingResize;
+          pendingResize = null;
+          if (pending) sendResizeNow(pending.cols, pending.rows);
+        }, RESIZE_DEBOUNCE_MS);
+      };
+
+      inputDisposable = term.onData((data) => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'input', data: encodeBase64(data) }));
+        }
+      });
+      resizeDisposable = term.onResize(({ cols, rows }) => sendResize(cols, rows));
+
+      observer = new ResizeObserver(() => {
+        try {
+          fit.fit();
+        } catch {
+          /* container not laid out yet */
+        }
+      });
+      observer.observe(container);
+
+      socket.onopen = () => {
+        // Tell the server the initial size right away; any resize fired while
+        // the socket was still CONNECTING was dropped by sendResizeNow's
+        // readyState guard (and its debounced replay may also have raced ahead).
+        if (resizeTimer !== undefined) {
+          window.clearTimeout(resizeTimer);
+          resizeTimer = undefined;
+          pendingResize = null;
+        }
+        sendResizeNow(term.cols, term.rows);
+      };
+      socket.onmessage = (event) => {
+        if (typeof event.data !== 'string') {
+          console.warn('[terminal] ignoring non-text WebSocket frame');
+          return;
+        }
+        let msg: { type?: string; data?: string; code?: number; message?: string };
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        switch (msg.type) {
+          case 'ready':
+            updateStatus('ready');
+            term.focus();
+            break;
+          case 'output':
+            if (typeof msg.data === 'string') term.write(decodeBase64(msg.data));
+            break;
+          case 'exit':
+            setExitCode(typeof msg.code === 'number' ? msg.code : null);
+            updateStatus('exited');
+            break;
+          case 'error':
+            setErrorMessage(msg.message ?? null);
+            updateStatus('error');
+            break;
+        }
+      };
+      socket.onclose = () => {
+        if (closedByUs) return;
+        if (statusRef.current !== 'exited' && statusRef.current !== 'error') {
+          updateStatus('disconnected');
+        }
+      };
+      socket.onerror = () => {
+        if (closedByUs) return;
+        if (statusRef.current !== 'ready') updateStatus('error');
+      };
+    })();
 
     return () => {
       closedByUs = true;
-      window.clearTimeout(watchdog);
+      if (watchdog !== undefined) window.clearTimeout(watchdog);
       if (resizeTimer !== undefined) {
         window.clearTimeout(resizeTimer);
         resizeTimer = undefined;
       }
       pendingResize = null;
-      observer.disconnect();
+      observer?.disconnect();
       container.removeEventListener('contextmenu', onContextMenu);
-      inputDisposable.dispose();
-      resizeDisposable.dispose();
-      ws.close();
+      inputDisposable?.dispose();
+      resizeDisposable?.dispose();
+      ws?.close();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;

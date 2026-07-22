@@ -62,6 +62,9 @@ export function TerminalDialog({ sandboxID, open, onOpenChange }: Props) {
                 {sandboxID}
               </span>
             </Dialog.Title>
+            <Dialog.Description className="sr-only">
+              {t('description', { id: sandboxID })}
+            </Dialog.Description>
             <span
               className={cn(
                 'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ring-1',

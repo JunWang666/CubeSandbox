@@ -1137,20 +1137,34 @@ resource "kubernetes_config_map" "cube_webui_nginx_conf" {
     labels    = { app = "cube-webui" }
   }
   data = {
-    # webui/nginx.conf has two upstream placeholders that must both be replaced,
+    # webui/nginx.conf has four upstream placeholders that must all be replaced,
     # otherwise nginx rejects the leftover literal with "invalid URL prefix".
     # webui runs inside the cluster, so it reaches the backends over the internal
     # (VPC) network via their Service ClusterIPs instead of the public CLB IPs:
-    #   __WEB_UI_UPSTREAM__        → cube-api   (the /cubeapi/ backend, port 3000)
+    #   __WEB_UI_UPSTREAM__        → cube-api   (serves /health, port 3000)
     #   __SANDBOX_PROXY_UPSTREAM__ → cube-proxy (the /sandbox/ backend, port 80)
+    #   __CUBE_API_UPSTREAM__      → cube-api   (terminal WebSocket, port 3000)
+    #   __CUBE_OPS_UPSTREAM__      → cube-api   (degraded, see below)
+    # This deployment does not run CubeOps, so the CubeOps-backed routes
+    # (/opsapi/, /cubeapi/v1/* SDK rewrite) answer 404 from cube-api — the same
+    # behavior as before this placeholder existed, but nginx can at least start
+    # and the SPA, /sandbox/, and the web terminal keep working.
     "nginx.conf" = replace(
       replace(
-        local.webui_nginx_conf,
-        "__WEB_UI_UPSTREAM__",
+        replace(
+          replace(
+            local.webui_nginx_conf,
+            "__WEB_UI_UPSTREAM__",
+            "http://${kubernetes_service.cube_api[0].spec[0].cluster_ip}:3000"
+          ),
+          "__SANDBOX_PROXY_UPSTREAM__",
+          "http://${kubernetes_service.cube_proxy[0].spec[0].cluster_ip}"
+        ),
+        "__CUBE_API_UPSTREAM__",
         "http://${kubernetes_service.cube_api[0].spec[0].cluster_ip}:3000"
       ),
-      "__SANDBOX_PROXY_UPSTREAM__",
-      "http://${kubernetes_service.cube_proxy[0].spec[0].cluster_ip}"
+      "__CUBE_OPS_UPSTREAM__",
+      "http://${kubernetes_service.cube_api[0].spec[0].cluster_ip}:3000"
     )
   }
 

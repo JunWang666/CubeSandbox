@@ -34,19 +34,36 @@
 //   mismatch is rejected with 403 before the upgrade. Clients that send no
 //   Origin (curl, python, CLI) are unaffected.
 // - Session cap: at most `terminal_max_sessions_per_sandbox` concurrent
-//   sessions per sandbox (default 8); beyond the cap → 429.
+//   sessions per sandbox (default 8) and `terminal_max_sessions_global`
+//   across all sandboxes (default 128); beyond either cap → 429.
 // - Frame cap: browser WebSocket messages and frames are capped at 64 KiB;
 //   oversized client traffic terminates the session with a protocol error.
+//   envd Connect-RPC frames are capped at 4 MiB; oversized envd frames are
+//   treated as a stream error and take the normal teardown path. PTY output
+//   is re-chunked to ≤64 KiB per client message so a burst of shell output
+//   does not arrive as one oversized WebSocket message.
 // - Write deadline: every client-bound send has a 10 s deadline so a client
 //   that stops reading cannot pin the writer task.
+// - Orphan reaping: the envd Start request carries a unique `tag`; if the
+//   Start stream fails before the start event (request timeout, truncated
+//   stream) the shell may already be running without us knowing its pid.
+//   The handler then reconnects with `Connect(process.tag)` to recover the
+//   pid and SIGKILLs it (best-effort, deadline-bounded).
 //
-// Authorization scope (known gap): authentication proves *a* valid user,
-// but there is no per-sandbox ownership or tenancy check — any
-// authenticated user can open a terminal on any sandbox. CubeAPI's sandbox
-// APIs have no per-sandbox ownership/tenancy model today, so this endpoint
-// inherits the same platform-wide posture as the other sandbox actions
-// (pause/resume/kill). Proper per-sandbox authorization is future
-// cross-API multi-tenancy work.
+// Known gaps:
+//
+// - Authorization scope: authentication proves *a* valid user,
+//   but there is no per-sandbox ownership or tenancy check — any
+//   authenticated user can open a terminal on any sandbox. CubeAPI's sandbox
+//   APIs have no per-sandbox ownership/tenancy model today, so this endpoint
+//   inherits the same platform-wide posture as the other sandbox actions
+//   (pause/resume/kill). Proper per-sandbox authorization is future
+//   cross-API multi-tenancy work.
+// - Orphan reaping depends on envd's `ProcessSelector.tag` support (present
+//   in e2b-dev/infra envd 2026.16, which the CubeSandbox base image builds).
+//   Sandboxes running an older envd reject the tag reconnect, so a shell
+//   orphaned by the failed-start window keeps running until the sandbox
+//   dies.
 
 use axum::{
     extract::{
@@ -56,6 +73,7 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,6 +82,7 @@ use std::time::Duration;
 use crate::{
     cubemaster::SandboxStatus,
     error::{AppError, AppResult},
+    middleware::auth::{constant_time_eq, AUTH_CALLBACK_TIMEOUT},
     state::AppState,
 };
 
@@ -97,6 +116,14 @@ const TOKEN_SUBPROTOCOL_PREFIX: &str = "cube-terminal.";
 const TERMINAL_SUBPROTOCOL: &str = "cube-terminal";
 /// Browser WebSocket message/frame size cap (64 KiB).
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
+/// envd Connect-RPC frame size cap (4 MiB). A frame header claiming more than
+/// this is treated as a stream error — envd PTY chunks are 16 KiB, so
+/// anything near the cap is already pathological.
+const MAX_ENVD_FRAME_SIZE: usize = 4 * 1024 * 1024;
+/// Raw PTY bytes per client output message: 48 KiB base64-encodes to exactly
+/// the 64 KiB WebSocket cap, keeping every client message within
+/// `MAX_WS_MESSAGE_SIZE` even when envd delivers a large frame.
+const OUTPUT_CHUNK_SIZE: usize = 48 * 1024;
 /// Deadline for every client-bound send — a client that stops reading must
 /// not pin the writer.
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -160,29 +187,52 @@ impl ServerMessage {
     }
 }
 
-/// Shared per-sandbox live-session counters backing the concurrent-session
-/// cap. Lives on `AppState` so every handler clone sees the same counts.
-/// Uses a std Mutex, held only for a map update and never across `.await`.
+/// Shared live-session counters backing the concurrent-session caps (per
+/// sandbox and global). Lives on `AppState` so every handler clone sees the
+/// same counts. Uses a std Mutex, held only for a map update and never
+/// across `.await`.
 #[derive(Clone, Default)]
 pub struct TerminalSessionTracker {
-    counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    inner: std::sync::Arc<std::sync::Mutex<TerminalSessionCounts>>,
+}
+
+#[derive(Default)]
+struct TerminalSessionCounts {
+    per_sandbox: std::collections::HashMap<String, usize>,
+    total: usize,
+}
+
+/// Which session cap rejected an `acquire` — used for the 429 message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCap {
+    PerSandbox,
+    Global,
 }
 
 impl TerminalSessionTracker {
-    /// Take a session slot for `sandbox_id`, or return None when the sandbox
-    /// already runs `max` live sessions. The returned guard releases the
-    /// slot exactly once on drop, covering every session exit path.
-    fn acquire(&self, sandbox_id: &str, max: usize) -> Option<TerminalSessionGuard> {
-        let mut counts = self
-            .counts
+    /// Take a session slot for `sandbox_id`, or report which cap is full.
+    /// The returned guard releases the slot exactly once on drop, covering
+    /// every session exit path.
+    fn acquire(
+        &self,
+        sandbox_id: &str,
+        max_per_sandbox: usize,
+        max_global: usize,
+    ) -> Result<TerminalSessionGuard, SessionCap> {
+        let mut inner = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = counts.entry(sandbox_id.to_string()).or_insert(0);
-        if *count >= max {
-            return None;
+        if inner.total >= max_global {
+            return Err(SessionCap::Global);
+        }
+        let count = inner.per_sandbox.entry(sandbox_id.to_string()).or_insert(0);
+        if *count >= max_per_sandbox {
+            return Err(SessionCap::PerSandbox);
         }
         *count += 1;
-        Some(TerminalSessionGuard {
+        inner.total += 1;
+        Ok(TerminalSessionGuard {
             tracker: self.clone(),
             sandbox_id: sandbox_id.to_string(),
         })
@@ -197,15 +247,16 @@ struct TerminalSessionGuard {
 
 impl Drop for TerminalSessionGuard {
     fn drop(&mut self) {
-        let mut counts = self
+        let mut inner = self
             .tracker
-            .counts
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&self.sandbox_id) {
+        inner.total = inner.total.saturating_sub(1);
+        if let Some(count) = inner.per_sandbox.get_mut(&self.sandbox_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                counts.remove(&self.sandbox_id);
+                inner.per_sandbox.remove(&self.sandbox_id);
             }
         }
     }
@@ -266,6 +317,9 @@ fn handshake_token(headers: &HeaderMap, query_token: Option<String>) -> Option<S
             v.split(',')
                 .map(str::trim)
                 .find_map(|p| p.strip_prefix(TOKEN_SUBPROTOCOL_PREFIX))
+                // A bare `cube-terminal.` entry carries no token; treat it as
+                // absent so the query-param fallback still applies.
+                .filter(|t| !t.trim().is_empty())
         })
         .map(str::to_string);
     from_subprotocol.or(query_token)
@@ -345,7 +399,14 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
     }
     match (o_port, h_port) {
         (Some(a), Some(b)) => a == b,
-        // Port-less Origin: scheme default, hostname match is enough.
+        // Port-less Origin: scheme default, hostname match is enough. This
+        // deliberate widening is safe because the terminal credential is not
+        // ambient: browsers attach it as a WebSocket subprotocol, not as a
+        // cookie, so a cross-site WebSocket hijack (CSWSH) already requires
+        // the attacker to know the token. The relaxation only gains real
+        // meaning if a proxy in front of CubeAPI injects credentials based
+        // on cookies — in that deployment the proxy must also pin the Origin
+        // port policy itself.
         (None, _) => true,
         // Explicit Origin port vs port-less Host: the Host then *means* the
         // scheme default port, so only that port may match (see doc
@@ -464,19 +525,32 @@ pub async fn terminal_ws(
     }
 
     let max_sessions = state.config.terminal_max_sessions_per_sandbox.max(1);
-    let Some(session_guard) = state.terminal_sessions.acquire(&sandbox_id, max_sessions) else {
-        audit_log(
-            "rejected",
-            &sandbox_id,
-            None,
-            user.as_deref(),
-            client_ip.as_deref(),
-            Some("session-limit"),
-        );
-        return Err(AppError::TooManyRequests(format!(
-            "sandbox {} already has {} terminal sessions",
-            sandbox_id, max_sessions
-        )));
+    let max_global = state.config.terminal_max_sessions_global.max(1);
+    let session_guard = match state
+        .terminal_sessions
+        .acquire(&sandbox_id, max_sessions, max_global)
+    {
+        Ok(guard) => guard,
+        Err(cap) => {
+            audit_log(
+                "rejected",
+                &sandbox_id,
+                None,
+                user.as_deref(),
+                client_ip.as_deref(),
+                Some("session-limit"),
+            );
+            let message = match cap {
+                SessionCap::PerSandbox => format!(
+                    "sandbox {} already has {} terminal sessions",
+                    sandbox_id, max_sessions
+                ),
+                SessionCap::Global => {
+                    "global terminal session limit reached".to_string()
+                }
+            };
+            return Err(AppError::TooManyRequests(message));
+        }
     };
 
     let idle_timeout = Duration::from_secs(state.config.terminal_idle_timeout_secs.max(1));
@@ -550,6 +624,15 @@ async fn authenticate(
     {
         let credential =
             credential.ok_or_else(|| AppError::Unauthorized(MISSING_CREDENTIAL.to_string()))?;
+        // The credential is forwarded verbatim into a request header below.
+        // A query token carrying control characters (e.g. a percent-decoded
+        // newline) would fail reqwest's header builder and surface as a 500
+        // "Auth callback unreachable" — reject it as a client error instead.
+        if !is_forwardable_header_value(credential.secret()) {
+            return Err(AppError::Unauthorized(
+                "Invalid authentication token".to_string(),
+            ));
+        }
         let req = state
             .http_client
             .post(callback_url)
@@ -564,10 +647,21 @@ async fn authenticate(
             }
             TerminalCredential::ApiKey(key) => req.header("X-API-Key", key),
         };
-        let resp = req.send().await.map_err(|e| {
-            tracing::error!(error = %e, callback_url = %callback_url, "auth callback request failed");
-            AppError::Internal(anyhow::anyhow!("Auth callback unreachable: {}", e))
-        })?;
+        // A hung callback must not park the handshake forever; the deadline
+        // matches the one unified_auth applies on the HTTP routes.
+        let resp = tokio::time::timeout(AUTH_CALLBACK_TIMEOUT, req.send())
+            .await
+            .map_err(|_| {
+                tracing::error!(callback_url = %callback_url, "auth callback request timed out");
+                AppError::Internal(anyhow::anyhow!(
+                    "Auth callback timed out after {:?}",
+                    AUTH_CALLBACK_TIMEOUT
+                ))
+            })?
+            .map_err(|e| {
+                tracing::error!(error = %e, callback_url = %callback_url, "auth callback request failed");
+                AppError::Internal(anyhow::anyhow!("Auth callback unreachable: {}", e))
+            })?;
         if resp.status().as_u16() == 200 {
             // The callback only answers allow/deny; the caller's identity is
             // not known to CubeAPI in this mode.
@@ -586,7 +680,7 @@ async fn authenticate(
     {
         let credential =
             credential.ok_or_else(|| AppError::Unauthorized(MISSING_CREDENTIAL.to_string()))?;
-        if credential.secret() != expected_key {
+        if !constant_time_eq(credential.secret(), expected_key) {
             return Err(AppError::Unauthorized(
                 "Invalid API key or token".to_string(),
             ));
@@ -597,6 +691,12 @@ async fn authenticate(
     }
 
     Ok(None)
+}
+
+/// Whether `value` survives being placed into an HTTP header verbatim:
+/// printable ASCII (space through `~`), no control characters or DEL.
+fn is_forwardable_header_value(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
 fn client_ip(headers: &HeaderMap) -> Option<String> {
@@ -670,6 +770,15 @@ impl ConnectFrameReader {
             if self.buf.len() >= 5 {
                 let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
                     as usize;
+                // A hostile or broken envd could claim a huge frame and make
+                // us buffer it unboundedly; treat oversize frames as a
+                // stream error so the session takes the normal teardown path.
+                if len > MAX_ENVD_FRAME_SIZE {
+                    return Err(AppError::Internal(anyhow::anyhow!(
+                        "envd terminal frame exceeds {} byte cap",
+                        MAX_ENVD_FRAME_SIZE
+                    )));
+                }
                 if self.buf.len() >= 5 + len {
                     let frame = ConnectFrame {
                         flags: self.buf[0],
@@ -745,12 +854,16 @@ async fn envd_unary(state: &AppState, host: &str, method: &str, body: Value) -> 
     Ok(())
 }
 
-/// POST process.Process/Start and return the streaming frame reader.
+/// POST process.Process/Start and return the streaming frame reader. The
+/// request carries a unique `tag` so a shell whose start event never reaches
+/// us (timeout / truncated stream) can still be found and killed afterwards
+/// — see `reap_shell_by_tag`.
 async fn envd_start(
     state: &AppState,
     host: &str,
     cols: u32,
     rows: u32,
+    tag: &str,
 ) -> AppResult<ConnectFrameReader> {
     let payload = json!({
         "process": {
@@ -763,6 +876,7 @@ async fn envd_start(
             },
         },
         "pty": { "size": { "rows": rows, "cols": cols } },
+        "tag": tag,
     });
     let body = connect_envelope(&serde_json::to_vec(&payload).map_err(anyhow::Error::from)?);
 
@@ -889,6 +1003,81 @@ async fn wait_for_start(reader: &mut ConnectFrameReader) -> AppResult<i64> {
         })?
 }
 
+/// Best-effort cleanup for the failure window where envd may have spawned
+/// the shell but the start event (with its pid) never reached us — the Start
+/// request timed out before response headers, `wait_for_start` timed out, or
+/// the stream was truncated. Reconnect with `Connect(process.tag)` (envd
+/// resolves the tag selector to the running process), then SIGKILL the
+/// recovered pid. envd builds without `ProcessSelector.tag` reject the
+/// reconnect and the shell keeps running — the known gap documented in the
+/// module header. Every step is deadline-bounded (ENVD_CALL_TIMEOUT /
+/// START_EVENT_TIMEOUT).
+async fn reap_shell_by_tag(state: &AppState, host: &str, sandbox_id: &str, tag: &str) {
+    match envd_pid_by_tag(state, host, tag).await {
+        Ok(Some(pid)) => {
+            if let Err(err) = envd_unary(
+                state,
+                host,
+                "SendSignal",
+                json!({"process": {"pid": pid}, "signal": "SIGNAL_SIGKILL"}),
+            )
+            .await
+            {
+                tracing::debug!(sandbox_id = %sandbox_id, pid = pid, error = %err, "terminal: orphan SIGKILL failed");
+            } else {
+                tracing::info!(sandbox_id = %sandbox_id, pid = pid, "terminal: reaped orphaned shell via tag reconnect");
+            }
+        }
+        // envd has no process for the tag: the shell never started, nothing
+        // to reap.
+        Ok(None) => {}
+        Err(err) => {
+            tracing::debug!(sandbox_id = %sandbox_id, error = %err, "terminal: tag reconnect failed, shell may be orphaned");
+        }
+    }
+}
+
+/// `Connect(process.tag)` and read the start event to recover the pid.
+/// Ok(None) when envd reports the tag unknown (HTTP 404).
+async fn envd_pid_by_tag(state: &AppState, host: &str, tag: &str) -> AppResult<Option<i64>> {
+    let payload = json!({"process": {"tag": tag}});
+    let body = connect_envelope(&serde_json::to_vec(&payload).map_err(anyhow::Error::from)?);
+    let resp = tokio::time::timeout(
+        ENVD_CALL_TIMEOUT,
+        state
+            .http_client
+            .post(envd_url(state, "Connect"))
+            .header("Host", host)
+            .header("Content-Type", CONNECT_JSON)
+            .header("Connect-Protocol-Version", "1")
+            .header("Connect-Content-Encoding", "identity")
+            .header("Authorization", ENVD_BASIC_AUTH)
+            .body(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Internal(anyhow::anyhow!(
+            "envd connect-by-tag request timed out after {:?}",
+            ENVD_CALL_TIMEOUT
+        ))
+    })?
+    .map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("envd connect-by-tag request failed: {}", e))
+    })?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "envd connect-by-tag returned HTTP {}",
+            resp.status()
+        )));
+    }
+    let mut reader = ConnectFrameReader::new(resp);
+    wait_for_start(&mut reader).await.map(Some)
+}
+
 /// Why a session is being torn down; recorded in the audit log.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
@@ -932,6 +1121,43 @@ async fn ws_close(tx: &mut futures::stream::SplitSink<WebSocket, Message>) {
     let _ = tokio::time::timeout(WS_SEND_TIMEOUT, tx.close()).await;
 }
 
+/// Forward one envd PTY data payload (base64) to the client, re-chunked so
+/// every WebSocket message stays within `MAX_WS_MESSAGE_SIZE`: decode, split
+/// the raw bytes into `OUTPUT_CHUNK_SIZE` pieces, and base64-encode each
+/// piece separately (splitting the base64 text itself could leave a client
+/// that decodes per message with a non-aligned chunk). A payload that fails
+/// to decode is forwarded as-is — envd should never send one, and the client
+/// surfaces the decode error.
+async fn send_pty_output(
+    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    data: &str,
+) -> bool {
+    let Ok(raw) = BASE64.decode(data) else {
+        return ws_send(
+            tx,
+            ServerMessage::Output {
+                data: data.to_string(),
+            }
+            .to_message(),
+        )
+        .await;
+    };
+    for chunk in raw.chunks(OUTPUT_CHUNK_SIZE) {
+        if !ws_send(
+            tx,
+            ServerMessage::Output {
+                data: BASE64.encode(chunk),
+            }
+            .to_message(),
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     socket: WebSocket,
@@ -947,7 +1173,12 @@ async fn run_session(
     let host = format!("{}-{}.{}", ENVD_PORT, sandbox_id, domain);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let mut reader = match envd_start(&state, &host, cols, rows).await {
+    // Unique tag on the Start request: if envd spawns the shell but the
+    // start event (with the pid) never reaches us, `reap_shell_by_tag` uses
+    // it to find and kill the orphaned process.
+    let tag = format!("cubeapi-terminal-{}", uuid::Uuid::new_v4());
+
+    let mut reader = match envd_start(&state, &host, cols, rows, &tag).await {
         Ok(reader) => reader,
         Err(err) => {
             tracing::warn!(sandbox_id = %sandbox_id, error = %err, "terminal: envd start failed");
@@ -960,6 +1191,7 @@ async fn run_session(
             )
             .await;
             ws_close(&mut ws_tx).await;
+            reap_shell_by_tag(&state, &host, &sandbox_id, &tag).await;
             audit_log(
                 "close",
                 &sandbox_id,
@@ -976,6 +1208,7 @@ async fn run_session(
         Ok(pid) => pid,
         Err(err) => {
             tracing::warn!(sandbox_id = %sandbox_id, error = %err, "terminal: no start event");
+            drop(reader);
             let _ = ws_send(
                 &mut ws_tx,
                 ServerMessage::Error {
@@ -985,6 +1218,7 @@ async fn run_session(
             )
             .await;
             ws_close(&mut ws_tx).await;
+            reap_shell_by_tag(&state, &host, &sandbox_id, &tag).await;
             audit_log(
                 "close",
                 &sandbox_id,
@@ -1128,7 +1362,7 @@ async fn pump_loop(
                     Ok(Some(frame)) => match parse_data_frame(&frame.payload) {
                         Ok(Some(EnvdEvent::Output(data))) => {
                             reset_idle(idle.as_mut());
-                            if !ws_send(ws_tx, ServerMessage::Output { data }.to_message()).await {
+                            if !send_pty_output(ws_tx, &data).await {
                                 return CloseReason::ClientDisconnect;
                             }
                         }
@@ -1248,7 +1482,7 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use serde_json::{json, Value};
     use std::sync::Arc;
@@ -1266,6 +1500,7 @@ mod tests {
     #[derive(Default)]
     struct EnvdSpy {
         start_payload: Option<Value>,
+        connect: Vec<Value>,
         send_input: Vec<Value>,
         update: Vec<Value>,
         send_signal: Vec<Value>,
@@ -1279,6 +1514,13 @@ mod tests {
         stream_tx: Arc<Mutex<Option<FrameTx>>>,
         /// When set, SendInput never responds, simulating a hung envd.
         hang_send_input: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, Start accepts the request (recording the payload, like a
+        /// real envd that already spawned the process) but never responds,
+        /// simulating the hung-start orphan window.
+        hang_start: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, the Start stream ends immediately without a start event,
+        /// simulating a truncated stream after the process was spawned.
+        close_stream_without_start: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockEnvd {
@@ -1286,6 +1528,13 @@ mod tests {
             if let Some(tx) = &*self.stream_tx.lock().await {
                 let bytes = serde_json::to_vec(&payload).expect("frame JSON");
                 let _ = tx.unbounded_send(Ok(connect_envelope(&bytes)));
+            }
+        }
+
+        /// Push raw bytes onto the Start stream (e.g. a malformed envelope).
+        async fn push_raw(&self, bytes: Vec<u8>) {
+            if let Some(tx) = &*self.stream_tx.lock().await {
+                let _ = tx.unbounded_send(Ok(bytes));
             }
         }
     }
@@ -1305,11 +1554,58 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body[5..]).expect("start payload JSON");
         mock.spy.lock().await.start_payload = Some(payload);
 
+        if mock
+            .hang_start
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // A hung envd never answers; the client's ENVD_CALL_TIMEOUT is
+            // what unblocks the session (and triggers the tag-based orphan
+            // cleanup, which this mock answers via the Connect route).
+            std::future::pending::<()>().await;
+        }
+
         let (tx, rx) = unbounded::<Result<Vec<u8>, std::io::Error>>();
+        if mock
+            .close_stream_without_start
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // Drop the sender: the response stream ends before any start
+            // event, like a truncated envd stream.
+            drop(tx);
+            return (
+                [(axum::http::header::CONTENT_TYPE, CONNECT_JSON)],
+                Body::from_stream(rx),
+            );
+        }
         *mock.stream_tx.lock().await = Some(tx.clone());
         let start = serde_json::to_vec(&json!({"event": {"start": {"pid": MOCK_PID}}}))
             .expect("start event JSON");
         let _ = tx.unbounded_send(Ok(connect_envelope(&start)));
+
+        (
+            [(axum::http::header::CONTENT_TYPE, CONNECT_JSON)],
+            Body::from_stream(rx),
+        )
+    }
+
+    /// envd `process.Process/Connect`: resolve a tag/pid selector to the
+    /// running process, answer with its start event, then end the stream.
+    async fn envd_connect_handler(
+        AxumState(mock): AxumState<MockEnvd>,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        assert!(
+            body.len() >= 5,
+            "connect request must carry a Connect envelope"
+        );
+        let payload: Value = serde_json::from_slice(&body[5..]).expect("connect payload JSON");
+        mock.spy.lock().await.connect.push(payload);
+
+        let (tx, rx) = unbounded::<Result<Vec<u8>, std::io::Error>>();
+        let start = serde_json::to_vec(&json!({"event": {"start": {"pid": MOCK_PID}}}))
+            .expect("start event JSON");
+        let _ = tx.unbounded_send(Ok(connect_envelope(&start)));
+        drop(tx);
 
         (
             [(axum::http::header::CONTENT_TYPE, CONNECT_JSON)],
@@ -1365,6 +1661,7 @@ mod tests {
     async fn spawn_mock_envd_with(mock: MockEnvd) -> (String, MockEnvd) {
         let app = Router::new()
             .route("/process.Process/Start", post(envd_start_handler))
+            .route("/process.Process/Connect", post(envd_connect_handler))
             .route("/process.Process/SendInput", post(envd_send_input_handler))
             .route("/process.Process/Update", post(envd_update_handler))
             .route(
@@ -1426,6 +1723,17 @@ mod tests {
         };
         let url = spawn_server(Router::new().route("/auth", post(handler))).await;
         (format!("{}/auth", url), captured)
+    }
+
+    /// An auth callback that never responds, simulating a hung auth service.
+    async fn spawn_hanging_auth_callback() -> String {
+        let handler = || async {
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            axum::http::Response::new(Body::empty())
+        };
+        let url = spawn_server(Router::new().route("/auth", post(handler))).await;
+        format!("{}/auth", url)
     }
 
     // ── Shared helpers ────────────────────────────────────────────────────
@@ -1531,10 +1839,10 @@ mod tests {
     /// header value. Returns the response head and the still-open TCP stream
     /// so callers can assert on the status line before (maybe) continuing as
     /// a WebSocket.
-    async fn raw_handshake(app: &str, protocols: &str) -> (String, tokio::net::TcpStream) {
+    async fn raw_handshake(app: &str, query: &str, protocols: &str) -> (String, tokio::net::TcpStream) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let url = ws_url(app, "");
+        let url = ws_url(app, query);
         let without_scheme = url.strip_prefix("ws://").expect("ws url");
         let (authority, path) = without_scheme
             .split_once('/')
@@ -1583,6 +1891,7 @@ mod tests {
     ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
         let (head, stream) = raw_handshake(
             app,
+            "",
             &format!("{}, {}", TERMINAL_SUBPROTOCOL, token_subprotocol),
         )
         .await;
@@ -1641,6 +1950,15 @@ mod tests {
             .expect("start payload recorded");
         assert_eq!(start["pty"]["size"], json!({"rows": 30, "cols": 100}));
         assert_eq!(start["process"]["cmd"], json!("/bin/bash"));
+        // The Start request carries a unique tag for orphan recovery.
+        assert!(
+            start["tag"]
+                .as_str()
+                .expect("start payload carries a tag")
+                .starts_with("cubeapi-terminal-"),
+            "unexpected start tag: {}",
+            start["tag"]
+        );
 
         // Client input is forwarded to envd SendInput, and envd PTY data
         // frames come back as output messages.
@@ -1791,7 +2109,7 @@ mod tests {
         // Only the token-bearing subprotocol, no base `cube-terminal`: no
         // valid selection exists (the token entry is never echoed), so the
         // request is rejected with 400 before the upgrade.
-        let (head, _stream) = raw_handshake(&app, "cube-terminal.some-token").await;
+        let (head, _stream) = raw_handshake(&app, "", "cube-terminal.some-token").await;
         assert!(
             head.starts_with("HTTP/1.1 400"),
             "expected 400 Bad Request, got: {}",
@@ -2208,5 +2526,325 @@ mod tests {
             .expect("x-api-key handshake should succeed");
         let ready = recv_json(&mut ws).await;
         assert_eq!(ready["type"], json!("ready"));
+    }
+
+    // ── Session tracker caps ──────────────────────────────────────────────
+
+    #[test]
+    fn session_tracker_enforces_per_sandbox_and_global_caps() {
+        let tracker = TerminalSessionTracker::default();
+
+        // Per-sandbox cap: max 1 for sb-a, global has room.
+        let a1 = tracker
+            .acquire("sb-a", 1, 10)
+            .expect("first sb-a session");
+        assert!(
+            matches!(
+                tracker.acquire("sb-a", 1, 10),
+                Err(SessionCap::PerSandbox)
+            ),
+            "second sb-a session must hit the per-sandbox cap"
+        );
+        drop(a1);
+        let _a1 = tracker
+            .acquire("sb-a", 1, 10)
+            .expect("per-sandbox slot released on drop");
+
+        // Global cap: with one live session and max_global = 2, one more
+        // session fits anywhere; the next is rejected even on a fresh
+        // sandbox.
+        let _b1 = tracker
+            .acquire("sb-b", 5, 2)
+            .expect("second global slot");
+        assert!(
+            matches!(tracker.acquire("sb-c", 5, 2), Err(SessionCap::Global)),
+            "fresh sandbox must still hit the global cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_session_cap_returns_429() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        // Per-sandbox cap stays at the default 8; the global cap of 1 is what
+        // rejects the second handshake.
+        config.terminal_max_sessions_global = 1;
+        let app = spawn_app(config).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("first session should upgrade");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+    }
+
+    // ── Orphan shell reaping via envd tag reconnect ───────────────────────
+
+    /// envd accepts the Start request (the shell may already be running) but
+    /// never responds before ENVD_CALL_TIMEOUT: the session must fail and the
+    /// recovery path must reconnect by tag to learn the pid and SIGKILL it.
+    #[tokio::test]
+    async fn hung_start_reaps_orphaned_shell_via_tag() {
+        let hanging = MockEnvd::default();
+        hanging
+            .hang_start
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (proxy_url, mock) = spawn_mock_envd_with(hanging).await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let app = spawn_app(test_config(&proxy_url, &master_url)).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("websocket upgrade should succeed");
+
+        // The Start request deadline (ENVD_CALL_TIMEOUT) must fire and the
+        // client must see an error frame instead of hanging forever.
+        let msg = tokio::time::timeout(ENVD_CALL_TIMEOUT + Duration::from_secs(15), ws.next())
+            .await
+            .expect("session must fail after the envd start deadline")
+            .expect("ws stream ended unexpectedly")
+            .expect("ws read error");
+        let tungstenite::Message::Text(text) = msg else {
+            panic!("expected text message, got {:?}", msg);
+        };
+        let error: Value = serde_json::from_str(&text).expect("message JSON");
+        assert_eq!(error["type"], json!("error"));
+
+        // The orphan cleanup reconnects with the same tag the Start request
+        // carried and kills the recovered pid.
+        let connect =
+            wait_for_recorded(first_of(&mock.spy, |s| s.connect.first().cloned())).await;
+        let start = mock
+            .spy
+            .lock()
+            .await
+            .start_payload
+            .clone()
+            .expect("start payload recorded");
+        assert_eq!(connect["process"]["tag"], start["tag"]);
+
+        let signal =
+            wait_for_recorded(first_of(&mock.spy, |s| s.send_signal.first().cloned())).await;
+        assert_eq!(
+            signal,
+            json!({"process": {"pid": MOCK_PID}, "signal": "SIGNAL_SIGKILL"})
+        );
+    }
+
+    /// The Start stream opens but ends before the start event: same orphan
+    /// window, same tag-based reaping, without the 10 s start deadline.
+    #[tokio::test]
+    async fn truncated_start_stream_reaps_orphaned_shell_via_tag() {
+        let truncating = MockEnvd::default();
+        truncating
+            .close_stream_without_start
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (proxy_url, mock) = spawn_mock_envd_with(truncating).await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let app = spawn_app(test_config(&proxy_url, &master_url)).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("websocket upgrade should succeed");
+        let error = recv_json(&mut ws).await;
+        assert_eq!(error["type"], json!("error"));
+
+        let connect =
+            wait_for_recorded(first_of(&mock.spy, |s| s.connect.first().cloned())).await;
+        let start = mock
+            .spy
+            .lock()
+            .await
+            .start_payload
+            .clone()
+            .expect("start payload recorded");
+        assert_eq!(connect["process"]["tag"], start["tag"]);
+
+        let signal =
+            wait_for_recorded(first_of(&mock.spy, |s| s.send_signal.first().cloned())).await;
+        assert_eq!(
+            signal,
+            json!({"process": {"pid": MOCK_PID}, "signal": "SIGNAL_SIGKILL"})
+        );
+    }
+
+    // ── envd frame cap and output chunking ────────────────────────────────
+
+    /// A single envd frame carrying more PTY output than one client message
+    /// may hold is re-chunked: every output message stays within the 64 KiB
+    /// cap and decodes independently; concatenated they equal the original.
+    #[tokio::test]
+    async fn large_pty_output_is_chunked_within_message_cap() {
+        let (proxy_url, mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let app = spawn_app(test_config(&proxy_url, &master_url)).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("websocket upgrade should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        let raw: Vec<u8> = (0..OUTPUT_CHUNK_SIZE + 1000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        mock.push_frame(json!({"event": {"data": {"pty": BASE64.encode(&raw)}}}))
+            .await;
+
+        let first = recv_json(&mut ws).await;
+        let second = recv_json(&mut ws).await;
+        assert_eq!(first["type"], json!("output"));
+        assert_eq!(second["type"], json!("output"));
+        let d1 = first["data"].as_str().expect("chunk 1 data");
+        let d2 = second["data"].as_str().expect("chunk 2 data");
+        assert!(
+            d1.len() <= MAX_WS_MESSAGE_SIZE && d2.len() <= MAX_WS_MESSAGE_SIZE,
+            "every output message must stay within the 64 KiB cap"
+        );
+        let decoded = [BASE64.decode(d1).unwrap(), BASE64.decode(d2).unwrap()].concat();
+        assert_eq!(decoded, raw);
+    }
+
+    /// An envd frame header claiming more than the 4 MiB cap is a stream
+    /// error: the session ends through the normal teardown path (error frame
+    /// to the client, SIGKILL to the shell) instead of buffering unboundedly.
+    #[tokio::test]
+    async fn oversized_envd_frame_terminates_session() {
+        let (proxy_url, mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let app = spawn_app(test_config(&proxy_url, &master_url)).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("websocket upgrade should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        // Only the 5-byte envelope header arrives, claiming a frame larger
+        // than MAX_ENVD_FRAME_SIZE; the reader must reject it on sight.
+        let mut header = vec![0u8];
+        header.extend_from_slice(&((MAX_ENVD_FRAME_SIZE as u32) + 1).to_be_bytes());
+        mock.push_raw(header).await;
+
+        let error = recv_json(&mut ws).await;
+        assert_eq!(error["type"], json!("error"));
+
+        let signal =
+            wait_for_recorded(first_of(&mock.spy, |s| s.send_signal.first().cloned())).await;
+        assert_eq!(signal["signal"], json!("SIGNAL_SIGKILL"));
+    }
+
+    // ── Handshake credential edge cases ───────────────────────────────────
+
+    /// A bare `cube-terminal.` subprotocol carries no token; the handshake
+    /// must fall back to the `token` query param instead of treating the
+    /// empty string as the credential.
+    #[tokio::test]
+    async fn empty_token_subprotocol_falls_back_to_query_token() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let (callback_url, captured) = spawn_auth_callback(StatusCode::OK).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        let app = spawn_app(config).await;
+
+        let (head, stream) =
+            raw_handshake(&app, "?token=good-token", "cube-terminal, cube-terminal.").await;
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101 Switching Protocols, got: {}",
+            head
+        );
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            stream,
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        // The callback received the query token, not the empty subprotocol
+        // token.
+        let guard = captured.lock().await;
+        let authz = guard
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .map(|(_, v)| v.clone());
+        assert_eq!(authz.as_deref(), Some("Bearer good-token"));
+    }
+
+    /// A query token carrying control characters (percent-decoded newline)
+    /// cannot be forwarded as a header value; it must be rejected with 401
+    /// instead of surfacing as a 500 "Auth callback unreachable".
+    #[tokio::test]
+    async fn control_char_query_token_is_rejected_with_401() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let (callback_url, captured) = spawn_auth_callback(StatusCode::OK).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        let app = spawn_app(config).await;
+
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=bad%0Atoken")).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        // The callback must never see the malformed credential.
+        assert!(captured.lock().await.is_empty());
+    }
+
+    /// A hung auth callback must not park the WebSocket handshake forever:
+    /// AUTH_CALLBACK_TIMEOUT bounds it and the handshake fails with a 500.
+    #[tokio::test]
+    async fn hanging_auth_callback_times_out_handshake() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let callback_url = spawn_hanging_auth_callback().await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        let app = spawn_app(config).await;
+
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=good-token")).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    // ── Rate limiting ─────────────────────────────────────────────────────
+
+    /// Terminal handshake tokens derive per-token rate-limit buckets: two
+    /// different tokens must not share one quota, while the same token twice
+    /// within the window is throttled.
+    #[tokio::test]
+    async fn rate_limit_buckets_terminal_handshakes_per_token() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.cube_api_key = Some("secret-key".to_string());
+        config.rate_limit_per_sec = 1;
+        let app = spawn_app(config).await;
+
+        // Each distinct token gets its own bucket: both pass the rate limit
+        // and are rejected by auth (401), not by quota (429).
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=wrong-1")).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=wrong-2")).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        // Repeating the first token within the window drains its bucket.
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=wrong-1")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+        );
     }
 }

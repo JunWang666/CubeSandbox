@@ -104,7 +104,7 @@ Dashboard 内置了 **交互式 Web 终端**，你可以直接从浏览器进入
 ### 4.3 会话管理、重连与空闲超时
 
 - **多会话** — 每次打开终端都会启动独立 Shell；不同沙箱的会话可以并存。
-- **单沙箱会话上限** — 每个沙箱最多同时容纳 8 个终端会话，超出的连接会被拒绝。可通过 CubeAPI 环境变量 `TERMINAL_MAX_SESSIONS_PER_SANDBOX` 调整（默认 `8`）。
+- **单沙箱会话上限** — 每个沙箱最多同时容纳 8 个终端会话，超出的连接会被拒绝。可通过 CubeAPI 环境变量 `TERMINAL_MAX_SESSIONS_PER_SANDBOX` 调整（默认 `8`）。此外还有跨所有沙箱的全局上限——`TERMINAL_MAX_SESSIONS_GLOBAL`（默认 `128`）。
 - **重连** — 异常断开、Shell 退出或出错时，弹窗会显示明确状态并提供 **Reconnect（重连）** 按钮。
 - **空闲超时** — 30 分钟既没有任何输入也没有任何 Shell 输出的会话会被服务端终止；任何活动都会重置计时器，所以 `tail -f`、长时间构建等持续输出会话不会因没敲键盘而被断开。可通过 CubeAPI 环境变量 `TERMINAL_IDLE_TIMEOUT_SECS` 调整（单位秒，默认 `1800`）。
 - **传输限制** — 客户端 WebSocket 消息上限为 64 KiB；服务端写入带有 10 秒超时。
@@ -115,13 +115,19 @@ Dashboard 内置了 **交互式 Web 终端**，你可以直接从浏览器进入
 
 ### 4.5 鉴权与审计
 
-- **开启鉴权时**（auth callback / WebUI 会话登录）：终端要求相同的登录会话，未授权用户会收到 `401`，无法建立会话。详见 [鉴权](./authentication.md)。注意在 WebUI 会话模式下，终端端点是**自行强制**校验会话的——目前沙箱的其他 REST API（pause/resume/kill 等）在该模式下并未做会话保护，终端比它们更严格。会话凭证通过 `Sec-WebSocket-Protocol` 子协议头（`cube-terminal.<token>`）传输，而不是 URL——令牌不会出现在 URL、服务端访问日志或浏览器历史记录中。非浏览器 API 客户端也可以改用 `token` 查询参数——CubeAPI 自身的请求日志会对终端路由剔除查询字符串，但前置代理仍可能记录它。
+- **鉴权模式** — CubeAPI 支持两种鉴权模式（外加完全开放），其统一鉴权中间件保护所有路由，终端也不例外。由于浏览器无法在 WebSocket 握手上设置请求头，终端端点会自行校验凭证，逻辑与中间件一致。详见 [鉴权](./authentication.md)。
+  - **callback 模式**（设置了 `AUTH_CALLBACK_URL`）：CubeAPI 会把凭证连同 `X-Request-Path`、`X-Request-Method` 一起转发给回调地址，回调返回 HTTP 200 即放行。能够校验 WebUI 登录 JWT 的回调对终端同样生效。注意终端挂载在 `/cubeapi/v1` 前缀下（`GET /cubeapi/v1/sandboxes/{sandboxID}/terminal/ws`）——按 path 白名单放行的回调需要放行该前缀。
+  - **simple-key 模式**（设置了 `CUBE_API_KEY` 且未设置回调）：凭证必须与 `CUBE_API_KEY` 字符串相等。**已知限制：** 浏览器端持有的是 CubeOps JWT，与 `CUBE_API_KEY` 并不相等，因此该模式下 Web 终端无法通过鉴权、不可用——如需在鉴权下使用终端，请改用 callback 模式（或不开启鉴权）。
+  - **未开启鉴权（开放模式）**：任何能访问 Dashboard 的人都能对任意运行中的沙箱打开终端——请据此控制 Dashboard 的访问范围。
+  - 在所有模式下，会话凭证都通过 `Sec-WebSocket-Protocol` 子协议头（`cube-terminal.<token>`）传输，而不是 URL——令牌不会出现在 URL、服务端访问日志或浏览器历史记录中。非浏览器 API 客户端也可以改用 `token` 查询参数——CubeAPI 自身的请求日志会对终端路由剔除查询字符串，但前置代理仍可能记录它。
 - **Origin 校验** — CubeAPI 会拒绝 `Origin` 主机与请求主机不一致的 WebSocket 升级请求，跨源的浏览器连接将收到 `403`。端口规则：`Origin` 不带端口（即 scheme 默认端口）时仅按主机名匹配；`Origin` 带显式端口时必须与请求 `Host` 的端口一致——`Host` 不带端口时按 scheme 默认端口（80/443）处理。如果在**非默认端口**上用反向代理前置 CubeAPI，请转发完整的 authority 以保留端口（nginx 用 `proxy_set_header Host $http_host;`）；`proxy_set_header Host $host;` 会丢掉端口，导致非默认端口的 Origin 被拒绝。
-- **未开启鉴权（开放模式）**：任何能访问 Dashboard 的人都能对任意运行中的沙箱打开终端——请据此控制 Dashboard 的访问范围。
+- **反向代理要求** — 终端是长连接 WebSocket，前置代理必须使用 HTTP/1.1 并转发 `Upgrade`/`Connection` 头（`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade;`），且 `proxy_read_timeout` 必须大于服务端空闲超时——随附的 nginx 配置（one-click 与 Helm）按默认 1800 秒空闲超时设置为 `7206s`。两套随附配置都会把 `/cubeapi/v1/sandboxes/*/terminal/ws` 直接代理到 CubeAPI；其余 `/cubeapi/v1/*` SDK 请求仍走 CubeOps（CubeOps 没有终端路由）。
+- **可调参数（CubeAPI 环境变量）** — `SANDBOX_PROXY_URL`：CubeAPI 经 CubeProxy 连接沙箱内 envd 时使用的 CubeProxy 基础地址（默认 `http://127.0.0.1`，在 CubeProxy 共享宿主机网络的 one-click 部署中无需修改；Helm chart 会自动将其设置为 CubeProxy Service 地址）。`TERMINAL_IDLE_TIMEOUT_SECS` 与 `TERMINAL_MAX_SESSIONS_PER_SANDBOX` 见 §4.3；`TERMINAL_MAX_SESSIONS_GLOBAL` 限制所有沙箱的并发终端会话总数（默认 `128`，超出后以 `429` 拒绝）。
 - **审计** — CubeAPI 会记录会话打开 / 关闭 / 超时事件，包含时间戳、用户身份（可用时）、客户端 IP、沙箱 ID 和 Shell PID。被拒绝的尝试（令牌错误、Origin 不匹配、沙箱不存在或未运行、超出会话上限）同样会被审计，并记录原因和客户端 IP。
 
 ### 4.6 已知限制
 
+- simple-key 鉴权模式下（设置了 `CUBE_API_KEY` 而未设置 `AUTH_CALLBACK_URL`）Web 终端不可用——浏览器端的 CubeOps JWT 永远不会等于 `CUBE_API_KEY`（见 §4.5）。
 - 创建时限制了公网访问的沙箱（`allowPublicTraffic=false` / 流量访问令牌）无法使用 Web 终端——流量令牌在创建后不可恢复，弹窗会显示连接错误。
 - 终端访问只做用户身份认证，**不做**按沙箱的授权——任何已认证用户都能对任意沙箱打开终端。这与当前沙箱 API 的权限模型一致（尚无按用户的沙箱归属），已纳入未来的多租户工作。
 - 沙箱镜像必须包含 `envd`（所有标准模板都已包含）。

@@ -96,6 +96,12 @@ pub struct ServerConfig {
     /// Env var: `TERMINAL_MAX_SESSIONS_PER_SANDBOX` (default 8).
     #[serde(default = "default_terminal_max_sessions_per_sandbox")]
     pub terminal_max_sessions_per_sandbox: usize,
+
+    /// Maximum concurrent interactive terminal WebSocket sessions across all
+    /// sandboxes. New connections beyond the cap are rejected with 429.
+    /// Env var: `TERMINAL_MAX_SESSIONS_GLOBAL` (default 128).
+    #[serde(default = "default_terminal_max_sessions_global")]
+    pub terminal_max_sessions_global: usize,
 }
 
 fn default_bind() -> String {
@@ -147,6 +153,13 @@ fn default_terminal_max_sessions_per_sandbox() -> usize {
         .unwrap_or(8)
 }
 
+fn default_terminal_max_sessions_global() -> usize {
+    std::env::var("TERMINAL_MAX_SESSIONS_GLOBAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
+
 impl ServerConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let _ = dotenvy::dotenv();
@@ -175,6 +188,7 @@ impl Default for ServerConfig {
             sandbox_proxy_url: default_sandbox_proxy_url(),
             terminal_idle_timeout_secs: default_terminal_idle_timeout_secs(),
             terminal_max_sessions_per_sandbox: default_terminal_max_sessions_per_sandbox(),
+            terminal_max_sessions_global: default_terminal_max_sessions_global(),
         }
     }
 }
