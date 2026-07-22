@@ -102,6 +102,32 @@ pub struct ServerConfig {
     /// Env var: `TERMINAL_MAX_SESSIONS_GLOBAL` (default 128).
     #[serde(default = "default_terminal_max_sessions_global")]
     pub terminal_max_sessions_global: usize,
+
+    /// Allow terminal WebSocket access when no auth backend is configured
+    /// (neither `auth_callback_url` nor `cube_api_key`). An unauthenticated
+    /// terminal is a remote shell, so this defaults to false (fail closed);
+    /// set to true only for local development.
+    /// Env var: `TERMINAL_ALLOW_UNAUTHENTICATED` (default false).
+    #[serde(default = "default_terminal_allow_unauthenticated")]
+    pub terminal_allow_unauthenticated: bool,
+
+    /// Accept the auth token via the `?token=` query parameter on terminal
+    /// WebSocket handshakes. Disabled by default: URLs are routinely logged
+    /// by front proxies, which would leak the token. Non-browser clients
+    /// should use the `Authorization: Bearer` header instead.
+    /// Env var: `TERMINAL_TOKEN_QUERY_PARAM` (default false).
+    #[serde(default = "default_terminal_token_query_param")]
+    pub terminal_token_query_param: bool,
+
+    /// Exact-match Origin whitelist for terminal WebSocket handshakes (e.g.
+    /// "https://cube.example.com,https://admin.example.com:8443"). When
+    /// non-empty, a browser Origin must equal one of these entries
+    /// (scheme/host compared case-insensitively) and the Host-match fallback
+    /// is not used; when empty, the Origin must match the request Host.
+    /// Clients without an Origin header are unaffected either way.
+    /// Env var: `TERMINAL_ALLOWED_ORIGINS` (comma-separated, default empty).
+    #[serde(default = "default_terminal_allowed_origins")]
+    pub terminal_allowed_origins: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -160,6 +186,32 @@ fn default_terminal_max_sessions_global() -> usize {
         .unwrap_or(128)
 }
 
+fn default_terminal_allow_unauthenticated() -> bool {
+    std::env::var("TERMINAL_ALLOW_UNAUTHENTICATED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(false)
+}
+
+fn default_terminal_token_query_param() -> bool {
+    std::env::var("TERMINAL_TOKEN_QUERY_PARAM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(false)
+}
+
+fn default_terminal_allowed_origins() -> Vec<String> {
+    std::env::var("TERMINAL_ALLOWED_ORIGINS")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ServerConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let _ = dotenvy::dotenv();
@@ -189,6 +241,9 @@ impl Default for ServerConfig {
             terminal_idle_timeout_secs: default_terminal_idle_timeout_secs(),
             terminal_max_sessions_per_sandbox: default_terminal_max_sessions_per_sandbox(),
             terminal_max_sessions_global: default_terminal_max_sessions_global(),
+            terminal_allow_unauthenticated: default_terminal_allow_unauthenticated(),
+            terminal_token_query_param: default_terminal_token_query_param(),
+            terminal_allowed_origins: default_terminal_allowed_origins(),
         }
     }
 }

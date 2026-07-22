@@ -24,23 +24,34 @@
 //
 // Hardening notes:
 //
+// - Fail closed: when no auth backend is configured (neither
+//   `auth_callback_url` nor `cube_api_key`) the endpoint rejects every
+//   handshake with 403 unless `terminal_allow_unauthenticated` is explicitly
+//   enabled — an unauthenticated terminal is a remote shell, so a default
+//   deployment must never expose one.
 // - Auth token transport: browsers pass the auth token as a WebSocket
 //   subprotocol (`Sec-WebSocket-Protocol: cube-terminal.<token>`) alongside
-//   the token-free base protocol `cube-terminal`. The `token` query param
-//   remains as a documented fallback for non-browser clients (CLI scripts,
-//   curl) that can set arbitrary handshake headers anyway; the subprotocol
-//   wins when both are present. When the client offered `cube-terminal`,
-//   the server selects exactly that base protocol in the upgrade response —
-//   Chrome aborts the handshake when it offered subprotocols but the server
-//   selects none — while the token-bearing entry is never selected, so the
-//   token is not echoed back.
+//   the token-free base protocol `cube-terminal`. Non-browser clients use
+//   the standard `Authorization: Bearer <token>` header. The `token` query
+//   param exists as a fallback but is DISABLED by default
+//   (`terminal_token_query_param`): URLs end up in front-proxy access logs,
+//   which would leak the token. Priority: subprotocol → Authorization
+//   header → (when enabled) query param → X-API-Key. When the client
+//   offered `cube-terminal`, the server selects exactly that base protocol
+//   in the upgrade response — Chrome aborts the handshake when it offered
+//   subprotocols but the server selects none — while the token-bearing
+//   entry is never selected, so the token is not echoed back.
 // - Origin check: when an `Origin` header is present (browsers always send
-//   one on WebSocket handshakes) its hostname must match the request `Host`
-//   header; explicit ports must match as well, with a port-less `Host` read
-//   as the Origin scheme's default port (80/443) so a proxy cannot widen
-//   the check to arbitrary same-host services by stripping the port. A
-//   mismatch is rejected with 403 before the upgrade. Clients that send no
-//   Origin (curl, python, CLI) are unaffected.
+//   one on WebSocket handshakes) it must be authorized one of two ways:
+//   with `terminal_allowed_origins` configured, the Origin must exactly
+//   match a whitelist entry (scheme/host case-insensitive); otherwise its
+//   hostname must match the request `Host` header and the effective ports
+//   must agree, where a port-less side means the Origin scheme's default
+//   (80/443) — so `http://example.com` matches `example.com:80` but not
+//   `example.com:3000`, and a proxy cannot widen the check to arbitrary
+//   same-host services by stripping or adding a port. A mismatch is
+//   rejected with 403 before the upgrade. Clients that send no Origin
+//   (curl, python, CLI) are unaffected.
 // - Session cap: at most `terminal_max_sessions_per_sandbox` concurrent
 //   sessions per sandbox (default 8) and `terminal_max_sessions_global`
 //   across all sandboxes (default 128); beyond either cap → 429.
@@ -67,11 +78,13 @@
 //   inherits the same platform-wide posture as the other sandbox actions
 //   (pause/resume/kill). Proper per-sandbox authorization is future
 //   cross-API multi-tenancy work.
-//   Audit attribution: in callback mode the operator identity comes from the
-//   callback's `X-Auth-User` response header, falling back to the
-//   unverified username/sub claims of the already-authorized Bearer JWT;
-//   simple-key and open modes have no identity, so their audit `user`
-//   field stays empty.
+//   Audit attribution: the audit record distinguishes identity grades via
+//   `identity_source` — "auth_callback" (`user`, from the callback's
+//   authoritative `X-Auth-User` response header) or "unverified_jwt_claim"
+//   (`claimed_user`, a self-asserted hint parsed from the *unverified*
+//   claims of the already-authorized Bearer JWT, never treated as proof of
+//   identity). Simple-key and open modes have no identity, so both fields
+//   stay empty.
 // - Orphan reaping depends on envd's `ProcessSelector.tag` support (present
 //   in e2b-dev/infra envd 2026.16, which the CubeSandbox base image builds).
 //   Sandboxes running an older envd reject the tag reconnect, so a shell
@@ -162,10 +175,13 @@ const DEFAULT_ROWS: u32 = 24;
 pub struct TerminalQuery {
     cols: Option<u32>,
     rows: Option<u32>,
-    /// Auth credential fallback for non-browser clients. Browsers pass the
-    /// token via the `cube-terminal.<token>` WebSocket subprotocol instead
-    /// (see `handshake_token`); the query param is only used when no token
-    /// subprotocol was offered.
+    /// Auth credential fallback for non-browser clients, DISABLED by default
+    /// (`terminal_token_query_param` / `TERMINAL_TOKEN_QUERY_PARAM`): URLs
+    /// are routinely written to front-proxy access logs, which would leak
+    /// the token. Non-browser clients should send `Authorization: Bearer`
+    /// instead; browsers use the `cube-terminal.<token>` subprotocol (see
+    /// `handshake_credential`). When the flag is off this parameter is
+    /// ignored as if absent.
     token: Option<String>,
     /// Target container (ID or name) for multi-container sandboxes.
     /// Defaults to the primary container; see `resolve_envd_port`.
@@ -347,13 +363,30 @@ impl Drop for TerminalSessionGuard {
     }
 }
 
+/// Operator identity attached to a terminal session for the audit trail.
+/// The two fields are deliberately graded: `user` is authoritative (vouched
+/// for by the authorizing party), while `claimed_user` is a self-asserted
+/// hint parsed from an *unverified* Bearer JWT — useful for attribution,
+/// never proof of identity.
+#[derive(Debug, Clone, Default)]
+struct TerminalIdentity {
+    /// Authoritative operator identity: the auth callback's `X-Auth-User`
+    /// response header. Empty in simple-key and open modes.
+    user: Option<String>,
+    /// Attribution hint from the Bearer JWT's unverified claims
+    /// (`username`/`sub`/...), only populated when `user` is empty.
+    claimed_user: Option<String>,
+}
+
 /// Auth credential offered on the WebSocket handshake, mirroring the
 /// Bearer / X-API-Key split of `middleware::auth::unified_auth`: the
-/// `cube-terminal.<token>` subprotocol (then the `token` query fallback)
-/// maps to Bearer; the `X-API-Key` header maps to an API key.
+/// `cube-terminal.<token>` subprotocol (then the `Authorization: Bearer`
+/// header, then — when enabled — the `token` query fallback) maps to
+/// Bearer; the `X-API-Key` header maps to an API key.
 #[derive(Debug)]
 enum TerminalCredential {
-    /// `cube-terminal.<token>` subprotocol or `token` query param.
+    /// `cube-terminal.<token>` subprotocol, `Authorization: Bearer` header,
+    /// or (when enabled) `token` query param.
     Bearer(String),
     /// `X-API-Key: <key>` header.
     ApiKey(String),
@@ -370,14 +403,21 @@ impl TerminalCredential {
 }
 
 /// Pull the auth credential out of the WebSocket handshake. Bearer
-/// (subprotocol, then query param — see `handshake_token`) takes priority
-/// over `X-API-Key`, exactly as in `unified_auth`; a Bearer value that
-/// trims to empty falls through to the header.
+/// transports win over `X-API-Key`, exactly as in `unified_auth`; a Bearer
+/// value that trims to empty falls through to the header. Bearer priority:
+/// the `cube-terminal.<token>` subprotocol (browser path) first, then the
+/// `Authorization: Bearer` header (non-browser clients), then — only when
+/// `allow_query_token` is set — the `token` query param (disabled by
+/// default because front proxies log URLs).
 fn handshake_credential(
     headers: &HeaderMap,
     query_token: Option<String>,
+    allow_query_token: bool,
 ) -> Option<TerminalCredential> {
-    if let Some(token) = handshake_token(headers, query_token) {
+    let bearer = subprotocol_token(headers)
+        .or_else(|| authorization_bearer(headers))
+        .or_else(|| query_token.filter(|_| allow_query_token));
+    if let Some(token) = bearer {
         let token = token.trim();
         if !token.is_empty() {
             return Some(TerminalCredential::Bearer(token.to_string()));
@@ -391,23 +431,38 @@ fn handshake_credential(
         .map(|k| TerminalCredential::ApiKey(k.to_string()))
 }
 
-/// Pull the auth token out of the WebSocket handshake: the
-/// `cube-terminal.<token>` subprotocol (browser path) wins; the `token`
-/// query param is the documented fallback for non-browser clients.
-fn handshake_token(headers: &HeaderMap, query_token: Option<String>) -> Option<String> {
-    let from_subprotocol = headers
+/// The token from the `cube-terminal.<token>` subprotocol (the only
+/// credential transport available to browser WebSocket clients). A bare
+/// `cube-terminal.` entry carries no token and is treated as absent so the
+/// lower-priority transports still apply.
+fn subprotocol_token(headers: &HeaderMap) -> Option<String> {
+    headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             v.split(',')
                 .map(str::trim)
                 .find_map(|p| p.strip_prefix(TOKEN_SUBPROTOCOL_PREFIX))
-                // A bare `cube-terminal.` entry carries no token; treat it as
-                // absent so the query-param fallback still applies.
                 .filter(|t| !t.trim().is_empty())
         })
-        .map(str::to_string);
-    from_subprotocol.or(query_token)
+        .map(str::to_string)
+}
+
+/// The token from a standard `Authorization: Bearer <token>` header — the
+/// recommended credential transport for non-browser clients (CLI scripts,
+/// curl), which can set arbitrary handshake headers anyway.
+fn authorization_bearer(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("authorization").and_then(|v| v.to_str().ok())?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 /// Whether the client offered the base `cube-terminal` subprotocol. When it
@@ -440,18 +495,58 @@ fn offered_token_subprotocol(headers: &HeaderMap) -> bool {
         })
 }
 
+/// Entry point for the Origin guard. When `allowed_origins` is non-empty
+/// the Origin must exactly equal one of the whitelist entries (compared
+/// after normalization) and the Host-match fallback is not consulted;
+/// otherwise the Origin must match the request Host (see
+/// `origin_matches_host`). Clients that send no Origin header (curl,
+/// python, CLI) are not checked either way.
+fn origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    if !allowed_origins.is_empty() {
+        let Some(origin) = normalize_origin(origin) else {
+            return false;
+        };
+        return allowed_origins
+            .iter()
+            .filter_map(|entry| normalize_origin(entry))
+            .any(|entry| entry == origin);
+    }
+    origin_matches_host(headers)
+}
+
+/// Normalize an Origin for exact whitelist comparison: trim, lowercase the
+/// scheme and authority (host comparison is case-insensitive; ports are
+/// digits or bracketed IPv6 hex), and drop any path (browsers never send
+/// one on an Origin header).
+fn normalize_origin(origin: &str) -> Option<String> {
+    let (scheme, authority) = origin_parts(origin.trim())?;
+    Some(format!(
+        "{}://{}",
+        scheme.to_lowercase(),
+        authority.to_lowercase()
+    ))
+}
+
 /// CSRF guard for browser clients: when an `Origin` header is present, its
 /// hostname must match the request `Host` header (compared
-/// case-insensitively). Port rules:
+/// case-insensitively). Effective-port rules (a side with no explicit port
+/// is read as the Origin scheme's default, 80/443; a Host without a port
+/// has no scheme and therefore no default):
 ///
 /// - both sides carry an explicit port → the ports must match;
-/// - a port-less Origin (the scheme default) matches on hostname alone;
-/// - an explicit Origin port against a port-less Host (a proxy that strips
-///   the port from `Host`, e.g. nginx `proxy_set_header Host $host`) only
-///   matches when the port equals the Origin scheme's default (80/443) —
-///   anything else could be a different service merely sharing the
-///   hostname. Proxies listening on a non-default port must forward the
-///   full authority instead (`proxy_set_header Host $http_host`).
+/// - explicit Origin port vs port-less Host → the Origin port must equal
+///   the Origin scheme's default, so a proxy that strips the port from
+///   `Host` (nginx `proxy_set_header Host $host`) cannot widen the check
+///   to arbitrary same-host services. Proxies on a non-default port must
+///   forward the full authority (`proxy_set_header Host $http_host`);
+/// - port-less Origin vs explicit Host port → the Host port must equal the
+///   Origin scheme's default (e.g. `http://example.com` matches
+///   `example.com:80` but NOT `example.com:3000`); an Origin scheme with no
+///   default port never matches;
+/// - neither side carries a port → the hostname match alone decides.
 ///
 /// Clients that send no Origin header (curl, python, CLI) are not checked.
 fn origin_matches_host(headers: &HeaderMap) -> bool {
@@ -484,19 +579,20 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
     }
     match (o_port, h_port) {
         (Some(a), Some(b)) => a == b,
-        // Port-less Origin: scheme default, hostname match is enough. This
-        // deliberate widening is safe because the terminal credential is not
-        // ambient: browsers attach it as a WebSocket subprotocol, not as a
-        // cookie, so a cross-site WebSocket hijack (CSWSH) already requires
-        // the attacker to know the token. The relaxation only gains real
-        // meaning if a proxy in front of CubeAPI injects credentials based
-        // on cookies — in that deployment the proxy must also pin the Origin
-        // port policy itself.
-        (None, _) => true,
         // Explicit Origin port vs port-less Host: the Host then *means* the
         // scheme default port, so only that port may match (see doc
         // comment).
         (Some(port), None) => port.parse::<u16>().ok() == scheme_default_port(scheme),
+        // Port-less Origin (i.e. the scheme default port) vs an explicit
+        // Host port: the Host port must equal the scheme default. A
+        // port-less Origin no longer matches a same-host service on an
+        // arbitrary port.
+        (None, Some(port)) => scheme_default_port(scheme) == port.parse::<u16>().ok(),
+        // Neither side pins a port: the hostname match alone decides. The
+        // terminal credential is not ambient (browsers attach it as a
+        // WebSocket subprotocol, not as a cookie), so a cross-site WebSocket
+        // hijack (CSWSH) already requires the attacker to know the token.
+        (None, None) => true,
     }
 }
 
@@ -541,15 +637,16 @@ pub async fn terminal_ws(
     let rows = clamp_size(query.rows, DEFAULT_ROWS);
     let client_ip = client_ip(&headers);
 
-    // Browser CSRF guard: an Origin that does not match the request host is
+    // Browser CSRF guard: an Origin that is not whitelisted (when a
+    // whitelist is configured) or does not match the request host is
     // rejected before any auth work. Header-less clients skip the check.
-    if !origin_matches_host(&headers) {
+    if !origin_allowed(&headers, &state.config.terminal_allowed_origins) {
         audit_log(
             "auth-failure",
             &sandbox_id,
             query.container.as_deref(),
             None,
-            None,
+            &TerminalIdentity::default(),
             client_ip.as_deref(),
             Some("origin-mismatch"),
         );
@@ -558,16 +655,51 @@ pub async fn terminal_ws(
         ));
     }
 
-    let credential = handshake_credential(&headers, query.token);
-    let user = match authenticate(&state, credential.as_ref(), uri.path()).await {
-        Ok(user) => user,
+    // Fail closed: with no auth backend configured the terminal endpoint is
+    // disabled unless explicitly opted in — an unauthenticated terminal is
+    // a remote shell, so a default deployment must never expose one.
+    let auth_configured = state
+        .config
+        .auth_callback_url
+        .as_deref()
+        .is_some_and(|u| !u.is_empty())
+        || state
+            .config
+            .cube_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty());
+    if !auth_configured && !state.config.terminal_allow_unauthenticated {
+        audit_log(
+            "rejected",
+            &sandbox_id,
+            query.container.as_deref(),
+            None,
+            &TerminalIdentity::default(),
+            client_ip.as_deref(),
+            Some("auth-disabled"),
+        );
+        return Err(AppError::Forbidden(
+            "terminal access is disabled: no auth backend is configured (set AUTH_CALLBACK_URL \
+             or CUBE_API_KEY); set TERMINAL_ALLOW_UNAUTHENTICATED=true to allow unauthenticated \
+             terminal access"
+                .to_string(),
+        ));
+    }
+
+    let credential = handshake_credential(
+        &headers,
+        query.token,
+        state.config.terminal_token_query_param,
+    );
+    let identity = match authenticate(&state, credential.as_ref(), uri.path()).await {
+        Ok(identity) => identity,
         Err(err) => {
             audit_log(
                 "auth-failure",
                 &sandbox_id,
                 query.container.as_deref(),
                 None,
-                None,
+                &TerminalIdentity::default(),
                 client_ip.as_deref(),
                 None,
             );
@@ -591,7 +723,7 @@ pub async fn terminal_ws(
                     &sandbox_id,
                     query.container.as_deref(),
                     None,
-                    user.as_deref(),
+                    &identity,
                     client_ip.as_deref(),
                     Some("sandbox-not-found"),
                 );
@@ -605,7 +737,7 @@ pub async fn terminal_ws(
             &sandbox_id,
             query.container.as_deref(),
             None,
-            user.as_deref(),
+            &identity,
             client_ip.as_deref(),
             Some("sandbox-not-running"),
         );
@@ -630,7 +762,7 @@ pub async fn terminal_ws(
                 &sandbox_id,
                 query.container.as_deref(),
                 None,
-                user.as_deref(),
+                &identity,
                 client_ip.as_deref(),
                 Some("container-unavailable"),
             );
@@ -656,7 +788,7 @@ pub async fn terminal_ws(
                 &sandbox_id,
                 query.container.as_deref(),
                 None,
-                user.as_deref(),
+                &identity,
                 client_ip.as_deref(),
                 Some("session-limit"),
             );
@@ -700,7 +832,7 @@ pub async fn terminal_ws(
         ws
     };
     Ok(ws.on_upgrade(move |socket| {
-        let audit_user = user.clone();
+        let audit_identity = identity.clone();
         let audit_ip = client_ip.clone();
         async move {
             // Held until run_session returns, releasing the session slot
@@ -716,7 +848,7 @@ pub async fn terminal_ws(
                 rows,
                 idle_timeout,
                 audit_container,
-                audit_user,
+                audit_identity,
                 audit_ip,
             )
             .await;
@@ -724,26 +856,29 @@ pub async fn terminal_ws(
     }))
 }
 
-/// Validate the handshake credential (subprotocol or query token mapped to
-/// Bearer, or the `X-API-Key` header — see `handshake_credential`) against
-/// whichever auth backend is configured, mirroring `unified_auth`: auth
-/// callback first (forwarding the credential on the same header the client
-/// used), then the simple API key (`cube_api_key`), then open mode.
+/// Validate the handshake credential (subprotocol, `Authorization: Bearer`
+/// header, or — when enabled — query token mapped to Bearer, or the
+/// `X-API-Key` header — see `handshake_credential`) against whichever auth
+/// backend is configured, mirroring `unified_auth`: auth callback first
+/// (forwarding the credential on the same header the client used), then the
+/// simple API key (`cube_api_key`), then open mode.
 ///
-/// Returns the operator identity when one is known, for the audit trail:
-/// - callback mode: the callback's `X-Auth-User` response header (the
-///   callback is the authorizing party, so an identity it vouches for is
-///   inherently trusted), falling back to the unverified claims of the
-///   already-authorized Bearer JWT (see `jwt_identity`);
+/// Returns the operator identity for the audit trail, graded by trust (see
+/// `TerminalIdentity`):
+/// - callback mode: `user` comes only from the callback's `X-Auth-User`
+///   response header (the callback is the authorizing party, so an identity
+///   it vouches for is authoritative); when absent, `claimed_user` falls
+///   back to the unverified claims of the already-authorized Bearer JWT
+///   (see `jwt_identity`);
 /// - simple-key mode: no identity — a shared key proves no individual;
 /// - open mode: no identity — there is no credential at all.
 async fn authenticate(
     state: &AppState,
     credential: Option<&TerminalCredential>,
     request_path: &str,
-) -> AppResult<Option<String>> {
+) -> AppResult<TerminalIdentity> {
     const MISSING_CREDENTIAL: &str = "Missing authentication token (cube-terminal subprotocol, \
-         token query parameter, or X-API-Key header)";
+         Authorization Bearer header, or X-API-Key header)";
 
     if let Some(callback_url) = state
         .config
@@ -792,9 +927,17 @@ async fn authenticate(
                 AppError::Internal(anyhow::anyhow!("Auth callback unreachable: {}", e))
             })?;
         if resp.status().as_u16() == 200 {
-            // The callback authorized the request; attribute the session to
-            // the operator it names, else to the authorized token's claims.
-            return Ok(callback_identity(&resp).or_else(|| jwt_identity(credential)));
+            // The callback authorized the request; the only authoritative
+            // identity is the one it names explicitly. The Bearer JWT's
+            // unverified claims are a fallback attribution hint, kept out
+            // of the authoritative `user` field.
+            let user = callback_identity(&resp);
+            let claimed_user = if user.is_none() {
+                jwt_identity(credential)
+            } else {
+                None
+            };
+            return Ok(TerminalIdentity { user, claimed_user });
         }
         return Err(AppError::Unauthorized(
             "Authentication rejected by callback".to_string(),
@@ -816,10 +959,10 @@ async fn authenticate(
         }
         // Simple-key mode only proves knowledge of the shared key; the
         // caller's identity is not known to CubeAPI in this mode.
-        return Ok(None);
+        return Ok(TerminalIdentity::default());
     }
 
-    Ok(None)
+    Ok(TerminalIdentity::default())
 }
 
 /// Trim, reject empty, and defensively truncate an operator identity
@@ -899,16 +1042,29 @@ fn audit_log(
     sandbox_id: &str,
     container: Option<&str>,
     pid: Option<i64>,
-    user: Option<&str>,
+    identity: &TerminalIdentity,
     client_ip: Option<&str>,
     reason: Option<&str>,
 ) {
+    // `identity_source` states how much the logged identity is worth:
+    // "auth_callback" (authoritative, from the callback's X-Auth-User),
+    // "unverified_jwt_claim" (self-asserted, from an unverified JWT), or ""
+    // (no identity at all).
+    let identity_source = if identity.user.is_some() {
+        "auth_callback"
+    } else if identity.claimed_user.is_some() {
+        "unverified_jwt_claim"
+    } else {
+        ""
+    };
     tracing::info!(
         event = event,
         sandbox_id = sandbox_id,
         container = container.unwrap_or(""),
         pid = pid,
-        user = user.unwrap_or(""),
+        user = identity.user.as_deref().unwrap_or(""),
+        claimed_user = identity.claimed_user.as_deref().unwrap_or(""),
+        identity_source = identity_source,
         client_ip = client_ip.unwrap_or(""),
         reason = reason.unwrap_or(""),
         "terminal session"
@@ -1348,7 +1504,7 @@ async fn run_session(
     rows: u32,
     idle_timeout: Duration,
     container: Option<String>,
-    user: Option<String>,
+    identity: TerminalIdentity,
     client_ip: Option<String>,
 ) {
     // CubeProxy routes by Host header: "<envd-port>-<sandbox-id>.<domain>".
@@ -1379,7 +1535,7 @@ async fn run_session(
                 &sandbox_id,
                 container.as_deref(),
                 None,
-                user.as_deref(),
+                &identity,
                 client_ip.as_deref(),
                 Some(CloseReason::Error.as_str()),
             );
@@ -1407,7 +1563,7 @@ async fn run_session(
                 &sandbox_id,
                 container.as_deref(),
                 None,
-                user.as_deref(),
+                &identity,
                 client_ip.as_deref(),
                 Some(CloseReason::Error.as_str()),
             );
@@ -1427,7 +1583,7 @@ async fn run_session(
             &mut ws_tx,
             CloseReason::ClientDisconnect,
             container.as_deref(),
-            user.as_deref(),
+            &identity,
             client_ip.as_deref(),
         )
         .await;
@@ -1438,7 +1594,7 @@ async fn run_session(
         &sandbox_id,
         container.as_deref(),
         Some(pid),
-        user.as_deref(),
+        &identity,
         client_ip.as_deref(),
         None,
     );
@@ -1460,7 +1616,7 @@ async fn run_session(
             &sandbox_id,
             container.as_deref(),
             Some(pid),
-            user.as_deref(),
+            &identity,
             client_ip.as_deref(),
             None,
         );
@@ -1475,7 +1631,7 @@ async fn run_session(
         &mut ws_tx,
         reason,
         container.as_deref(),
-        user.as_deref(),
+        &identity,
         client_ip.as_deref(),
     )
     .await;
@@ -1494,7 +1650,7 @@ async fn teardown_session(
     ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
     reason: CloseReason,
     container: Option<&str>,
-    user: Option<&str>,
+    identity: &TerminalIdentity,
     client_ip: Option<&str>,
 ) {
     if let Err(err) = envd_unary(
@@ -1514,7 +1670,7 @@ async fn teardown_session(
         sandbox_id,
         container,
         Some(pid),
-        user,
+        identity,
         client_ip,
         Some(reason.as_str()),
     );
@@ -1953,6 +2109,12 @@ mod tests {
         ServerConfig {
             cubemaster_url: master_url.to_string(),
             sandbox_proxy_url: proxy_url.to_string(),
+            // Most tests predate the secure defaults: keep the legacy
+            // behaviors (open-mode terminal allowed, ?token= accepted) so
+            // they exercise the same paths as before. Tests for the secure
+            // defaults construct their own config explicitly.
+            terminal_allow_unauthenticated: true,
+            terminal_token_query_param: true,
             ..Default::default()
         }
     }
@@ -2431,8 +2593,15 @@ mod tests {
         // Exact match, case-insensitive host.
         assert!(check(Some("http://example.com:8443"), "example.com:8443"));
         assert!(check(Some("https://EXAMPLE.com"), "example.com"));
-        // Port-less Origin (scheme default) matches on hostname alone.
-        assert!(check(Some("http://example.com"), "example.com:3000"));
+        // Port-less Origin vs explicit Host port: the Host port must equal
+        // the Origin scheme's default — `example.com:3000` is NOT matched
+        // by a port-less http Origin (tightened rule), while :80/:443 are.
+        assert!(!check(Some("http://example.com"), "example.com:3000"));
+        assert!(check(Some("http://example.com"), "example.com:80"));
+        assert!(check(Some("https://example.com"), "example.com:443"));
+        assert!(!check(Some("https://example.com"), "example.com:80"));
+        // An Origin scheme with no default port never matches a ported Host.
+        assert!(!check(Some("ftp://example.com"), "example.com:21"));
         // An explicit port equal to the scheme default is the same as
         // port-less, even against a port-less Host.
         assert!(check(Some("http://example.com:80"), "example.com"));
@@ -2450,11 +2619,45 @@ mod tests {
         assert!(!check(Some("http://evil.com"), "example.com"));
         assert!(!check(Some("http://example.com.evil.com"), "example.com"));
         // No Origin header: not a browser, skip the check.
-        assert!(check(None, "example.com"));
+        assert!(origin_allowed(&HeaderMap::new(), &[]));
         // Malformed Origin: reject.
         assert!(!check(Some("not-a-url"), "example.com"));
         // Bracketed IPv6 without a port is not misparsed as host+port.
         assert!(check(Some("http://[::1]"), "[::1]"));
+    }
+
+    #[test]
+    fn origin_allowed_origins_whitelist() {
+        use axum::http::HeaderValue;
+
+        let whitelist = vec![
+            "https://cube.example.com".to_string(),
+            "https://admin.example.com:8443".to_string(),
+        ];
+        let check = |origin: Option<&str>, host: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", HeaderValue::from_str(host).unwrap());
+            if let Some(o) = origin {
+                headers.insert("origin", HeaderValue::from_str(o).unwrap());
+            }
+            origin_allowed(&headers, &whitelist)
+        };
+
+        // Exact whitelist entries match, regardless of the request Host.
+        assert!(check(Some("https://cube.example.com"), "10.0.0.1:3000"));
+        assert!(check(Some("https://admin.example.com:8443"), "10.0.0.1:3000"));
+        // Comparison normalizes case (scheme/host) and surrounding space.
+        assert!(check(Some("HTTPS://CUBE.example.COM"), "10.0.0.1:3000"));
+        assert!(check(Some(" https://cube.example.com "), "10.0.0.1:3000"));
+        // Same host, wrong scheme or port: no Host-match fallback.
+        assert!(!check(Some("http://cube.example.com"), "cube.example.com"));
+        assert!(!check(Some("https://cube.example.com:443"), "10.0.0.1:3000"));
+        assert!(!check(Some("https://admin.example.com"), "10.0.0.1:3000"));
+        // A Host-matching Origin that is not whitelisted is rejected.
+        assert!(!check(Some("http://10.0.0.1:3000"), "10.0.0.1:3000"));
+        // Malformed Origin: reject; no Origin: unaffected.
+        assert!(!check(Some("not-a-url"), "10.0.0.1:3000"));
+        assert!(check(None, "10.0.0.1:3000"));
     }
 
     // ── Multi-container envd port resolution ──────────────────────────────
@@ -2569,10 +2772,13 @@ mod tests {
             spawn_auth_callback_with_headers(StatusCode::OK, &[("x-auth-user", "bob")]).await;
         let state = auth_state(&url).await;
         let credential = TerminalCredential::Bearer("plain-token".to_string());
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("callback 200 authorizes");
-        assert_eq!(user.as_deref(), Some("bob"));
+        // The callback-named identity is authoritative…
+        assert_eq!(identity.user.as_deref(), Some("bob"));
+        // …and suppresses the unverified-claim fallback entirely.
+        assert_eq!(identity.claimed_user, None);
     }
 
     #[tokio::test]
@@ -2581,10 +2787,12 @@ mod tests {
         let state = auth_state(&url).await;
         let token = unsigned_jwt(json!({"username": "alice", "sub": "alice", "exp": 1}));
         let credential = TerminalCredential::Bearer(token);
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("callback 200 authorizes");
-        assert_eq!(user.as_deref(), Some("alice"));
+        // Unverified claims land in claimed_user, never in user.
+        assert_eq!(identity.user, None);
+        assert_eq!(identity.claimed_user.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
@@ -2593,10 +2801,11 @@ mod tests {
         let state = auth_state(&url).await;
         let token = unsigned_jwt(json!({"sub": "carol", "exp": 1}));
         let credential = TerminalCredential::Bearer(token);
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("callback 200 authorizes");
-        assert_eq!(user.as_deref(), Some("carol"));
+        assert_eq!(identity.user, None);
+        assert_eq!(identity.claimed_user.as_deref(), Some("carol"));
     }
 
     #[tokio::test]
@@ -2606,24 +2815,27 @@ mod tests {
 
         // Not a JWT at all.
         let credential = TerminalCredential::Bearer("not-a-jwt".to_string());
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("identity failure must not reject the request");
-        assert_eq!(user, None);
+        assert_eq!(identity.user, None);
+        assert_eq!(identity.claimed_user, None);
 
         // JWT-shaped, but the payload segment is not decodable base64url.
         let credential = TerminalCredential::Bearer("aaa.!!!.bbb".to_string());
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("identity failure must not reject the request");
-        assert_eq!(user, None);
+        assert_eq!(identity.user, None);
+        assert_eq!(identity.claimed_user, None);
 
         // API-key credentials carry no identity either.
         let credential = TerminalCredential::ApiKey("some-key".to_string());
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("identity failure must not reject the request");
-        assert_eq!(user, None);
+        assert_eq!(identity.user, None);
+        assert_eq!(identity.claimed_user, None);
     }
 
     #[tokio::test]
@@ -2633,10 +2845,11 @@ mod tests {
         let state = auth_state(&url).await;
         let token = unsigned_jwt(json!({"username": "alice"}));
         let credential = TerminalCredential::Bearer(token);
-        let user = authenticate(&state, Some(&credential), "/x")
+        let identity = authenticate(&state, Some(&credential), "/x")
             .await
             .expect("callback 200 authorizes");
-        assert_eq!(user.as_deref(), Some("bob"));
+        assert_eq!(identity.user.as_deref(), Some("bob"));
+        assert_eq!(identity.claimed_user, None);
     }
 
     #[tokio::test]
@@ -2669,15 +2882,13 @@ mod tests {
         assert_eq!(ready["type"], json!("ready"));
         ws.close(None).await.expect("close websocket");
 
-        // An Origin without an explicit port matches on hostname alone.
+        // A port-less Origin against a non-default Host port no longer
+        // matches (tightened port rule): http's effective port 80 != the
+        // ephemeral listener port, so the handshake is rejected with 403.
         let request =
             tungstenite::ClientRequestBuilder::new(ws_url(&app, "").parse().expect("uri"))
                 .with_header("Origin", "http://127.0.0.1");
-        let (mut ws, _resp) = connect_async(request)
-            .await
-            .expect("default-port origin upgrade should succeed");
-        let ready = recv_json(&mut ws).await;
-        assert_eq!(ready["type"], json!("ready"));
+        expect_upgrade_error(connect_async(request).await, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -3201,11 +3412,12 @@ mod tests {
 
     // ── Rate limiting ─────────────────────────────────────────────────────
 
-    /// Terminal handshake tokens derive per-token rate-limit buckets: two
-    /// different tokens must not share one quota, while the same token twice
-    /// within the window is throttled.
+    /// Terminal handshakes are rate-limited per client IP, not per presented
+    /// token: forged or rotated tokens from one client share a single bucket
+    /// and cannot mint fresh quota (which would also grow the limiter map
+    /// without bound).
     #[tokio::test]
-    async fn rate_limit_buckets_terminal_handshakes_per_token() {
+    async fn rate_limit_buckets_terminal_handshakes_per_ip() {
         let (proxy_url, _mock) = spawn_mock_envd().await;
         let master_url = spawn_mock_master(STATUS_RUNNING).await;
         let mut config = test_config(&proxy_url, &master_url);
@@ -3213,20 +3425,144 @@ mod tests {
         config.rate_limit_per_sec = 1;
         let app = spawn_app(config).await;
 
-        // Each distinct token gets its own bucket: both pass the rate limit
-        // and are rejected by auth (401), not by quota (429).
+        // First forged token: passes the rate limit, rejected by auth (401).
         expect_upgrade_error(
             connect_async(ws_url(&app, "?token=wrong-1")).await,
             StatusCode::UNAUTHORIZED,
         );
+        // A different forged token from the same IP shares the bucket: 429.
         expect_upgrade_error(
             connect_async(ws_url(&app, "?token=wrong-2")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+    }
+
+    // ── Secure-by-default handshake policies ──────────────────────────────
+
+    /// Without any auth backend the terminal endpoint fails closed: the
+    /// handshake is rejected with 403 unless the operator explicitly opts
+    /// into unauthenticated access.
+    #[tokio::test]
+    async fn open_mode_terminal_is_rejected_by_default() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        // No auth backend and no explicit opt-in — the secure default.
+        config.terminal_allow_unauthenticated = false;
+        let app = spawn_app(config).await;
+
+        expect_upgrade_error(connect_async(ws_url(&app, "")).await, StatusCode::FORBIDDEN);
+    }
+
+    /// With the explicit opt-in the open-mode terminal works as before
+    /// (covered by the rest of the suite via `test_config`, restated here
+    /// against the same default-reject setup).
+    #[tokio::test]
+    async fn open_mode_terminal_allowed_when_explicitly_enabled() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let app = spawn_app(test_config(&proxy_url, &master_url)).await;
+
+        let (mut ws, _resp) = connect_async(ws_url(&app, ""))
+            .await
+            .expect("explicitly enabled open-mode terminal should upgrade");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+    }
+
+    /// The `?token=` query parameter is ignored when
+    /// `terminal_token_query_param` is off (the secure default): the
+    /// handshake authenticates as if the parameter were absent, and the
+    /// `Authorization: Bearer` header becomes the non-browser transport.
+    #[tokio::test]
+    async fn query_token_param_is_ignored_when_disabled() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let (callback_url, captured) = spawn_auth_callback(StatusCode::OK).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        config.terminal_token_query_param = false;
+        let app = spawn_app(config).await;
+
+        // The query token alone no longer authenticates: 401, and the
+        // callback must never see it.
+        expect_upgrade_error(
+            connect_async(ws_url(&app, "?token=good-token")).await,
             StatusCode::UNAUTHORIZED,
         );
-        // Repeating the first token within the window drains its bucket.
-        expect_upgrade_error(
-            connect_async(ws_url(&app, "?token=wrong-1")).await,
-            StatusCode::TOO_MANY_REQUESTS,
+        assert!(captured.lock().await.is_empty());
+
+        // The same token via the Authorization header upgrades.
+        let request =
+            tungstenite::ClientRequestBuilder::new(ws_url(&app, "").parse().expect("uri"))
+                .with_header("Authorization", "Bearer good-token");
+        let (mut ws, _resp) = connect_async(request)
+            .await
+            .expect("authorization-header handshake should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+
+        // …and is forwarded to the callback as Bearer.
+        let guard = captured.lock().await;
+        let authz = guard
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .map(|(_, v)| v.clone());
+        assert_eq!(authz.as_deref(), Some("Bearer good-token"));
+    }
+
+    /// Credential priority: the subprotocol token beats the Authorization
+    /// header, which beats the (enabled) query param.
+    #[tokio::test]
+    async fn credential_priority_subprotocol_then_authorization_then_query() {
+        let (proxy_url, _mock) = spawn_mock_envd().await;
+        let master_url = spawn_mock_master(STATUS_RUNNING).await;
+        let (callback_url, captured) = spawn_auth_callback(StatusCode::OK).await;
+        let mut config = test_config(&proxy_url, &master_url);
+        config.auth_callback_url = Some(callback_url);
+        let app = spawn_app(config).await;
+
+        async fn last_forwarded_bearer(captured: &CapturedHeaders) -> Option<String> {
+            captured
+                .lock()
+                .await
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "authorization")
+                .map(|(_, v)| v.clone())
+        }
+
+        // Authorization header + query token: the header wins.
+        let request = tungstenite::ClientRequestBuilder::new(
+            ws_url(&app, "?token=query-token").parse().expect("uri"),
+        )
+        .with_header("Authorization", "Bearer header-token");
+        let (mut ws, _resp) = connect_async(request)
+            .await
+            .expect("handshake should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+        ws.close(None).await.expect("close websocket");
+        assert_eq!(
+            last_forwarded_bearer(&captured).await.as_deref(),
+            Some("Bearer header-token")
+        );
+
+        // Subprotocol + Authorization header: the subprotocol wins.
+        let request =
+            tungstenite::ClientRequestBuilder::new(ws_url(&app, "").parse().expect("uri"))
+                .with_header("Authorization", "Bearer header-token")
+                .with_sub_protocol("cube-terminal")
+                .with_sub_protocol("cube-terminal.subprotocol-token");
+        let (mut ws, _resp) = connect_async(request)
+            .await
+            .expect("handshake should succeed");
+        let ready = recv_json(&mut ws).await;
+        assert_eq!(ready["type"], json!("ready"));
+        ws.close(None).await.expect("close websocket");
+        assert_eq!(
+            last_forwarded_bearer(&captured).await.as_deref(),
+            Some("Bearer subprotocol-token")
         );
     }
 }

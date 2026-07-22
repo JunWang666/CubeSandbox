@@ -33,19 +33,31 @@ pub async fn rate_limit(
     }
 }
 
-/// Derive the rate-limit bucket key for this request, mirroring the
-/// credential precedence of `unified_auth` / `handshake_credential`: the
-/// terminal WebSocket token (subprotocol first, then the `token` query param)
-/// maps to Bearer and wins over `X-API-Key`; with no credential at all the
-/// key is "anonymous".
+/// Derive the rate-limit bucket key for this request.
 ///
-/// Browser terminal handshakes cannot set headers, so their token arrives as
-/// a `cube-terminal.<token>` WebSocket subprotocol — keying only on
-/// `X-API-Key` would bucket every browser user together as "anonymous",
-/// letting anyone exhaust the shared quota with bare handshakes. The token is
-/// used only as the in-memory limiter key; it is never logged.
+/// Terminal WebSocket handshakes (`/sandboxes/.../terminal/ws`) are keyed by
+/// client IP, never by the presented credential: at this layer the credential
+/// is unverified, so keying on it would let an attacker mint unbounded
+/// buckets (limiter map growth) and rotate keys to dodge the quota. The
+/// per-IP coarse limit plus the terminal session caps bound the blast
+/// radius. A post-auth per-identity check in the handler was considered and
+/// deliberately skipped: `AppState::rate_limiter` is a single keyed limiter
+/// shared with the HTTP routes, so terminal identity keys would share quota
+/// semantics (and bucket namespace) with HTTP credential keys — a muddy
+/// tradeoff for marginal benefit once IP limiting and session caps apply.
+///
+/// All other routes keep the existing credential keying, mirroring the
+/// credential precedence of `unified_auth` / `handshake_credential`: a
+/// Bearer-shaped credential (the terminal subprotocol token, then the
+/// `token` query param) wins over `X-API-Key`; with no credential at all
+/// the key is "anonymous". The credential is used only as the in-memory
+/// limiter key; it is never logged.
 fn rate_limit_key(request: &Request) -> String {
     let headers = request.headers();
+
+    if is_terminal_path(request.uri().path()) {
+        return client_ip_key(headers);
+    }
 
     // Browser terminal handshake: `cube-terminal.<token>` subprotocol.
     if let Some(token) = headers
@@ -79,6 +91,34 @@ fn rate_limit_key(request: &Request) -> String {
     "anonymous".to_string()
 }
 
+/// Whether the request path is the terminal WebSocket route
+/// (`.../sandboxes/<id>/terminal/ws`).
+fn is_terminal_path(path: &str) -> bool {
+    path.contains("/sandboxes/") && path.ends_with("/terminal/ws")
+}
+
+/// Client-IP bucket key for terminal handshakes: the first
+/// `X-Forwarded-For` value (the deployment proxy overwrites it — direct
+/// clients could spoof it, but spoofing only moves them between equally
+/// sized buckets), then `X-Real-IP`, then "unknown".
+fn client_ip_key(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Extract one raw query parameter value (`name=value`), without
 /// percent-decoding. Empty values count as absent.
 fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -106,33 +146,66 @@ mod tests {
     }
 
     #[test]
-    fn key_prefers_subprotocol_token() {
+    fn terminal_path_is_keyed_by_client_ip() {
+        // The terminal route ignores the (unverified) credential and buckets
+        // by the first X-Forwarded-For value.
         let req = request(
             "/cubeapi/v1/sandboxes/sb-1/terminal/ws",
             &[
                 ("sec-websocket-protocol", "cube-terminal, cube-terminal.tok-1"),
-                ("x-api-key", "other-key"),
+                ("x-forwarded-for", "203.0.113.7, 10.0.0.1"),
             ],
         );
+        assert_eq!(rate_limit_key(&req), "203.0.113.7");
+    }
+
+    #[test]
+    fn terminal_same_ip_different_tokens_share_one_bucket() {
+        // Forged or rotated tokens must not mint fresh buckets: same IP →
+        // same key, whatever token the handshake presents.
+        let key_of = |token: &str| {
+            let req = request(
+                "/cubeapi/v1/sandboxes/sb-1/terminal/ws",
+                &[
+                    ("sec-websocket-protocol", token),
+                    ("x-forwarded-for", "203.0.113.7"),
+                ],
+            );
+            rate_limit_key(&req)
+        };
+        assert_eq!(
+            key_of("cube-terminal.forged-1"),
+            key_of("cube-terminal.forged-2")
+        );
+        // …and the same holds for query-param tokens.
+        let req = request(
+            "/cubeapi/v1/sandboxes/sb-1/terminal/ws?token=forged-3",
+            &[("x-forwarded-for", "203.0.113.7")],
+        );
+        assert_eq!(rate_limit_key(&req), "203.0.113.7");
+    }
+
+    #[test]
+    fn terminal_key_falls_back_to_x_real_ip_then_unknown() {
+        let req = request(
+            "/cubeapi/v1/sandboxes/sb-1/terminal/ws",
+            &[("x-real-ip", "198.51.100.9")],
+        );
+        assert_eq!(rate_limit_key(&req), "198.51.100.9");
+
+        let req = request("/cubeapi/v1/sandboxes/sb-1/terminal/ws", &[]);
+        assert_eq!(rate_limit_key(&req), "unknown");
+    }
+
+    #[test]
+    fn non_terminal_path_keeps_credential_keying() {
+        // A `/sandboxes/` route that is NOT the terminal WebSocket still
+        // keys on the credential, exactly as before.
+        let req = request(
+            "/cubeapi/v1/sandboxes/sb-1?token=tok-2",
+            &[("sec-websocket-protocol", "cube-terminal.tok-1")],
+        );
         assert_eq!(rate_limit_key(&req), "tok-1");
-    }
-
-    #[test]
-    fn key_uses_query_token_without_subprotocol() {
-        let req = request(
-            "/cubeapi/v1/sandboxes/sb-1/terminal/ws?token=tok-2&cols=80",
-            &[],
-        );
-        assert_eq!(rate_limit_key(&req), "tok-2");
-    }
-
-    #[test]
-    fn empty_subprotocol_token_falls_back_to_query_token() {
-        let req = request(
-            "/cubeapi/v1/sandboxes/sb-1/terminal/ws?token=tok-3",
-            &[("sec-websocket-protocol", "cube-terminal, cube-terminal.")],
-        );
-        assert_eq!(rate_limit_key(&req), "tok-3");
     }
 
     #[test]
