@@ -271,6 +271,13 @@ controlPlane:
     env: []
     bind: "0.0.0.0:3000"
     sandboxDomain: "cube.app"
+    # Auth callback for CubeAPI's unified auth (all routes, incl. the web
+    # terminal). "auto" wires the co-deployed CubeOps JWT verifier
+    # (POST /api/v1/auth/verify) when cubeOps is enabled; "off" runs CubeAPI
+    # without authentication (the web terminal then stays disabled unless
+    # TERMINAL_ALLOW_UNAUTHENTICATED=true is set via env); any other value is
+    # used verbatim as the callback URL.
+    authCallbackUrl: "auto"
     service:
       type: ClusterIP
       port: 3000

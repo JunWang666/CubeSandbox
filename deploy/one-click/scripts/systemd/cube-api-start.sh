@@ -22,8 +22,16 @@ export CUBE_API_SANDBOX_DOMAIN="${CUBE_API_SANDBOX_DOMAIN:-cube.app}"
 if [[ -n "${CUBE_MASTER_ADDR:-}" ]]; then
   export CUBE_MASTER_ADDR
 fi
-if [[ -n "${AUTH_CALLBACK_URL:-}" ]]; then
-  export AUTH_CALLBACK_URL
+# Auth callback: default to the co-located CubeOps JWT verifier
+# (POST /api/v1/auth/verify) so the web terminal — and every other CubeAPI
+# route — is not wide open out of the box. Point AUTH_CALLBACK_URL at your
+# own service to override, or set AUTH_CALLBACK_URL=off to explicitly run
+# without authentication (the terminal then stays disabled unless
+# TERMINAL_ALLOW_UNAUTHENTICATED=true).
+if [[ "${AUTH_CALLBACK_URL:-}" == "off" ]]; then
+  unset AUTH_CALLBACK_URL
+else
+  export AUTH_CALLBACK_URL="${AUTH_CALLBACK_URL:-http://127.0.0.1:3010/api/v1/auth/verify}"
 fi
 if [[ -n "${CUBE_API_KEY:-}" ]]; then
   export CUBE_API_KEY
