@@ -4,9 +4,11 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as Dialog from '@radix-ui/react-dialog';
+import { useQuery } from '@tanstack/react-query';
 import { X, Maximize2, Minimize2, RotateCcw, Plus, Minus, Loader2 } from 'lucide-react';
 import '@xterm/xterm/css/xterm.css';
 import { Button } from '@/components/ui/button';
+import { sandboxApi } from '@/api/client';
 import { cn } from '@/lib/utils';
 import { useTerminal } from './useTerminal';
 
@@ -19,6 +21,21 @@ interface Props {
 export function TerminalDialog({ sandboxID, open, onOpenChange }: Props) {
   const { t } = useTranslation('terminal');
   const [fullscreen, setFullscreen] = useState(false);
+  // Container list comes from the sandbox detail; the selector is only shown
+  // for multi-container sandboxes. Default selection is the primary container
+  // (kind === 'sandbox'), falling back to the first entry.
+  const detail = useQuery({
+    queryKey: ['sandbox', sandboxID],
+    queryFn: () => sandboxApi.get(sandboxID),
+    enabled: open && !!sandboxID,
+  });
+  const containers = detail.data?.containers ?? null;
+  const showContainerSelector = !!containers && containers.length > 1;
+  const primaryContainerID =
+    containers?.find((c) => c.kind === 'sandbox')?.containerID ?? containers?.[0]?.containerID;
+  const [selectedContainerID, setSelectedContainerID] = useState<string | null>(null);
+  const containerID =
+    selectedContainerID ?? (showContainerSelector ? primaryContainerID : undefined);
   const {
     containerRef,
     status,
@@ -28,7 +45,7 @@ export function TerminalDialog({ sandboxID, open, onOpenChange }: Props) {
     fontSize,
     increaseFontSize,
     decreaseFontSize,
-  } = useTerminal(sandboxID, open);
+  } = useTerminal(sandboxID, open, containerID);
 
   const handleOpenChange = (next: boolean) => {
     if (!next) setFullscreen(false);
@@ -65,6 +82,23 @@ export function TerminalDialog({ sandboxID, open, onOpenChange }: Props) {
             <Dialog.Description className="sr-only">
               {t('description', { id: sandboxID })}
             </Dialog.Description>
+            {showContainerSelector && containers && (
+              <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                {t('container')}
+                <select
+                  aria-label={t('selectContainer')}
+                  value={containerID ?? ''}
+                  onChange={(event) => setSelectedContainerID(event.target.value)}
+                  className="h-7 rounded-md border border-input bg-background/50 px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {containers.map((c) => (
+                    <option key={c.containerID} value={c.containerID}>
+                      {c.name || c.containerID.slice(0, 12)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <span
               className={cn(
                 'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ring-1',

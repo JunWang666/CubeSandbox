@@ -1173,3 +1173,81 @@ func TestTransformError(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveEnvdPort(t *testing.T) {
+	tests := []struct {
+		name           string
+		envs           []*cubebox.KeyValue
+		index          int
+		wantPort       int
+		wantNeedInject bool
+	}{
+		{
+			name:           "default injection for pod container",
+			envs:           nil,
+			index:          0,
+			wantPort:       constants.DefaultEnvdPort,
+			wantNeedInject: true,
+		},
+		{
+			name:           "default injection for second container",
+			envs:           nil,
+			index:          1,
+			wantPort:       constants.DefaultEnvdPort + 1,
+			wantNeedInject: true,
+		},
+		{
+			name:           "default injection for third container",
+			envs:           nil,
+			index:          2,
+			wantPort:       constants.DefaultEnvdPort + 2,
+			wantNeedInject: true,
+		},
+		{
+			name: "user provided ENVD_PORT is kept",
+			envs: []*cubebox.KeyValue{
+				{Key: "FOO", Value: "bar"},
+				{Key: "ENVD_PORT", Value: "50000"},
+			},
+			index:          1,
+			wantPort:       50000,
+			wantNeedInject: false,
+		},
+		{
+			name: "invalid user ENVD_PORT falls back to default",
+			envs: []*cubebox.KeyValue{
+				{Key: "ENVD_PORT", Value: "not-a-port"},
+			},
+			index:          2,
+			wantPort:       constants.DefaultEnvdPort + 2,
+			wantNeedInject: true,
+		},
+		{
+			name: "empty user ENVD_PORT falls back to default",
+			envs: []*cubebox.KeyValue{
+				{Key: "ENVD_PORT", Value: ""},
+			},
+			index:          0,
+			wantPort:       constants.DefaultEnvdPort,
+			wantNeedInject: true,
+		},
+		{
+			name: "nil entries are skipped",
+			envs: []*cubebox.KeyValue{
+				nil,
+				{Key: "ENVD_PORT", Value: "50001"},
+			},
+			index:          0,
+			wantPort:       50001,
+			wantNeedInject: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			port, needInject := resolveEnvdPort(tt.envs, tt.index)
+			assert.Equal(t, tt.wantPort, port)
+			assert.Equal(t, tt.wantNeedInject, needInject)
+		})
+	}
+}

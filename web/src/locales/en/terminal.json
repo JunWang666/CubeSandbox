@@ -11,6 +11,8 @@
     "error": "Connection error"
   },
   "exitCode": "Shell exited with code {{code}}",
+  "container": "Container",
+  "selectContainer": "Select container",
   "reconnect": "Reconnect",
   "close": "Close",
   "fullscreen": "Toggle fullscreen",

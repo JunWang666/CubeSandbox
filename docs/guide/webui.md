@@ -115,11 +115,23 @@ The dialog is a full [xterm.js](https://xtermjs.org/) terminal running a `/bin/b
 - **Idle timeout** — a session with no input and no shell output for 30 minutes is terminated server-side; any activity resets the timer, so a session streaming output (`tail -f`, a long build) is not cut off just because you are not typing. Tune it with the CubeAPI env var `TERMINAL_IDLE_TIMEOUT_SECS` (seconds, default `1800`).
 - **Transport limits** — client WebSocket messages are capped at 64 KiB, and server-side writes carry a 10-second deadline.
 
-### 4.4 How it works
+### 4.4 Multi-container sandboxes
 
-Browser xterm.js ⇄ WSS ⇄ CubeAPI (`GET /cubeapi/v1/sandboxes/{sandboxID}/terminal/ws`) ⇄ CubeProxy ⇄ `envd` (port `49983`), which hosts the PTY inside the sandbox. When your deployment is behind TLS, the transport rides the same HTTPS/WSS encryption. The shell runs **root inside the sandbox only** — the same permission boundary as SDK `exec` — and is not a path to the host.
+When a sandbox runs more than one container, the dialog header shows a **container selector** listing every container reported for the sandbox (the primary container is selected by default). Picking a container reconnects the session into that container's own environment — its filesystem, processes, and env vars.
 
-### 4.5 Auth and audit
+How it works: every container created from a cube-base image starts its own `envd`, listening on port `49983 + <container index>` (the primary container keeps `49983`). Cubelet records the port in the container label `cube.envd-port`, CubeMaster exposes it as `envd_port` on the sandbox info API, and CubeAPI routes the terminal WebSocket to the selected container's port. A container whose image sets `ENVD_PORT` explicitly is honored instead of the convention. Non-browser clients get the same behavior with the `container` query parameter (container ID or name) on the terminal WebSocket URL.
+
+Caveats:
+
+- Only containers running `envd` (images based on `cube-base`) are terminal-capable; selecting anything else fails with a connection error.
+- Sandboxes created before multi-container terminal support only expose the primary container — other containers are rejected with a clear "no terminal endpoint" message.
+- On multi-node deployments, reaching a non-primary container's envd port **across hosts** requires that port to be exposed at sandbox creation time (the same mechanism that exposes `49983`); same-host routing works out of the box.
+
+### 4.5 How it works
+
+Browser xterm.js ⇄ WSS ⇄ CubeAPI (`GET /cubeapi/v1/sandboxes/{sandboxID}/terminal/ws`) ⇄ CubeProxy ⇄ `envd` (port `49983` for the primary container, `49983 + index` otherwise), which hosts the PTY inside the sandbox. When your deployment is behind TLS, the transport rides the same HTTPS/WSS encryption. The shell runs **root inside the selected container only** — the same permission boundary as SDK `exec` — and is not a path to the host.
+
+### 4.6 Auth and audit
 
 - **Auth modes** — CubeAPI supports two auth modes (plus fully open), and its unified auth middleware protects every route, the terminal included. Because browsers cannot set headers on a WebSocket handshake, the terminal endpoint validates the credential itself, mirroring the middleware's logic. See [Authentication](./authentication.md).
   - **Callback mode** (`AUTH_CALLBACK_URL` set): CubeAPI forwards the credential to your callback together with `X-Request-Path` and `X-Request-Method`; an HTTP 200 grants access. A callback that validates the WebUI login JWT therefore works for the terminal too. Note the terminal is mounted under the `/cubeapi/v1` prefix (`GET /cubeapi/v1/sandboxes/{sandboxID}/terminal/ws`) — a callback that whitelists by path must allow that prefix.
@@ -129,15 +141,15 @@ Browser xterm.js ⇄ WSS ⇄ CubeAPI (`GET /cubeapi/v1/sandboxes/{sandboxID}/ter
 - **Origin check** — CubeAPI rejects WebSocket upgrade requests whose `Origin` host does not match the request host, so cross-origin browser connections get `403`. Port rules: a port-less `Origin` (scheme default) matches on hostname alone; an explicit `Origin` port must match the request `Host` port — a `Host` without a port is read as the scheme default (80/443). If you front CubeAPI with a reverse proxy on a **non-default port**, forward the full authority so the port survives (`proxy_set_header Host $http_host;` in nginx); `proxy_set_header Host $host;` strips the port and non-default-port origins will be rejected.
 - **Reverse-proxy requirements** — the terminal is a long-lived WebSocket, so a fronting proxy must use HTTP/1.1 with `Upgrade`/`Connection` header forwarding (`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade;`) and a `proxy_read_timeout` larger than the server-side idle timeout — the bundled nginx configs (one-click and Helm) use `7206s` against the default 1800 s idle timeout. Both bundled configs route `/cubeapi/v1/sandboxes/*/terminal/ws` directly to CubeAPI; the remaining `/cubeapi/v1/*` SDK calls go to CubeOps, which has no terminal route.
 - **Tuning (CubeAPI env vars)** — `SANDBOX_PROXY_URL`: base URL of CubeProxy used to reach envd inside sandboxes (default `http://127.0.0.1`, correct for one-click where CubeProxy shares the host network; the Helm chart sets it to the CubeProxy Service automatically). `TERMINAL_IDLE_TIMEOUT_SECS` and `TERMINAL_MAX_SESSIONS_PER_SANDBOX` are covered in §4.3; `TERMINAL_MAX_SESSIONS_GLOBAL` caps concurrent terminal sessions across all sandboxes (default `128`, rejected beyond the cap with `429`).
-- **Audit** — CubeAPI logs session open / close / timeout events with timestamp, user identity (when available), client IP, sandbox ID, and shell PID. Rejected attempts (bad token, origin mismatch, sandbox not found or not running, session limit exceeded) are audited too, with the reason and client IP.
+- **Audit** — CubeAPI logs session open / close / timeout events with timestamp, user identity (when available), client IP, sandbox ID, target container (when a non-default container is selected), and shell PID. Rejected attempts (bad token, origin mismatch, sandbox not found or not running, session limit exceeded) are audited too, with the reason and client IP.
 
-### 4.6 Known limitations
+### 4.7 Known limitations
 
-- In simple-key auth mode (`CUBE_API_KEY` without `AUTH_CALLBACK_URL`) the web terminal is unavailable — the browser's CubeOps JWT never equals `CUBE_API_KEY` (see §4.5).
+- In simple-key auth mode (`CUBE_API_KEY` without `AUTH_CALLBACK_URL`) the web terminal is unavailable — the browser's CubeOps JWT never equals `CUBE_API_KEY` (see §4.6).
 - Sandboxes created with public-traffic restriction (`allowPublicTraffic=false` / traffic access token) can't use the web terminal — the traffic token isn't recoverable after creation, so the dialog shows a connection error.
 - Terminal access authenticates the user but does **not** authorize per sandbox — any authenticated user can open a terminal on any sandbox. This matches the sandbox API's current posture (no per-user sandbox ownership yet) and is tracked as future multi-tenancy work.
 - The sandbox image must include `envd` (all standard templates do).
-- Multi-container sandboxes: the shell lands in the sandbox's default environment; use normal in-sandbox tools (e.g. `docker exec`) to reach specific containers.
+- Multi-container sandboxes: only `envd`-based containers are selectable, and pre-existing sandboxes expose just the primary container — see §4.4.
 
 ## 5. Keyboard shortcuts
 

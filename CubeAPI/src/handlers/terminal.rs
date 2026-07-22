@@ -8,6 +8,14 @@
 // CubeProxy via Host-header routing — the same wire protocol as the Go
 // SDK's `pty.go`).
 //
+// Multi-container sandboxes: the sandbox's i-th container runs its own envd
+// on port 49983 + i, reported by CubeMaster as `envd_port` per container.
+// The optional `container` query parameter selects the target container by
+// ID or name; without it the primary container is used. Sandboxes created
+// before per-container envd ports existed carry no port on their sidecar
+// containers — selecting one is rejected with 409, while the primary
+// container falls back to ENVD_PORT.
+//
 // Sandboxes created with `allowPublicTraffic = false` require CubeProxy's
 // `e2b-traffic-access-token` header. This endpoint does not send one: the
 // token is only handed out at sandbox create time (CubeProxy enforces it
@@ -80,13 +88,15 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::{
-    cubemaster::SandboxStatus,
+    cubemaster::{SandboxContainer, SandboxStatus},
     error::{AppError, AppResult},
     middleware::auth::{constant_time_eq, AUTH_CALLBACK_TIMEOUT},
     state::AppState,
 };
 
-/// envd's Connect-RPC port inside every sandbox.
+/// envd's Connect-RPC port of the primary container — also the fallback for
+/// sandboxes created before per-container envd ports existed (sidecar
+/// containers listen on 49983 + i; see `resolve_envd_port`).
 const ENVD_PORT: u16 = 49983;
 /// Connect-RPC streaming content type.
 const CONNECT_JSON: &str = "application/connect+json";
@@ -142,10 +152,70 @@ pub struct TerminalQuery {
     /// (see `handshake_token`); the query param is only used when no token
     /// subprotocol was offered.
     token: Option<String>,
+    /// Target container (ID or name) for multi-container sandboxes.
+    /// Defaults to the primary container; see `resolve_envd_port`.
+    container: Option<String>,
 }
 
 fn clamp_size(value: Option<u32>, default: u32) -> u32 {
     value.unwrap_or(default).clamp(MIN_PTY_SIZE, MAX_PTY_SIZE)
+}
+
+/// Pick the target container for a terminal session. Without a selector the
+/// primary container (kind == "sandbox", or whose ID equals the sandbox ID)
+/// wins, falling back to the first entry; with a selector the container is
+/// matched by ID or name.
+fn select_container<'a>(
+    containers: &'a [SandboxContainer],
+    sandbox_id: &str,
+    selector: Option<&str>,
+) -> Option<&'a SandboxContainer> {
+    match selector {
+        None => containers
+            .iter()
+            .find(|c| c.kind == "sandbox" || c.container_id == sandbox_id)
+            .or_else(|| containers.first()),
+        Some(s) => containers
+            .iter()
+            .find(|c| c.container_id == s || c.name == s),
+    }
+}
+
+/// Resolve the envd port for the container selected by `selector`
+/// (container ID or name; None = primary container).
+///
+/// - No selector: the primary container's port, falling back to ENVD_PORT
+///   when it carries no `envd_port` (sandboxes created before per-container
+///   envd ports existed) or when CubeMaster reports no containers at all.
+/// - With a selector: 404 when no container matches, 409 when the match has
+///   no terminal endpoint (e.g. a sidecar of a pre-feature sandbox).
+fn resolve_envd_port(
+    containers: &[SandboxContainer],
+    sandbox_id: &str,
+    selector: Option<&str>,
+) -> AppResult<u16> {
+    let container = match select_container(containers, sandbox_id, selector) {
+        Some(container) => container,
+        None => {
+            return match selector {
+                // No containers reported at all: keep the legacy
+                // single-container behaviour for the default target.
+                None => Ok(ENVD_PORT),
+                Some(s) => Err(AppError::NotFound(format!(
+                    "container {} not found in sandbox {}",
+                    s, sandbox_id
+                ))),
+            };
+        }
+    };
+    match container.envd_port.filter(|port| *port > 0) {
+        Some(port) => Ok(port),
+        None if selector.is_none() => Ok(ENVD_PORT),
+        None => Err(AppError::Conflict(format!(
+            "container {} does not expose a terminal endpoint",
+            container.container_id
+        ))),
+    }
 }
 
 /// Client → server WebSocket messages.
@@ -462,6 +532,7 @@ pub async fn terminal_ws(
         audit_log(
             "auth-failure",
             &sandbox_id,
+            query.container.as_deref(),
             None,
             None,
             client_ip.as_deref(),
@@ -479,6 +550,7 @@ pub async fn terminal_ws(
             audit_log(
                 "auth-failure",
                 &sandbox_id,
+                query.container.as_deref(),
                 None,
                 None,
                 client_ip.as_deref(),
@@ -488,18 +560,21 @@ pub async fn terminal_ws(
         }
     };
 
-    let status = match state
+    // One CubeMaster round-trip yields both the liveness-gate status and the
+    // per-container envd ports used to route the session below.
+    let detail = match state
         .services
         .sandboxes
-        .get_sandbox_status(&sandbox_id)
+        .get_sandbox_runtime_detail(&sandbox_id)
         .await
     {
-        Ok(status) => status,
+        Ok(detail) => detail,
         Err(err) => {
             if matches!(err, AppError::NotFound(_)) {
                 audit_log(
                     "rejected",
                     &sandbox_id,
+                    query.container.as_deref(),
                     None,
                     user.as_deref(),
                     client_ip.as_deref(),
@@ -509,10 +584,11 @@ pub async fn terminal_ws(
             return Err(err);
         }
     };
-    if status != SandboxStatus::Running {
+    if detail.status != SandboxStatus::Running {
         audit_log(
             "rejected",
             &sandbox_id,
+            query.container.as_deref(),
             None,
             user.as_deref(),
             client_ip.as_deref(),
@@ -520,9 +596,37 @@ pub async fn terminal_ws(
         );
         return Err(AppError::Conflict(format!(
             "sandbox {} is not running (status: {:?})",
-            sandbox_id, status
+            sandbox_id, detail.status
         )));
     }
+
+    // Resolve the target container's envd port before the upgrade so an
+    // unknown container (404) or one without a terminal endpoint (409) gets
+    // a proper HTTP status.
+    let envd_port = match resolve_envd_port(
+        &detail.containers,
+        &sandbox_id,
+        query.container.as_deref(),
+    ) {
+        Ok(port) => port,
+        Err(err) => {
+            audit_log(
+                "rejected",
+                &sandbox_id,
+                query.container.as_deref(),
+                None,
+                user.as_deref(),
+                client_ip.as_deref(),
+                Some("container-unavailable"),
+            );
+            return Err(err);
+        }
+    };
+    // Audit trails record the resolved container ID, falling back to the raw
+    // selector when it did not match any container.
+    let audit_container = select_container(&detail.containers, &sandbox_id, query.container.as_deref())
+        .map(|c| c.container_id.clone())
+        .or_else(|| query.container.clone());
 
     let max_sessions = state.config.terminal_max_sessions_per_sandbox.max(1);
     let max_global = state.config.terminal_max_sessions_global.max(1);
@@ -535,6 +639,7 @@ pub async fn terminal_ws(
             audit_log(
                 "rejected",
                 &sandbox_id,
+                query.container.as_deref(),
                 None,
                 user.as_deref(),
                 client_ip.as_deref(),
@@ -591,9 +696,11 @@ pub async fn terminal_ws(
                 state,
                 sandbox_id,
                 domain,
+                envd_port,
                 cols,
                 rows,
                 idle_timeout,
+                audit_container,
                 audit_user,
                 audit_ip,
             )
@@ -720,6 +827,7 @@ fn client_ip(headers: &HeaderMap) -> Option<String> {
 fn audit_log(
     event: &str,
     sandbox_id: &str,
+    container: Option<&str>,
     pid: Option<i64>,
     user: Option<&str>,
     client_ip: Option<&str>,
@@ -728,6 +836,7 @@ fn audit_log(
     tracing::info!(
         event = event,
         sandbox_id = sandbox_id,
+        container = container.unwrap_or(""),
         pid = pid,
         user = user.unwrap_or(""),
         client_ip = client_ip.unwrap_or(""),
@@ -1164,13 +1273,16 @@ async fn run_session(
     state: AppState,
     sandbox_id: String,
     domain: String,
+    envd_port: u16,
     cols: u32,
     rows: u32,
     idle_timeout: Duration,
+    container: Option<String>,
     user: Option<String>,
     client_ip: Option<String>,
 ) {
-    let host = format!("{}-{}.{}", ENVD_PORT, sandbox_id, domain);
+    // CubeProxy routes by Host header: "<envd-port>-<sandbox-id>.<domain>".
+    let host = format!("{}-{}.{}", envd_port, sandbox_id, domain);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Unique tag on the Start request: if envd spawns the shell but the
@@ -1195,6 +1307,7 @@ async fn run_session(
             audit_log(
                 "close",
                 &sandbox_id,
+                container.as_deref(),
                 None,
                 user.as_deref(),
                 client_ip.as_deref(),
@@ -1222,6 +1335,7 @@ async fn run_session(
             audit_log(
                 "close",
                 &sandbox_id,
+                container.as_deref(),
                 None,
                 user.as_deref(),
                 client_ip.as_deref(),
@@ -1242,6 +1356,7 @@ async fn run_session(
             pid,
             &mut ws_tx,
             CloseReason::ClientDisconnect,
+            container.as_deref(),
             user.as_deref(),
             client_ip.as_deref(),
         )
@@ -1251,6 +1366,7 @@ async fn run_session(
     audit_log(
         "open",
         &sandbox_id,
+        container.as_deref(),
         Some(pid),
         user.as_deref(),
         client_ip.as_deref(),
@@ -1272,6 +1388,7 @@ async fn run_session(
         audit_log(
             "timeout",
             &sandbox_id,
+            container.as_deref(),
             Some(pid),
             user.as_deref(),
             client_ip.as_deref(),
@@ -1287,6 +1404,7 @@ async fn run_session(
         pid,
         &mut ws_tx,
         reason,
+        container.as_deref(),
         user.as_deref(),
         client_ip.as_deref(),
     )
@@ -1305,6 +1423,7 @@ async fn teardown_session(
     pid: i64,
     ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
     reason: CloseReason,
+    container: Option<&str>,
     user: Option<&str>,
     client_ip: Option<&str>,
 ) {
@@ -1323,6 +1442,7 @@ async fn teardown_session(
     audit_log(
         "close",
         sandbox_id,
+        container,
         Some(pid),
         user,
         client_ip,
@@ -2255,6 +2375,92 @@ mod tests {
         assert!(!check(Some("not-a-url"), "example.com"));
         // Bracketed IPv6 without a port is not misparsed as host+port.
         assert!(check(Some("http://[::1]"), "[::1]"));
+    }
+
+    // ── Multi-container envd port resolution ──────────────────────────────
+
+    fn container(name: &str, id: &str, kind: &str, envd_port: Option<u16>) -> SandboxContainer {
+        SandboxContainer {
+            name: name.to_string(),
+            container_id: id.to_string(),
+            kind: kind.to_string(),
+            envd_port,
+        }
+    }
+
+    fn multi_containers() -> Vec<SandboxContainer> {
+        vec![
+            container("sandbox", SANDBOX_ID, "sandbox", Some(ENVD_PORT)),
+            container("sidecar", "cid-sidecar", "container", Some(ENVD_PORT + 1)),
+        ]
+    }
+
+    #[test]
+    fn resolve_envd_port_defaults_to_primary_container() {
+        let containers = multi_containers();
+        assert_eq!(
+            resolve_envd_port(&containers, SANDBOX_ID, None).expect("port"),
+            ENVD_PORT
+        );
+    }
+
+    #[test]
+    fn resolve_envd_port_falls_back_without_label_or_containers() {
+        // Pre-feature sandbox: primary container carries no envd_port.
+        let containers = vec![container("sandbox", SANDBOX_ID, "sandbox", None)];
+        assert_eq!(
+            resolve_envd_port(&containers, SANDBOX_ID, None).expect("port"),
+            ENVD_PORT
+        );
+        // envd_port = 0 is normalized to "no endpoint" at deserialization;
+        // a literal 0 must behave the same as None.
+        let containers = vec![container("sandbox", SANDBOX_ID, "sandbox", Some(0))];
+        assert_eq!(
+            resolve_envd_port(&containers, SANDBOX_ID, None).expect("port"),
+            ENVD_PORT
+        );
+        // CubeMaster reporting no containers at all keeps legacy behaviour.
+        assert_eq!(
+            resolve_envd_port(&[], SANDBOX_ID, None).expect("port"),
+            ENVD_PORT
+        );
+    }
+
+    #[test]
+    fn resolve_envd_port_selects_by_id_and_name() {
+        let containers = multi_containers();
+        assert_eq!(
+            resolve_envd_port(&containers, SANDBOX_ID, Some("cid-sidecar")).expect("port"),
+            ENVD_PORT + 1
+        );
+        assert_eq!(
+            resolve_envd_port(&containers, SANDBOX_ID, Some("sidecar")).expect("port"),
+            ENVD_PORT + 1
+        );
+    }
+
+    #[test]
+    fn resolve_envd_port_unknown_container_is_not_found() {
+        let containers = multi_containers();
+        let err = resolve_envd_port(&containers, SANDBOX_ID, Some("nope"))
+            .expect_err("unknown container must 404");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn resolve_envd_port_sidecar_without_endpoint_is_conflict() {
+        // Pre-feature sandbox: the sidecar exists but has no terminal
+        // endpoint; selecting it explicitly is a 409, and a literal 0 port
+        // is treated the same as a missing one.
+        for envd_port in [None, Some(0)] {
+            let containers = vec![
+                container("sandbox", SANDBOX_ID, "sandbox", Some(ENVD_PORT)),
+                container("sidecar", "cid-sidecar", "container", envd_port),
+            ];
+            let err = resolve_envd_port(&containers, SANDBOX_ID, Some("cid-sidecar"))
+                .expect_err("sidecar without endpoint must 409");
+            assert!(matches!(err, AppError::Conflict(_)));
+        }
     }
 
     #[tokio::test]

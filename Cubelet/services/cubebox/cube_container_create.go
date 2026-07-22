@@ -77,11 +77,32 @@ const (
 
 	K8sEmptyDirPath        = "kubernetes.io~empty-dir"
 	envdInitCleanupTimeout = 10 * time.Second
+
+	// envdPortEnvKey is the env var the cube-base entrypoint reads to pick
+	// the envd listen port inside a container.
+	envdPortEnvKey = "ENVD_PORT"
 )
 
 func init() {
 	typeurl.Register(&cubeboxstore.CubeBox{},
 		"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox", "CubeBox")
+}
+
+// resolveEnvdPort decides the envd listen port for the container created at
+// index. A valid user-provided ENVD_PORT wins and is kept as-is; otherwise
+// the port defaults to DefaultEnvdPort+index and must be injected into envs.
+// An unparseable user value is ignored rather than failing the creation.
+func resolveEnvdPort(envs []*cubebox.KeyValue, index int) (port int, needInject bool) {
+	for _, kv := range envs {
+		if kv == nil || kv.Key != envdPortEnvKey {
+			continue
+		}
+		if p, err := strconv.Atoi(kv.Value); err == nil {
+			return p, false
+		}
+		break
+	}
+	return constants.DefaultEnvdPort + index, true
 }
 
 func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error {
@@ -241,6 +262,12 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 		ctxTmp = constants.WithFuncType(ctxTmp, ci.InstanceType)
 
 		cntrReq.Envs = append(cntrReq.Envs, containerNameArray...)
+
+		envdPort, needInject := resolveEnvdPort(cntrReq.Envs, i)
+		if needInject {
+			cntrReq.Envs = append(cntrReq.Envs, &cubebox.KeyValue{Key: envdPortEnvKey, Value: strconv.Itoa(envdPort)})
+		}
+		ci.AddLabels(map[string]string{constants.LabelContainerEnvdPort: strconv.Itoa(envdPort)})
 
 		start := time.Now()
 

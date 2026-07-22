@@ -45,13 +45,15 @@ function encodeBase64(text: string): string {
   return btoa(bin);
 }
 
-function buildWsUrl(sandboxID: string, cols: number, rows: number): string {
+function buildWsUrl(sandboxID: string, cols: number, rows: number, containerID?: string): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = new URL(
     `${proto}//${window.location.host}/cubeapi/v1/sandboxes/${encodeURIComponent(sandboxID)}/terminal/ws`,
   );
   url.searchParams.set('cols', String(cols));
   url.searchParams.set('rows', String(rows));
+  // Optional target container (ID or name); omitted means the primary container.
+  if (containerID) url.searchParams.set('container', containerID);
   return url.toString();
 }
 
@@ -80,9 +82,15 @@ interface TerminalSession {
 /**
  * Owns one xterm.js instance plus its WebSocket session for a single sandbox.
  * Each TerminalDialog calls this hook independently, so multiple terminals can
- * coexist. Everything is torn down when `open` flips to false.
+ * coexist. Everything is torn down when `open` flips to false. `containerID`
+ * selects the target container (multi-container sandboxes); changing it
+ * reconnects the session against the new container.
  */
-export function useTerminal(sandboxID: string, open: boolean): TerminalSession {
+export function useTerminal(
+  sandboxID: string,
+  open: boolean,
+  containerID?: string,
+): TerminalSession {
   // The container lives inside a Radix Dialog portal whose mount timing is not
   // synchronized with this effect, so a plain ref + effect can fire before the
   // element exists and never retry. A callback ref + state re-runs the effect
@@ -189,7 +197,10 @@ export function useTerminal(sandboxID: string, open: boolean): TerminalSession {
       if (closedByUs) return;
 
       try {
-        ws = new WebSocket(buildWsUrl(sandboxID, term.cols, term.rows), wsProtocols(token));
+        ws = new WebSocket(
+          buildWsUrl(sandboxID, term.cols, term.rows, containerID),
+          wsProtocols(token),
+        );
       } catch (err) {
         setErrorMessage(String(err));
         updateStatus('error');
@@ -317,7 +328,9 @@ export function useTerminal(sandboxID: string, open: boolean): TerminalSession {
       fitRef.current = null;
     };
     // `session` bumps on reconnect; fontSize is applied by the effect below.
-  }, [open, sandboxID, session, containerEl]);
+    // `containerID` switching tears the session down and reconnects against
+    // the new container.
+  }, [open, sandboxID, session, containerEl, containerID]);
 
   // Apply font-size changes to the live terminal and re-fit.
   useEffect(() => {

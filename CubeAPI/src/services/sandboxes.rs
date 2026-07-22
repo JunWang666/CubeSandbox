@@ -112,12 +112,17 @@ impl SandboxService {
             .collect())
     }
 
-    /// Raw CubeMaster status for a sandbox. Used by liveness gates (the
-    /// terminal WebSocket endpoint) that must distinguish Running from
-    /// stopped/error states — unlike `sandbox_state_from_status`, which
-    /// collapses every non-paused status to Running for API responses.
-    pub async fn get_sandbox_status(&self, sandbox_id: &str) -> AppResult<SandboxStatus> {
-        Ok(self.fetch_sandbox_detail(sandbox_id).await?.status)
+    /// Full CubeMaster runtime detail (raw status + per-container envd
+    /// ports). Used by liveness gates (the terminal WebSocket endpoint) that
+    /// must distinguish Running from stopped/error states — unlike
+    /// `sandbox_state_from_status`, which collapses every non-paused status
+    /// to Running for API responses — and that resolve the target
+    /// container's envd port, all with a single CubeMaster round-trip.
+    pub async fn get_sandbox_runtime_detail(
+        &self,
+        sandbox_id: &str,
+    ) -> AppResult<crate::cubemaster::SandboxDetail> {
+        self.fetch_sandbox_detail(sandbox_id).await
     }
 
     pub async fn get_sandbox(&self, sandbox_id: &str) -> AppResult<SandboxDetail> {
@@ -153,6 +158,21 @@ impl SandboxService {
             metadata: optional_metadata(d.labels),
             state: sandbox_state_from_status(d.status),
             volume_mounts: None,
+            containers: if d.containers.is_empty() {
+                None
+            } else {
+                Some(
+                    d.containers
+                        .into_iter()
+                        .map(|c| crate::models::SandboxContainerInfo {
+                            name: c.name,
+                            container_id: c.container_id,
+                            kind: c.kind,
+                            envd_port: c.envd_port,
+                        })
+                        .collect(),
+                )
+            },
         })
     }
 
