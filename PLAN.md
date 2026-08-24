@@ -75,30 +75,64 @@ PreFilter → Filter → Score → PostScore → 加权随机选点，内置 6 �
 
 ## 2. 设计取向
 
-三条原则决定了整个方案的形状。
+### 2.0 兼容底线：一切建立在现有两个接口之上
 
-**策略层 100% 表达式化。** 打分和业务过滤本质是纯函数 `f(node, req, cluster) → score/bool`，
-Go 插件相对表达式没有表达力优势，却带来重编译、重发版、滚动重启的成本。
-内置策略也用表达式写，随发行版分发，同时充当示例文档。
+这条约束优先于后面所有设计，任何与之冲突的方案一律让路。
+
+```go
+// CubeMaster/pkg/selector/filter/init.go
+type Selector interface {
+	Select(selCtx *selctx.SelectorCtx) (node.NodeList, error)
+	ID() string
+}
+
+// CubeMaster/pkg/selector/score/init.go
+type Selector interface {
+	Select(selCtx *selctx.SelectorCtx) (node.NodeScoreList, error)
+	ID() string
+	Weight() float64
+	Disable() bool
+}
+```
+
+**这两个接口的方法签名一字不改。** 为解开自注册的 import 环，把接口定义下沉到
+`pkg/selector/spi`，老包用 Go 类型别名承接（`type Selector = spi.Filter`）——
+这是零破坏改动，所有存量实现与调用方无需任何修改。
+
+**现有 6 个 filter 与 4 个 score 插件全部保留、继续可用，一个都不删。**
+`thirtparty`（当前为空壳）只标记 deprecated，不移除。
+
+**本方案新增的"表达式宿主"与"子进程客户端"本身就是这两个接口的实现。**
+`expr_score` 是一个实现了 `score.Selector` 的 Go 结构体，在配置里按名启用、按名配权重、
+`Disable()` 语义不变；Extender 客户端同理。它们是接口的**使用者**而非替代者——
+区别只在于其行为由配置驱动而非代码写死。流水线、注册按名、权重、Profile 全部沿用原有语义。
+
+**能用现有插件表达的策略，一律不写新代码。** 见 L7：四个内置策略里有两个可以
+完全由现有打分器加配置实现，零 Go 代码。
+
+### 2.1 三条设计原则
+
+**策略优先表达式化。** 打分和业务过滤本质是纯函数 `f(node, req, cluster) → score/bool`，
+新写 Go 插件相对表达式没有表达力优势，却带来重编译、重发版、滚动重启的成本。
+因此内置策略优先用「现有插件 + 配置」表达，现有插件表达不了的部分才用表达式补，
+最后才考虑新增 Go 插件。
 
 **扩展走常驻子进程，不重编译 CubeMaster。** 需要新数据维度、外部系统数据、
-任意语言实现时，用常驻子进程（Unix socket gRPC）而非 Go 插件。
+任意语言实现时，用常驻子进程（Unix socket gRPC）而非新增 Go 插件。
 关键是**常驻**——Volume 插件的 `binary` 驱动是 fork-per-op（见
 `CubeMaster/pkg/volume/plugin/binary/driver.go` 的调用约定注释），
 对秒级低频的 volume create 没问题，但调度是每次创建沙箱都走的热路径，
 突发 500 QPS 下每秒 fork 500 个进程不可接受。
 
-**子进程供货，表达式决策。** 子进程不返回最终分数，而是注入自定义变量到 `node.ext.*`，
-策略仍然用表达式写。于是加新维度改子进程、调策略改 YAML，两者都不需要重编译 CubeMaster。
-
-Go 只保留四样东西：流水线编排、安全底线（guard）、跨请求状态、数据供给。
+**Go 侧只做四件事**：流水线编排、安全底线（guard）、跨请求状态、数据供给。
+策略本身尽量不落在 Go 里。
 
 ---
 
 ## 3. 架构总览
 
 ```
-┌── 编排层（Go，不可配）
+┌── 编排层（Go，不可配）                                        ← 接口不变，加固在调用侧
 │   PreFilter/Filter/Score/PostScore 流水线、backoff、重试熔断、cordon 复核
 │   per-plugin 超时 / panic 隔离 / 熔断 / 降级基线
 │
@@ -106,16 +140,21 @@ Go 只保留四样东西：流水线编排、安全底线（guard）、跨请求
 │   容量上限（含 overcommit）、节点健康、cordon、指标新鲜度、沙箱数上限
 │   语义：最终候选集 = guard(全集) ∩ policy(全集)，策略只能收紧不能放宽
 │
-├── 数据供给层（Go）
-│   调度上下文视图（node/req/cluster/node.ext）、按需计算调度、
+├── 数据供给层（Go）                                            ← 挂在 selCtx 上，不改接口
+│   调度上下文视图（node/req/cluster，node.ext 属 Phase 2）、按需计算调度、
 │   assume 乐观预留状态、模板副本索引、集群聚合量
 │
-├── ★ 策略层（表达式，100% 配置化，含全部内置策略）
-│   policy filter 表达式 + score 表达式 + 权重 + 选点策略 + Profile 路由
+├── ★ 策略层：全部是 filter.Selector / score.Selector 的实现
+│   ├─ 存量插件（保留）  cpu / mem / disk / realtime_create_num / template_locality
+│   │                    real_time_weighted_average / multi_factor / affinity / image_score
+│   ├─ 表达式宿主（新增） expr_filter / expr_score —— 行为由配置驱动的通用插件
+│   └─ 子进程客户端（新增）extender —— 行为由外部进程决定的通用插件
+│   上层：Profile 组合 + 权重 + 选点策略 + 路由
 │
-└── 扩展层（不重编译 CubeMaster）
-    常驻子进程 Extender：注入 node.ext.* 变量 / 参与 Filter / 参与 Score / 接管 Bind
-    Go SPI：仅保留给上游维护者，不作为用户侧扩展方式对外宣传
+└── 扩展方式（用户侧，均不需重编译 CubeMaster）
+    改策略      → 改 Profile 配置（存量插件组合 / 表达式）
+    加新维度    → 常驻子进程 Extender
+    Go SPI      → 仅保留给上游维护者，不作为用户侧扩展方式对外宣传
 ```
 
 ---
@@ -124,26 +163,37 @@ Go 只保留四样东西：流水线编排、安全底线（guard）、跨请求
 
 ### L0 框架加固（前置条件，所有后续工作依赖它）
 
-一律在框架层实现，Go 插件、表达式、子进程三种扩展共用。
+**全部实现在调用侧，不改 `filter.Selector` / `score.Selector` 的方法签名。**
+存量插件无需任何修改即可享受这些防护。
 
-| 项 | 设计 |
-|---|---|
-| per-plugin 超时 | 每次插件调用包一层带 deadline 的 context，默认 filter 10ms / score 10ms / extender 30ms |
-| panic 隔离 | 每个插件调用点 recover，转成该插件失败，**不再让单个插件拖垮整个阶段** |
-| 熔断 | 连续失败 N 次熔断 T 秒，期间不调用，出指标 |
-| 失败语义 | `on_error: fail_open`（默认，该插件当作未参与）/ `fail_closed`（整体失败），逐插件可配 |
-| 降级基线 | 任何扩展不可用时回落到内置基线 profile，保证调度不中断 |
-| 只读视图 | 插件收到的是值语义的 `NodeView` 快照，不是 `*node.Node`，杜绝污染共享缓存 |
-| 打分归一化 | 每插件输出线性归一到 `[0, 100]`；分母改为 profile 内启用插件的权重和；缺失分量按声明的 `default_score`（默认 0）补齐 |
-| 权重钳制 | `LeastRandomSelect` 的 `int(score*1e6)` 增加 `max(0, ...)` |
+| 项 | 设计 | 是否触碰接口 |
+|---|---|---|
+| per-plugin 超时 | 每次插件调用包一层带 deadline 的 context，默认 filter 10ms / score 10ms / extender 30ms。当前 `parallelRunFilters` 的 `eg, _ := errgroup.WithContext(selCtx.Ctx)` 把派生 context 丢弃了，需要改为透传给 `selCtx.Ctx` 的派生副本 | 否 |
+| panic 隔离 | 每个插件调用点 recover，转成该插件失败，**不再让单个插件拖垮整个阶段** | 否 |
+| 熔断 | 连续失败 N 次熔断 T 秒，期间不调用，出指标 | 否 |
+| 失败语义 | `on_error: fail_open`（默认，该插件当作未参与）/ `fail_closed`（整体失败），逐插件可配 | 否 |
+| 降级基线 | 任何扩展不可用时回落到内置基线 profile，保证调度不中断 | 否 |
+| 打分归一化 | 每插件输出线性归一到 `[0, 100]`；分母改为 profile 内启用插件的权重和；缺失分量按 `default_score`（默认 0）补齐 | 否 |
+| 权重钳制 | `LeastRandomSelect` 的 `int(score*1e6)` 增加 `max(0, ...)` | 否 |
 
-**兼容性**：归一化与新分母语义受 profile 级 `normalize` 开关控制，`default` profile 设 `false`
-保持旧语义，升级后打分结果逐位不变；用 benchmark 数据证明新语义更优后由运维显式切换。
+**关于共享指针的处理（相对早期草案的收敛）。**
+插件通过 `selCtx.Nodes()` 拿到的是 `[]*node.Node` 共享指针，理论上可写、可污染 localcache。
+早期草案打算把入参换成值语义的 `NodeView` 来根治，但那会改动 `Select()` 签名、
+迫使所有存量插件重写，违反 2.0 的兼容底线。**改为：**
+
+- 接口签名不动，`selCtx.Nodes()` 行为不变，存量插件照旧
+- 只读视图作为 `selCtx` 上的**附加能力**提供（`selCtx.View()` 返回 `[]NodeView` 值快照），
+  新插件（表达式宿主、Extender 客户端）用它
+- 误写风险靠三样兜：文档明确约定、debug 模式下对关键字段做写检测并告警、
+  code review checklist
 
 ### L1 调度上下文视图 Schema（地基，唯一不可回退的部分）
 
-只定义一次，四处绑定：Go SPI 的入参、表达式的求值环境、Extender 的 proto message、
-仿真器伪造的对象。字段一旦发布即为对外 API，只增不改不删。
+只定义一次，四处绑定：`selCtx.View()` 的返回值、表达式的求值环境、
+Extender 的 proto message、仿真器伪造的对象。
+字段一旦发布即为对外 API，只增不改不删。
+
+注意它是**挂在 `selCtx` 上的附加视图，不是接口参数**——存量插件可以完全不感知它的存在。
 
 ```
 node.id / ip / zone / region / cluster / instance_type / cpu_type
@@ -157,7 +207,7 @@ node.inflight / inflight_ratio                       本副本在途创建数
 node.data_disk_usage / storage_disk_usage / sys_disk_usage
 node.labels{}
 node.has_template / zone_has_template / template_replicas / template_inflight
-node.ext{}                                           ← 子进程注入的自定义维度
+node.ext{}                                           ← 子进程注入的自定义维度（Extender Phase 2，单独立项）
 
 req.cpu / mem / disk / template_id / image_ids[] / instance_type / zone / labels{}
 
@@ -172,6 +222,20 @@ cluster.node_count / avg_cpu_alloc_ratio / cpu_alloc_cv / mem_alloc_cv
 `cluster.*` 聚合量每次调度只算一次并缓存在上下文里，绝不进 per-node 循环。
 
 ### L2 表达式策略层
+
+**形态：两个实现了现有接口的通用插件，不是新的扩展点。**
+
+```go
+// 实现 score.Selector：Select / ID / Weight / Disable 四个方法齐全，语义与存量插件一致
+type exprScore struct { program *vm.Program; weight float64; ... }
+
+// 实现 filter.Selector：Select / ID
+type exprFilter struct { program *vm.Program; onError string; ... }
+```
+
+它们和 `image_score`、`cpu` 一样按名注册、按名在配置里启用、按名配权重，
+唯一区别是行为来自 `config.expr` 而非硬编码。同一个 profile 里可以多次实例化
+（用不同表达式和权重），也可以和存量插件混用——见 L7 的配置示例。
 
 引擎选 **`expr-lang/expr`**：纯 Go、无 cgo、依赖极小、编译成字节码、
 结构体绑定零分配、每次求值约 100–300ns，且**不图灵完备**（保证终止）。
@@ -200,6 +264,22 @@ instance type 匹配 > `default`。运行期命中不存在的 profile 记 warn 
 
 ### L4 常驻子进程 Extender
 
+**形态同样是现有接口的实现。** CubeMaster 侧的 Extender 客户端是一个
+实现了 `score.Selector`（以及可选的 `filter.Selector`）的 Go 结构体，
+按名注册、按名启用、按名配权重，`Disable()` 语义不变。
+"子进程"是它的实现细节，对流水线完全透明。
+
+分两个阶段交付，避免一上来就引入新的扩展点：
+
+| 阶段 | 模式 | 是否在现有接口内 |
+|---|---|---|
+| **Phase 1** | `score` / `filter`：子进程直接返回分数或过滤结果 | 是，完全在两个接口内 |
+| **Phase 2** | `enrich`：子进程返回 `node.ext.*` 变量，交给表达式决策 | 引入一个新的注入点，需单独评审 |
+
+Phase 1 已经能覆盖"接自研数据源做打分"的主要诉求；Phase 2 的价值在于
+一个子进程产出的维度能被任意多条表达式复用，但它超出了现有两个接口的范畴，
+因此放到后面、单独立项。
+
 配置形状对齐仓库既有的 Volume 插件语汇（`type: binary` 托管 / `type: rpc` 外部）：
 
 ```yaml
@@ -208,8 +288,8 @@ scheduler:
     - name: tenant-affinity
       type: binary                                    # CubeMaster 托管：启动拉起、崩溃重启
       binary_path: /opt/cube/plugins/tenant-affinity
-      stages: [enrich]
-      provides: [tenant_sandbox_count]                # 注入到 node.ext.*
+      stages: [score]                                 # Phase 1：直接参与打分
+      weight: 2.0
       fields: [id, zone, labels]                      # 声明需要同步哪些字段
       timeout: 30ms
       on_error: fail_open
@@ -218,8 +298,8 @@ scheduler:
     - name: ml-scorer
       type: rpc                                       # 外部部署：k8s sidecar / systemd
       socket_path: unix:///run/cube/sched-ml.sock
-      stages: [enrich]
-      provides: [ml_health_score]
+      stages: [score]
+      weight: 1.0
 ```
 
 生产推荐 `rpc`（重启策略交给 kubelet，资源限制用 cgroup，日志走标准采集）；
@@ -248,10 +328,10 @@ message ScheduleRequest {
 }
 
 message ScheduleResponse {
-  repeated NodeAnnotation annotations = 1;  // node_id → {key: value}，挂到 node.ext.*
-  repeated string filtered_out = 2;         // 可选，参与 Filter
-  map<string, double> scores = 3;           // 可选，直接参与 Score
-  string bind_node_id = 4;                  // 可选，接管最终选点
+  map<string, double> scores = 1;           // Phase 1：直接参与 Score（0..100）
+  repeated string filtered_out = 2;         // Phase 1：参与 Filter
+  repeated NodeAnnotation annotations = 3;  // Phase 2：node_id → {key: value}，挂到 node.ext.*
+  string bind_node_id = 4;                  // 后续：接管最终选点
 }
 ```
 
@@ -268,7 +348,8 @@ message ScheduleResponse {
 
 硬超时、熔断、背压（并发调用数上限，超过直接降级）、
 崩溃自动重启带指数退避、版本协商失败拒绝加载并告警。
-**降级基线是核心**：子进程超时/崩溃/熔断时必须回落到不含 `node.ext.*` 的基线表达式，
+**降级基线是核心**：子进程超时/崩溃/熔断时，该插件按 `fail_open` 退出打分，
+profile 内其余插件（存量插件 + 表达式）照常工作，
 绝不能出现"扩展进程挂了 → 集群创建不了沙箱"。
 
 #### 代价（必须写进文档）
@@ -368,7 +449,24 @@ _output/bin/cubeschedbench run \
 - `模板命中率 < 50% 且冷启动占延迟 60%+` → 提高 template 项权重，或增加模板副本数
 - `filter_rejected` 集中在单个插件 → 该过滤器可能过严，给出对应配置项名
 
-### L7 内置策略（全部用表达式实现，Go 里不留策略插件）
+### L7 内置策略（优先用存量插件表达，表达不了才补表达式）
+
+#### 先算一笔账：哪些策略根本不需要新代码
+
+核对现有四个打分器的因子表（`pkg/selector/score/utils.go` 的
+`getFactorWeightedAverageScore` 与 `constants.WeightFactor*`）后可以确认：
+
+| 策略 | 现有插件能否表达 | 说明 |
+|---|---|---|
+| `burst-spread` | **能，零 Go 代码** | `real_time_weighted_average` 的 `getMvmNumScore` = `100 - 沙箱数/上限×100`、`getCpuUtilScore` = `100 - CPU 利用率`、`getRealTimeCreateNumScore` = `100 - 实时创建数/并发上限×100`，加上 `req_cpu`/`req_mem` 两项剩余率，本身就是打散策略 |
+| `template-affinity` | **基础版能，零 Go 代码** | `image_score` 的 `template_id` 因子走 `localcache.GetImageStateByNode`，命中本地副本即得分。仅"热点保护"需要新变量 `template_inflight` |
+| `bin-packing` | **不能** | 现有四个打分器全是 LeastAllocated 方向（形如 `100 - 使用率×100`），没有 MostAllocated。靠配负权重反转也不可行：`totalPluginWeight` 会被拉向 0 或负数，且最终负分会让 `LeastRandomSelect` 里 `int(score*1e6)` 的加权随机失效 |
+| `balanced-mixed` | **不能** | 需要 `abs(cpu_ratio - mem_ratio)`，现有因子表里没有对应量 |
+
+结论：**四个内置策略里两个是纯配置交付**。这也决定了交付节奏——
+第一个 PR 只改三份 conf.yaml 的 `score:` 段，零 Go 代码，
+立刻解决第 1.1 节"默认不打分"的问题。表达式引擎是为后两个策略以及
+用户自定义场景准备的，不是为了替换存量插件。
 
 #### 配置示例
 
@@ -384,46 +482,42 @@ scheduler:
         normalize: false
         plugins: []
 
-    # ── 策略 A：高并发短生命周期 ─────────────────────────────────
+    # ── 策略 A：高并发短生命周期 ── 纯存量插件，零 Go 代码 ───────
     - name: burst-spread
       priority_select_num: 3            # top-3 内加权随机，进一步打散
-      assume: { enabled: true, ttl: 20s }
       filters:
-        - name: expr_filter
-          config: { expr: 'node.mvm_ratio < 0.9' }
+        enabled: ["cpu", "mem", "realtime_create_num", "template_locality"]
       score:
-        normalize: true
+        resource_weights:               # 现有 ResourceWeights 语义，未改动
+          mvm_num:            3.0
+          cpu_util:           2.0
+          realtime_create_num: 2.0
+          req_cpu:            1.0
+          req_mem:            1.0
         plugins:
-          - name: expr_score
+          - name: real_time_weighted_average    # 存量插件
             weight: 3.0
-            config:
-              expr: '100 - (node.mvm_ratio * 50 + node.cpu_util / 100 * 30 + node.inflight_ratio * 20)'
-          - name: expr_score
-            weight: 1.0
-            config:
-              expr: '100 * (1 - abs(node.cpu_alloc_ratio_after - node.mem_alloc_ratio_after))'
-          - name: expr_score
+          - name: image_score                   # 存量插件，弱亲和兜底
             weight: 0.5
-            config:
-              expr: 'node.has_template ? 100 : 0'
 
-    # ── 策略 B：同模板高频热启动 ─────────────────────────────────
+    # ── 策略 B：同模板高频热启动 ── 基础版纯存量插件 ─────────────
     - name: template-affinity
       score:
-        normalize: true
+        resource_weights:
+          template_id: 3.0
+          image_id:    1.0
+          mvm_num:     1.0
         plugins:
-          - name: expr_score
+          - name: image_score                   # 存量插件
             weight: 3.0
-            config:
-              expr: |
-                node.has_template
-                  ? 100 * clamp(1 - node.template_inflight / 8, 0.2, 1)
-                  : (node.zone_has_template ? 40 : 0)
-          - name: expr_score
+          - name: real_time_weighted_average    # 存量插件，避免全压一台
             weight: 1.0
-            config: { expr: '100 - node.mvm_ratio * 100' }
+        # 可选增强（需要 node.template_inflight，见下文 Go 侧工作）：
+        # - name: expr_score
+        #   weight: 1.0
+        #   config: { expr: 'node.has_template ? 100 * clamp(1 - node.template_inflight / 8, 0.2, 1) : 0' }
 
-    # ── 策略 C：大规格长驻，提装箱率 ─────────────────────────────
+    # ── 策略 C：大规格长驻，提装箱率 ── 存量插件无法表达，用表达式 ──
     - name: bin-packing
       priority_select_num: 1            # 严格贪心
       score:
@@ -434,7 +528,7 @@ scheduler:
             config:
               expr: '(node.cpu_alloc_ratio_after * 0.6 + node.mem_alloc_ratio_after * 0.4) * 100'
 
-    # ── 策略 D：混合规格抗碎片 ───────────────────────────────────
+    # ── 策略 D：混合规格抗碎片 ── 存量插件无法表达，用表达式 ──────
     - name: balanced-mixed
       score:
         normalize: true
@@ -460,16 +554,18 @@ scheduler:
 
 #### 适用场景与 trade-off
 
-| 策略 | 适用 | 预期改善 | Trade-off |
-|---|---|---|---|
-| `burst-spread` | Agent 会话型沙箱，秒级到分钟级生命周期，创建 QPS 脉冲 | 羊群度 P95、调度失败率下降 | 模板命中率下降，故保留 0.5 权重的弱亲和 |
-| `template-affinity` | 少量模板反复创建，冷启动是主要成本 | 模板命中率、端到端创建延迟 P95 改善 | 装箱率与均衡度可能下降 |
-| `bin-packing` | 数小时到数天的长驻沙箱、大规格实例 | 装箱率提升 | 单节点故障爆炸半径变大，突发下更易触碰 `NodeMaxCpuUtil` |
-| `balanced-mixed` | 混合规格，CPU/内存消耗比例不一 | 碎片率下降 | 极端装箱率略低于纯 bin-packing |
+| 策略 | 实现方式 | 适用 | 预期改善 | Trade-off |
+|---|---|---|---|---|
+| `burst-spread` | 存量插件 + 配置 | Agent 会话型沙箱，秒级到分钟级生命周期，创建 QPS 脉冲 | 羊群度 P95、调度失败率下降 | 模板命中率下降，故保留 0.5 权重的弱亲和 |
+| `template-affinity` | 存量插件 + 配置 | 少量模板反复创建，冷启动是主要成本 | 模板命中率、端到端创建延迟 P95 改善 | 装箱率与均衡度可能下降 |
+| `bin-packing` | 表达式 | 数小时到数天的长驻沙箱、大规格实例 | 装箱率提升 | 单节点故障爆炸半径变大，突发下更易触碰 `NodeMaxCpuUtil` |
+| `balanced-mixed` | 表达式 | 混合规格，CPU/内存消耗比例不一 | 碎片率下降 | 极端装箱率略低于纯 bin-packing |
 
 三者互为 trade-off（装箱 ↔ 均衡 ↔ 亲和），报告必须同时列出，不得只报好看的那项。
 
-#### 支撑这些表达式所需的 Go 侧工作
+#### 支撑后两个策略与可选增强所需的 Go 侧工作
+
+以下都是**数据供给**，不改动任何插件接口：
 
 - `node.inflight` / `inflight_ratio` / `cpu_alloc_ratio_after`：需要 **assume 乐观预留**。
   `Select()` 返回前把本次请求的 CPU/内存/沙箱数记入进程内 TTL 计数器，
@@ -510,8 +606,9 @@ troubleshooting/usecases/integrations 三个目录，但 `docs/zh` 是全量镜�
 | 验收项 | 落点 |
 |---|---|
 | 调度评估指标定义文档，benchmark 输出 ≥5 项指标 | L5（7 项）+ `docs/dev/scheduler-metrics.md` |
-| 新插件可通过统一机制接入，配置文件切换 Profile | L2 表达式 + L3 Profile + L4 Extender |
-| ≥3 种内置策略，每种有场景说明与配置示例 | L7（4 种，全表达式） |
+| **在现有 `filter.Selector` / `score.Selector` 接口基础上**设计注册与配置机制 | 2.0：接口签名不改、存量插件全留、新增插件均为两接口的实现；L3 Profile 沿用原有按名启用与权重语义 |
+| 支持配置文件启用/禁用插件、调整权重、组合为策略 Profile | L3（`EnableFilters` / `EnableScorers` / `Weight` / `Disable` 语义不变，新增 profile 维度） |
+| ≥3 种内置策略，每种有场景说明与配置示例 | L7（4 种：2 种纯存量插件配置、2 种表达式） |
 | 用户自定义扩展的开发示例与文档 | `examples/scheduler-extender/` + `docs/dev/scheduler-extender.md`（**不需要重编译 CubeMaster**） |
 | benchmark ≥3 种 workload，一键运行，生成对比报告 | L6（4 种）+ `make sched-bench` |
 | 至少一项指标明显改善，trade-off 需说明 | L6 报告 + L7 trade-off 表 |
@@ -521,22 +618,30 @@ troubleshooting/usecases/integrations 三个目录，但 `docs/zh` 是全量镜�
 
 ## 6. PR 拆分
 
-按依赖顺序，每个可独立评审、独立回滚。
+按依赖顺序，每个可独立评审、独立回滚。**改动侵入性由浅入深**：
+先纯配置，再框架加固（不碰接口），再新增插件（实现现有接口），最后才是新扩展点。
 
-| PR | 内容 | 行为变化 |
-|---|---|---|
-| 1 | L1 调度上下文视图 Schema + 只读 `NodeView` + 按需计算调度 + 单测 | 无 |
-| 2 | L0 框架加固：per-plugin 超时 / panic 隔离 / 熔断 / 归一化开关 / 权重钳制 | 仅"单插件故障不再拖垮整阶段" |
-| 3 | L3 Profile 配置与路由 + 老配置回落 + 未知插件 fail-fast + 单测 + 文档 | 无（不写 `profiles` 时等价） |
-| 4 | L5 调度 Prometheus 指标 + 指标定义文档 | 无（只加观测） |
-| 5 | L6 仿真器 + `cubeschedbench` + 4 workload + 报告 + `localcache.InitInMemory` | 无（新增工具） |
-| 6 | L2 表达式引擎（`expr_score` / `expr_filter`）+ 编译期校验 + `sched explain` + 文档 | 需显式配置才生效 |
-| 7 | assume 乐观预留 + `template_inflight` / `zone_has_template` 等变量供给 | 需 profile 显式启用 |
-| 8 | L7 四个内置策略 profile（纯 YAML）+ 单测 + 配置示例 | 需显式切换 profile |
-| 9 | L4 Extender：proto + 状态流 + 托管子进程生命周期 + 超时熔断背压 + `node.ext.*` 接入 | 无（未配置即不加载） |
-| 10 | 量化对比报告 + 调优建议 + `examples/scheduler-extender/` + 全部文档 | 无 |
+| PR | 内容 | 侵入性 | 行为变化 |
+|---|---|---|---|
+| 0 | **纯配置**：给三份 conf.yaml 补 `score:` 段（`real_time_weighted_average` + `image_score` + `resource_weights`），修正 `PrioritySelectNum` 默认值不一致 | 零 Go 代码 | 默认从"选注册序第一台"变为按负载打分，需 benchmark 佐证 |
+| 1 | L5 调度 Prometheus 指标 + 指标定义文档 | 只加埋点 | 无 |
+| 2 | L6 仿真器 + `cubeschedbench` + 4 workload + 报告 + `localcache.InitInMemory` | 新增工具 | 无 |
+| 3 | L0 框架加固：per-plugin 超时 / panic 隔离 / 熔断 / 归一化开关 / 权重钳制 | 只改调用侧，接口不动 | 仅"单插件故障不再拖垮整阶段" |
+| 4 | 注册机制：接口下沉 `spi` + 类型别名 + 显式 Registry + 未知插件 fail-fast + 单测 | 接口签名不变 | 仅"配置写错从静默变报错" |
+| 5 | L3 Profile 配置与路由 + 老配置回落 + 文档 | 新增配置维度 | 无（不写 `profiles` 时等价） |
+| 6 | L1 上下文视图 Schema（`selCtx.View()`）+ 按需计算调度 + 单测 | 附加能力，存量插件无感 | 无 |
+| 7 | assume 乐观预留 + `template_inflight` / `zone_has_template` 变量供给 | 新增状态 | 需 profile 显式启用 |
+| 8 | L2 表达式插件（`expr_score` / `expr_filter`，实现现有接口）+ 编译期校验 + `sched explain` | 新增两个插件 | 需显式配置才生效 |
+| 9 | L7 四个内置策略 profile + 单测 + 配置示例 | 纯 YAML | 需显式切换 profile |
+| 10 | L4 Extender Phase 1（score / filter 模式）：proto + 状态流 + 子进程生命周期 + 超时熔断背压 | 新增一个插件 | 无（未配置即不加载） |
+| 11 | 量化对比报告 + 调优建议 + `examples/scheduler-extender/` + 全部文档 | 文档 | 无 |
+| — | *Extender Phase 2（`enrich` / `node.ext.*` 注入）单独立项* | **超出现有两接口，需单独评审** | — |
 
-若上游偏好大颗粒，可合并为四组：`1–2` 框架、`3–5` 配置与评估、`6–8` 表达式与策略、`9–10` 扩展与文档。
+PR 0 单独打头是有意的：它零代码、可独立验证、直接消除第 1.1 节暴露的最大问题，
+也为后续所有改动提供了 baseline。
+
+若上游偏好大颗粒，可合并为四组：`0–2` 配置与评估基线、`3–6` 框架与机制、
+`7–9` 策略、`10–11` 扩展与文档。
 
 ---
 
@@ -583,12 +688,14 @@ make fmt
 | 变量口径歧义导致表达式语义错误 | 口径写进变量名（`_eff` / `_after`）；`sched explain` 打印中间值 |
 | assume 在创建失败时泄漏预留 | TTL 强制释放 + 失败路径显式回滚 + `assume_pending` gauge 告警 |
 | 多 master 副本下 assume 只在本副本生效 | 文档明确；Redis `RealTimeCreateNum` 硬过滤仍作全局兜底 |
-| 子进程挂掉影响调度可用性 | 降级基线（不含 `node.ext.*` 的 profile）+ 熔断 + 背压；子进程不可用时调度必须继续 |
+| 子进程挂掉影响调度可用性 | 该插件按 `fail_open` 退出打分，profile 内其余插件照常；熔断 + 背压；子进程不可用时调度必须继续 |
 | 子进程状态镜像滞后 | `snapshot_seq` 感知 + 落后阈值触发全量重同步；接受最终一致 |
 | 每次调度传全量节点导致 IPC 打爆 | 状态流 + 候选 ID 协议 + 字段裁剪 + 候选集裁剪 |
 | `localcache` 包级单例被仿真器污染 | `InitInMemory` 仅在 `cubeschedbench` 与测试中调用，生产路径不引用 |
 | 仿真结论与真实集群偏差 | 启动延迟分布参数从生产 Prometheus 直方图标定；报告标注"相对趋势可信、绝对值需实测校准" |
-| `PrioritySelectNum` 代码默认 `-1` 与配置 `1` 不一致 | Profile 内显式声明，消除隐式默认；PR 3 文档中专门说明 |
+| `PrioritySelectNum` 代码默认 `-1` 与配置 `1` 不一致 | Profile 内显式声明，消除隐式默认；PR 0 一并修正并在文档中说明 |
+| **方案偏离"在现有接口基础上"的要求** | 2.0 兼容底线：接口签名一字不改（类型别名下沉解 import 环）、存量 10 个插件全留、新增能力一律以两接口的实现形式落地；`NodeView` 退为 `selCtx` 附加视图而非入参；Extender `enrich` 模式降为 Phase 2 单独立项 |
+| 插件通过 `[]*node.Node` 污染 localcache | 早期草案想换值语义入参根治，但会破坏接口。改为：文档约定 + debug 模式写检测 + review checklist；新插件用 `selCtx.View()` |
 
 ---
 
@@ -606,5 +713,9 @@ make fmt
 - **抢占与重调度**——现有架构无此概念，属于独立课题
 - **对 Go SPI 做用户侧包装**（稳定 API 承诺、工程模板、版本兼容矩阵）——
   Go SPI 仅保留给上游维护者，不作为用户扩展方式对外宣传
-- **`thirtparty` 过滤器**（当前为空壳，所有分支原样返回全部节点）——
-  由 `expr_filter` 与 Extender filter 接管其位置后标记 deprecated
+- **Extender Phase 2（`enrich` / `node.ext.*` 注入）**——它引入了两个现有接口之外的
+  注入点，超出"在现有接口基础上"的范围，单独立项评审
+- **改动 `filter.Selector` / `score.Selector` 的方法签名**——包括早期草案里的
+  值语义 `NodeView` 入参。任何需要存量插件改代码的方案一律排除
+- **移除或重写存量插件**——6 个 filter 与 4 个 score 全部保留。
+  `thirtparty`（当前为空壳，所有分支原样返回全部节点）只标记 deprecated，不移除
