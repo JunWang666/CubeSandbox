@@ -4,7 +4,138 @@
 
 package score
 
-import "math"
+import (
+	"errors"
+	"math"
+
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
+)
+
+// 编译期检查 resourceFitScore 是否完整实现 Selector 接口。
+var _ Selector = (*resourceFitScore)(nil)
+
+// resourceFitScore 根据请求放入节点后的资源剩余量和比例失衡程度打分。
+type resourceFitScore struct {
+	weight           float64
+	imbalancePenalty float64
+	disable          bool
+}
+
+// newResourceFitScore 创建资源适配评分插件。
+// 当前使用显式参数，避免依赖尚未确定的 Profile/Registry 配置结构。
+func newResourceFitScore(
+	weight float64,
+	imbalancePenalty float64,
+	disable bool,
+) *resourceFitScore {
+	return &resourceFitScore{
+		weight:           weight,
+		imbalancePenalty: imbalancePenalty,
+		disable:          disable,
+	}
+}
+
+func (l *resourceFitScore) ID() string {
+	return constants.SelectorScoreID + "/" + "resource_fit_score"
+}
+
+func (l *resourceFitScore) String() string {
+	return l.ID()
+}
+
+func (l *resourceFitScore) Weight() float64 {
+	return l.weight
+}
+
+func (l *resourceFitScore) Disable() bool {
+	return l.disable
+}
+
+// Select 为每个候选节点计算请求感知的资源适配分数。
+//
+// CPU 使用 millicore，内存使用 MB；有效容量和已分配量的计算方式
+// 与现有 CPU、内存 Filter 保持一致。
+func (l *resourceFitScore) Select(
+	selCtx *selctx.SelectorCtx,
+) (node.NodeScoreList, error) {
+	if l == nil {
+		return nil, errors.New("resourceFitScore is nil")
+	}
+
+	if l.Disable() {
+		return nil, nil
+	}
+
+	if selCtx == nil {
+		return nil, errors.New("resourceFitScore: selector context is nil")
+	}
+
+	cfg := config.GetConfig()
+	if cfg == nil || cfg.Scheduler == nil {
+		return nil, errors.New("resourceFitScore: scheduler config is nil")
+	}
+
+	cpuq := selCtx.GetResCpuFromCtx()
+	memq := selCtx.GetResMemFromCtx()
+	if cpuq == nil || memq == nil {
+		return nil, errors.New(
+			"resourceFitScore: cpu request or memory request is nil",
+		)
+	}
+
+	cpuRequest := cpuq.MilliValue()
+	memRequest := memq.Value() / 1024 / 1024
+
+	inList := selCtx.Nodes()
+	nodes := make(node.NodeScoreList, 0, inList.Len())
+
+	for i := range inList {
+		currentNode := inList[i]
+		if currentNode == nil {
+			return nil, errors.New(
+				"resourceFitScore: candidate node is nil",
+			)
+		}
+
+		cpuCapacity := cfg.Scheduler.EffectiveQuotaCpu(
+			currentNode.InstanceType,
+			currentNode.QuotaCpu,
+		)
+		cpuUsed := cfg.Scheduler.EffectiveAllocated(
+			currentNode.QuotaCpuUsage,
+		)
+
+		memCapacity := cfg.Scheduler.EffectiveQuotaMem(
+			currentNode.InstanceType,
+			currentNode.QuotaMem,
+		)
+		memUsed := cfg.Scheduler.EffectiveAllocated(
+			currentNode.QuotaMemUsage,
+		)
+
+		fitScore := calculateResourceFitScore(
+			cpuCapacity,
+			cpuUsed,
+			cpuRequest,
+			memCapacity,
+			memUsed,
+			memRequest,
+			l.imbalancePenalty,
+		)
+
+		nodes.Append(&node.NodeScore{
+			InsID:    currentNode.ID(),
+			Score:    fitScore,
+			MvmNum:   currentNode.MvmNum,
+			OrigNode: currentNode,
+		})
+	}
+
+	return nodes, nil
+}
 
 // calculateResourceFitScore 计算请求放入节点后的资源适配分数。
 //

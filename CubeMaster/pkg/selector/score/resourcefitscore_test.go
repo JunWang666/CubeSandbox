@@ -3,7 +3,14 @@
 
 package score
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
 
 func TestCalculateResourceFitScorePrefersTighterBalancedFit(t *testing.T) {
 	// 节点 A：8 核/16 GB，已使用 4 核/8 GB。
@@ -129,5 +136,125 @@ func TestCalculateResourceFitScoreRejectsInvalidInput(t *testing.T) {
 				t.Fatalf("invalid input should return zero score, got=%f", got)
 			}
 		})
+	}
+}
+
+func TestResourceFitScoreMetadata(t *testing.T) {
+	scorer := newResourceFitScore(0.8, 0.5, false)
+
+	if scorer.ID() != "Score/resource_fit_score" {
+		t.Fatalf("unexpected score ID: %s", scorer.ID())
+	}
+
+	if scorer.String() != scorer.ID() {
+		t.Fatalf(
+			"String should return ID: string=%s id=%s",
+			scorer.String(),
+			scorer.ID(),
+		)
+	}
+
+	if scorer.Weight() != 0.8 {
+		t.Fatalf("unexpected weight: %f", scorer.Weight())
+	}
+
+	if scorer.Disable() {
+		t.Fatal("resource fit scorer should be enabled")
+	}
+}
+
+func TestResourceFitScoreSelectPrefersTighterFit(t *testing.T) {
+	selCtx := selctx.New("random")
+	selCtx.Ctx = context.Background()
+	selCtx.ReqRes = &selctx.RequestResource{
+		Cpu: resource.MustParse("2"),
+		Mem: resource.MustParse("4Gi"),
+	}
+
+	selCtx.SetNodes(node.NodeList{
+		{
+			InsID:         "tight-fit",
+			QuotaCpu:      8000,
+			QuotaMem:      16384,
+			QuotaCpuUsage: 4000,
+			QuotaMemUsage: 8192,
+		},
+		{
+			InsID:         "loose-fit",
+			QuotaCpu:      8000,
+			QuotaMem:      16384,
+			QuotaCpuUsage: 0,
+			QuotaMemUsage: 0,
+		},
+	})
+
+	scorer := newResourceFitScore(1.0, 0.5, false)
+
+	scores, err := scorer.Select(selCtx)
+	if err != nil {
+		t.Fatalf("Select returned an unexpected error: %v", err)
+	}
+
+	if scores.Len() != 2 {
+		t.Fatalf("expected 2 node scores, got %d", scores.Len())
+	}
+
+	if scores[0].InsID != "tight-fit" {
+		t.Fatalf("unexpected first node: %s", scores[0].InsID)
+	}
+
+	if scores[0].Score <= scores[1].Score {
+		t.Fatalf(
+			"tighter node should receive a higher score: tight=%f loose=%f",
+			scores[0].Score,
+			scores[1].Score,
+		)
+	}
+}
+
+func TestResourceFitScoreSelectRejectsMissingRequest(t *testing.T) {
+	selCtx := selctx.New("random")
+	selCtx.Ctx = context.Background()
+	selCtx.SetNodes(node.NodeList{
+		{
+			InsID:    "node-1",
+			QuotaCpu: 8000,
+			QuotaMem: 16384,
+		},
+	})
+
+	scorer := newResourceFitScore(1.0, 0.5, false)
+
+	_, err := scorer.Select(selCtx)
+	if err == nil {
+		t.Fatal("Select should reject a missing resource request")
+	}
+}
+
+func TestResourceFitScoreSelectSkipsWhenDisabled(t *testing.T) {
+	selCtx := selctx.New("random")
+	selCtx.Ctx = context.Background()
+	selCtx.ReqRes = &selctx.RequestResource{
+		Cpu: resource.MustParse("2"),
+		Mem: resource.MustParse("4Gi"),
+	}
+
+	selCtx.SetNodes(node.NodeList{
+		{
+			InsID:    "node-1",
+			QuotaCpu: 8000,
+			QuotaMem: 16384,
+		},
+	})
+
+	scorer := newResourceFitScore(1.0, 0.5, true)
+
+	scores, err := scorer.Select(selCtx)
+	if err != nil {
+		t.Fatalf("disabled scorer returned an error: %v", err)
+	}
+
+	if scores != nil {
+		t.Fatalf("disabled scorer should return nil scores, got %v", scores)
 	}
 }
