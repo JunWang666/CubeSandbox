@@ -7,6 +7,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -256,5 +257,130 @@ func TestResourceFitScoreSelectSkipsWhenDisabled(t *testing.T) {
 
 	if scores != nil {
 		t.Fatalf("disabled scorer should return nil scores, got %v", scores)
+	}
+}
+
+func TestNewResourceFitScoreFromProfileConfig(t *testing.T) {
+	t.Run("uses default values", func(t *testing.T) {
+		scorer, err := NewResourceFitScore(
+			config.SchedulerProfilePluginConf{},
+		)
+		if err != nil {
+			t.Fatalf("NewResourceFitScore returned an error: %v", err)
+		}
+
+		if scorer.Weight() != defaultResourceFitWeight {
+			t.Fatalf(
+				"unexpected default weight: got=%f want=%f",
+				scorer.Weight(),
+				defaultResourceFitWeight,
+			)
+		}
+
+		if scorer.imbalancePenalty !=
+			defaultResourceFitImbalancePenalty {
+			t.Fatalf(
+				"unexpected default imbalance penalty: got=%f want=%f",
+				scorer.imbalancePenalty,
+				defaultResourceFitImbalancePenalty,
+			)
+		}
+	})
+
+	t.Run("uses configured values", func(t *testing.T) {
+		scorer, err := NewResourceFitScore(
+			config.SchedulerProfilePluginConf{
+				Weight: 0.8,
+				Args: map[string]any{
+					"imbalance_penalty": 0.25,
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("NewResourceFitScore returned an error: %v", err)
+		}
+
+		if scorer.Weight() != 0.8 {
+			t.Fatalf(
+				"unexpected configured weight: %f",
+				scorer.Weight(),
+			)
+		}
+
+		if scorer.imbalancePenalty != 0.25 {
+			t.Fatalf(
+				"unexpected configured imbalance penalty: %f",
+				scorer.imbalancePenalty,
+			)
+		}
+	})
+
+	t.Run("accepts integer penalty", func(t *testing.T) {
+		scorer, err := NewResourceFitScore(
+			config.SchedulerProfilePluginConf{
+				Args: map[string]any{
+					"imbalance_penalty": 1,
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("NewResourceFitScore returned an error: %v", err)
+		}
+
+		if scorer.imbalancePenalty != 1 {
+			t.Fatalf(
+				"unexpected integer imbalance penalty: %f",
+				scorer.imbalancePenalty,
+			)
+		}
+	})
+}
+
+func TestNewResourceFitScoreRejectsInvalidProfileConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		conf config.SchedulerProfilePluginConf
+	}{
+		{
+			name: "negative weight",
+			conf: config.SchedulerProfilePluginConf{
+				Weight: -1,
+			},
+		},
+		{
+			name: "negative imbalance penalty",
+			conf: config.SchedulerProfilePluginConf{
+				Args: map[string]any{
+					"imbalance_penalty": -0.5,
+				},
+			},
+		},
+		{
+			name: "non-numeric imbalance penalty",
+			conf: config.SchedulerProfilePluginConf{
+				Args: map[string]any{
+					"imbalance_penalty": "high",
+				},
+			},
+		},
+		{
+			name: "unknown argument",
+			conf: config.SchedulerProfilePluginConf{
+				Args: map[string]any{
+					"imbalance_penality": 0.5,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewResourceFitScore(tt.conf)
+			if err == nil {
+				t.Fatal(
+					"NewResourceFitScore should reject invalid configuration",
+				)
+			}
+		})
 	}
 }

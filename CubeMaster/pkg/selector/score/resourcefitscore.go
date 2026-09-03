@@ -6,6 +6,7 @@ package score
 
 import (
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
@@ -22,6 +23,91 @@ type resourceFitScore struct {
 	weight           float64
 	imbalancePenalty float64
 	disable          bool
+}
+
+const (
+	defaultResourceFitWeight           = 1.0
+	defaultResourceFitImbalancePenalty = 0.5
+)
+
+// NewResourceFitScore 根据 Profile 插件配置创建资源适配评分插件。
+func NewResourceFitScore(
+	conf config.SchedulerProfilePluginConf,
+) (*resourceFitScore, error) {
+	weight := conf.Weight
+	if weight == 0 {
+		weight = defaultResourceFitWeight
+	}
+	if weight < 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+		return nil, fmt.Errorf(
+			"resource fit score: invalid weight %v",
+			weight,
+		)
+	}
+
+	imbalancePenalty := defaultResourceFitImbalancePenalty
+
+	for name := range conf.Args {
+		if name != "imbalance_penalty" {
+			return nil, fmt.Errorf(
+				"resource fit score: unknown argument %q",
+				name,
+			)
+		}
+	}
+
+	if value, ok := conf.Args["imbalance_penalty"]; ok {
+		parsed, err := numericProfileArg(value)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"resource fit score: invalid imbalance_penalty: %w",
+				err,
+			)
+		}
+		imbalancePenalty = parsed
+	}
+
+	if imbalancePenalty < 0 ||
+		math.IsNaN(imbalancePenalty) ||
+		math.IsInf(imbalancePenalty, 0) {
+		return nil, fmt.Errorf(
+			"resource fit score: invalid imbalance_penalty %v",
+			imbalancePenalty,
+		)
+	}
+
+	return newResourceFitScore(
+		weight,
+		imbalancePenalty,
+		false,
+	), nil
+}
+
+// numericProfileArg 将 YAML Args 中的数值转换为 float64。
+func numericProfileArg(value any) (float64, error) {
+	switch number := value.(type) {
+	case float64:
+		return number, nil
+	case float32:
+		return float64(number), nil
+	case int:
+		return float64(number), nil
+	case int32:
+		return float64(number), nil
+	case int64:
+		return float64(number), nil
+	case uint:
+		return float64(number), nil
+	case uint32:
+		return float64(number), nil
+	case uint64:
+		return float64(number), nil
+	default:
+		return 0, fmt.Errorf(
+			"expected a number, got %T",
+			value,
+		)
+	}
 }
 
 // newResourceFitScore 创建资源适配评分插件。
