@@ -187,9 +187,12 @@ func (c *client) reject(err error) error {
 	return err
 }
 
-func (c *client) syncSnapshot(selection *selctx.SelectorCtx) error {
-	c.syncMu.Lock()
-	defer c.syncMu.Unlock()
+// syncSnapshotLocked pushes the frozen snapshot when its version changed. The
+// caller must hold c.syncMu, which filterPlugin.Select and scorePlugin.Select
+// keep held across the following Filter/Score RPC: SnapshotVersion is unique
+// per scheduling attempt, so without that atomicity a concurrent request can
+// overwrite a single-slot plugin's snapshot between this sync and the query.
+func (c *client) syncSnapshotLocked(selection *selctx.SelectorCtx) error {
 	if selection.SnapshotVersion == "" {
 		return errors.New("scheduler snapshot version is empty")
 	}
@@ -292,7 +295,9 @@ func (p *filterPlugin) ID() string   { return "filter/grpc/" + p.client.name }
 func (p *filterPlugin) Close() error { return p.client.Close() }
 
 func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (node.NodeList, error) {
-	if err := p.client.syncSnapshot(selection); err != nil {
+	p.client.syncMu.Lock()
+	defer p.client.syncMu.Unlock()
+	if err := p.client.syncSnapshotLocked(selection); err != nil {
 		return nil, err
 	}
 	candidates := selection.Nodes()
@@ -359,7 +364,9 @@ func (p *scorePlugin) Disable() bool   { return false }
 func (p *scorePlugin) Close() error    { return p.client.Close() }
 
 func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (node.NodeScoreList, error) {
-	if err := p.client.syncSnapshot(selection); err != nil {
+	p.client.syncMu.Lock()
+	defer p.client.syncMu.Unlock()
+	if err := p.client.syncSnapshotLocked(selection); err != nil {
 		return nil, err
 	}
 	candidates := selection.Nodes()

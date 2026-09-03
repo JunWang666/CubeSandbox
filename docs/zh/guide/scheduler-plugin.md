@@ -54,7 +54,7 @@ CEL 提供基于版本化 protobuf 的强类型只读对象 `node` 与 `request`
           circuit_breaker_cooldown: 30s
 ```
 
-协议位于 `CubeMaster/api/services/schedulerplugin/v1/plugin.proto`。调用顺序为 `Handshake`、`SyncSnapshot`，再批量调用 `Filter` 或 `Score`。生产环境建议使用 Unix Domain Socket。可运行示例位于 `CubeMaster/examples/scheduler-plugin`：
+协议位于 `CubeMaster/api/services/schedulerplugin/v1/plugin.proto`。调用顺序为 `Handshake`、`SyncSnapshot`，再批量调用 `Filter` 或 `Score`。每次调度尝试都会生成新的快照版本，且并发请求会交错调用，因此插件服务端必须按 `snapshot_version` 键存快照（并设置淘汰上限），不能只保留单个"最新"槽位。生产环境建议使用 Unix Domain Socket。可运行示例位于 `CubeMaster/examples/scheduler-plugin`：
 
 ```bash
 cd CubeMaster

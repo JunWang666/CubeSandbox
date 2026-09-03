@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,14 +31,14 @@ const DefaultProfile = "default"
 
 // ProfileNameOf returns the metrics profile label for a scheduling context:
 // the name of the profile the pipeline actually routed the request to
-// (SelectorCtx.ProfileName is stamped by Select), falling back to
-// DefaultProfile when the context or stamp is absent. Profile names come from
-// the operator's config, a bounded set, so they are safe as a metric label.
+// (stamped atomically by Select), falling back to DefaultProfile when the
+// context or stamp is absent. Profile names come from the operator's config,
+// a bounded set, so they are safe as a metric label.
 func ProfileNameOf(selCtx *selctx.SelectorCtx) string {
-	if selCtx == nil || selCtx.ProfileName == "" {
+	if selCtx == nil || selCtx.GetProfileName() == "" {
 		return DefaultProfile
 	}
-	return selCtx.ProfileName
+	return selCtx.GetProfileName()
 }
 
 // Label value enums. Cardinality is intentionally kept small and closed.
@@ -387,9 +388,21 @@ func fragmentedCapacityRatio(nodes []nodeResourceStat, fn nodeCapacityFunc, shap
 
 var clusterGaugeOnce sync.Once
 
+var clusterGaugesDisabled atomic.Bool
+
+// DisableClusterGauges turns off the periodic cluster gauge collector. The
+// in-process scheduler simulator (pkg/scheduler/sim) uses it: the collector
+// clones nodes from a background goroutine while the sim engine writes node
+// metrics on its own goroutine, and localcache node fields are not race-safe
+// across goroutines.
+func DisableClusterGauges() { clusterGaugesDisabled.Store(true) }
+
 // startClusterGaugeCollector launches the periodic gauge collection exactly
 // once, even if InitScheduler is called repeatedly (e.g. in-process restarts).
 func startClusterGaugeCollector(ctx context.Context) {
+	if clusterGaugesDisabled.Load() {
+		return
+	}
 	clusterGaugeOnce.Do(func() {
 		recov.GoWithRecover(func() {
 			collectClusterGaugesLoop(ctx)

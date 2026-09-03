@@ -18,6 +18,7 @@ import (
 	"sync"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/filter"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/plugin"
@@ -176,6 +177,14 @@ func compileLegacy(ctx context.Context, scheduler *config.WrapperSchedulerConf, 
 			conf := config.SchedulerProfilePluginConf{Name: name, Type: plugin.TypeGo}
 			selector, err := registry.BuildFilter(ctx, conf)
 			if err != nil {
+				// Legacy compatibility: pre-plugin configs silently skipped
+				// unregistered filter names (filter.NewSelector). Keep
+				// tolerating them so stale entries in existing deployments do
+				// not become a startup-fatal error after upgrade.
+				if errors.Is(err, plugin.ErrUnknownPlugin) {
+					log.G(ctx).Warnf("legacy scheduler filter %q is not registered; skipping", name)
+					continue
+				}
 				return nil, err
 			}
 			pipeline.Filters = append(pipeline.Filters, FilterPlugin{Name: name, Selector: selector, Failure: FilterFailClosed})
@@ -187,10 +196,23 @@ func compileLegacy(ctx context.Context, scheduler *config.WrapperSchedulerConf, 
 			conf := config.SchedulerProfilePluginConf{Name: name, Type: plugin.TypeGo}
 			selector, err := registry.BuildScore(ctx, conf)
 			if err != nil {
+				if errors.Is(err, plugin.ErrUnknownPlugin) {
+					log.G(ctx).Warnf("legacy scheduler scorer %q is not registered; skipping", name)
+					continue
+				}
 				return nil, err
 			}
+			weight := selector.Weight()
+			if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+				// Legacy compatibility: pre-plugin scoring tolerated a zero
+				// weight (score * 0, random pick when all weights are zero).
+				// Skipping the scorer preserves that behavior instead of
+				// failing every create with an internal error at runtime.
+				log.G(ctx).Warnf("legacy scheduler scorer %q has invalid weight %v; skipping", name, weight)
+				continue
+			}
 			pipeline.Scores = append(pipeline.Scores, ScorePlugin{
-				Name: name, Selector: selector, Weight: selector.Weight(), Failure: ScoreSkip,
+				Name: name, Selector: selector, Weight: weight, Failure: ScoreSkip,
 			})
 			set.addCloser(selector)
 		}

@@ -256,7 +256,8 @@ func TestProfileNameOf(t *testing.T) {
 	if got := ProfileNameOf(&selctx.SelectorCtx{}); got != DefaultProfile {
 		t.Fatalf("ProfileNameOf(unstamped) = %q, want %q", got, DefaultProfile)
 	}
-	stamped := &selctx.SelectorCtx{ProfileName: "template-hotstart"}
+	stamped := &selctx.SelectorCtx{}
+	stamped.SetProfileName("template-hotstart")
 	if got := ProfileNameOf(stamped); got != "template-hotstart" {
 		t.Fatalf("ProfileNameOf(stamped) = %q, want template-hotstart", got)
 	}

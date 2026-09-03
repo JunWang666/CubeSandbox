@@ -23,11 +23,17 @@ import (
 
 const protocolVersion = "v1"
 
+// maxSnapshots bounds how many snapshot versions are kept. The CubeMaster
+// client assigns a fresh version per scheduling attempt, and concurrent
+// attempts interleave SyncSnapshot with Filter/Score, so snapshots must be
+// keyed by version — a single "latest" slot corrupts in-flight requests.
+const maxSnapshots = 8
+
 type server struct {
 	schedulerplugin.UnimplementedSchedulerPluginServer
-	mu      sync.RWMutex
-	version string
-	nodes   map[string]*schedulerplugin.SnapshotNode
+	mu        sync.RWMutex
+	snapshots map[string]map[string]*schedulerplugin.SnapshotNode
+	order     []string // FIFO of snapshot versions for eviction
 }
 
 func (s *server) Handshake(_ context.Context, request *schedulerplugin.HandshakeRequest) (*schedulerplugin.HandshakeResponse, error) {
@@ -46,22 +52,38 @@ func (s *server) SyncSnapshot(_ context.Context, request *schedulerplugin.Snapsh
 	for _, candidate := range request.GetNodes() {
 		nodes[candidate.GetId()] = candidate
 	}
+	version := request.GetSnapshotVersion()
 	s.mu.Lock()
-	s.version = request.GetSnapshotVersion()
-	s.nodes = nodes
+	if _, exists := s.snapshots[version]; !exists {
+		s.order = append(s.order, version)
+		for len(s.order) > maxSnapshots {
+			delete(s.snapshots, s.order[0])
+			s.order = s.order[1:]
+		}
+	}
+	s.snapshots[version] = nodes
 	s.mu.Unlock()
-	return &schedulerplugin.SnapshotResponse{SnapshotVersion: request.GetSnapshotVersion()}, nil
+	return &schedulerplugin.SnapshotResponse{SnapshotVersion: version}, nil
+}
+
+func (s *server) snapshot(version string) (map[string]*schedulerplugin.SnapshotNode, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	nodes, ok := s.snapshots[version]
+	if !ok {
+		return nil, fmt.Errorf("snapshot %q is not synchronized or has been evicted", version)
+	}
+	return nodes, nil
 }
 
 func (s *server) Filter(_ context.Context, request *schedulerplugin.FilterRequest) (*schedulerplugin.FilterResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if request.GetSnapshotVersion() != s.version {
-		return nil, fmt.Errorf("snapshot %q is not synchronized", request.GetSnapshotVersion())
+	nodes, err := s.snapshot(request.GetSnapshotVersion())
+	if err != nil {
+		return nil, err
 	}
-	response := &schedulerplugin.FilterResponse{SnapshotVersion: s.version}
+	response := &schedulerplugin.FilterResponse{SnapshotVersion: request.GetSnapshotVersion()}
 	for _, id := range request.GetCandidateIds() {
-		candidate := s.nodes[id]
+		candidate := nodes[id]
 		if candidate != nil && candidate.GetCreating() < 8 {
 			response.KeptIds = append(response.KeptIds, id)
 		}
@@ -70,14 +92,13 @@ func (s *server) Filter(_ context.Context, request *schedulerplugin.FilterReques
 }
 
 func (s *server) Score(_ context.Context, request *schedulerplugin.ScoreRequest) (*schedulerplugin.ScoreResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if request.GetSnapshotVersion() != s.version {
-		return nil, fmt.Errorf("snapshot %q is not synchronized", request.GetSnapshotVersion())
+	nodes, err := s.snapshot(request.GetSnapshotVersion())
+	if err != nil {
+		return nil, err
 	}
-	response := &schedulerplugin.ScoreResponse{SnapshotVersion: s.version}
+	response := &schedulerplugin.ScoreResponse{SnapshotVersion: request.GetSnapshotVersion()}
 	for _, id := range request.GetCandidateIds() {
-		candidate := s.nodes[id]
+		candidate := nodes[id]
 		if candidate == nil {
 			return nil, fmt.Errorf("unknown candidate %q", id)
 		}
@@ -103,7 +124,9 @@ func main() {
 		log.Fatalf("listen on %s: %v", socket, err)
 	}
 	grpcServer := grpc.NewServer()
-	schedulerplugin.RegisterSchedulerPluginServer(grpcServer, &server{})
+	schedulerplugin.RegisterSchedulerPluginServer(grpcServer, &server{
+		snapshots: make(map[string]map[string]*schedulerplugin.SnapshotNode),
+	})
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
