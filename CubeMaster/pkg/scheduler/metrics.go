@@ -127,10 +127,10 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 13), // 100ms .. ~7min
 	}, []string{profileLabel, resultLabel})
 
-	// clusterQuotaGauge exposes summed cluster resources: allocated is the
-	// usage the scheduler accounts for (EffectiveAllocated), capacity is the
-	// overcommitted quota (quota * overcommit_ratio). cpu in millicores,
-	// mem in MB.
+	// clusterQuotaGauge exposes summed cluster resources: allocated is the raw
+	// accounted usage (never EffectiveAllocated — it collapses to 0 under
+	// ignore_redis_allocation), capacity is the overcommitted quota
+	// (quota * overcommit_ratio). cpu in millicores, mem in MB.
 	clusterQuotaGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "scheduler_cluster_quota",
 		Help: "Summed cluster quota seen by the scheduler (cpu in millicores, mem in MB), by resource and type (allocated/capacity).",
@@ -277,9 +277,20 @@ type nodeResourceStat struct {
 }
 
 // nodeCapacityFunc resolves one node's overcommitted schedulable capacity and
-// the allocated usage the scheduler accounts for (EffectiveAllocated), in cpu
-// millicores / mem MB.
+// its raw allocated usage, in cpu millicores / mem MB. The allocated side must
+// stay the raw accounted usage: EffectiveAllocated collapses to 0 under
+// ignore_redis_allocation, which would silently zero the quota gauge, the
+// node load CV and the fragmentation ratio.
 type nodeCapacityFunc func(n nodeResourceStat) (cpuCapMilli, memCapMB, cpuAllocMilli, memAllocMB int64)
+
+// observedNodeCapacity applies the overcommit ratio to capacity but reports
+// the raw allocated usage, per the metrics definition (design doc §3.1).
+func observedNodeCapacity(cfg *config.WrapperSchedulerConf, n nodeResourceStat) (int64, int64, int64, int64) {
+	return cfg.EffectiveQuotaCpu(n.instanceType, n.quotaCpuMilli),
+		cfg.EffectiveQuotaMem(n.instanceType, n.quotaMemMB),
+		n.cpuUsageMilli,
+		n.memUsageMB
+}
 
 // clusterQuota holds summed cluster resources for the quota gauge.
 type clusterQuota struct {
@@ -450,10 +461,7 @@ func collectClusterGauges() {
 		})
 	}
 	capFn := func(n nodeResourceStat) (int64, int64, int64, int64) {
-		return cfg.Scheduler.EffectiveQuotaCpu(n.instanceType, n.quotaCpuMilli),
-			cfg.Scheduler.EffectiveQuotaMem(n.instanceType, n.quotaMemMB),
-			cfg.Scheduler.EffectiveAllocated(n.cpuUsageMilli),
-			cfg.Scheduler.EffectiveAllocated(n.memUsageMB)
+		return observedNodeCapacity(cfg.Scheduler, n)
 	}
 
 	quota := sumClusterQuota(stats, capFn)
