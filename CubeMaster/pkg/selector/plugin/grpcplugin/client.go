@@ -19,12 +19,12 @@ import (
 	"sync"
 	"time"
 
-	schedulerplugin "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/schedulerplugin/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/filter"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/score"
+	schedulerplugin "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/schedulerplugin/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
