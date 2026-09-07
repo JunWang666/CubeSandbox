@@ -144,15 +144,19 @@ func getImageScore(ctx context.Context, images []*selctx.ImageSpec, nodeInfo *no
 	return float64(score)
 }
 
-// getTemplateScore 按模板 ID 给节点打分：节点已缓存该模板镜像则得高分
+// getTemplateScore 按模板 ID 给节点打分：节点已缓存该模板镜像得满分，否则 0 分。
+// 模板因子是布尔化的：此前按"模板字节数 × 副本比例"经 calculatePriority 线性映射，
+// 常见 GiB 级模板在 [23MB, 80GB] 尺度上只得 1-2 分，会被任意资源类因子碾压，
+// 使 locality 偏好在数值上失效
 func getTemplateScore(ctx context.Context, templateID string, nodeInfo *node.Node) float64 {
 	_ = ctx
 	if templateID == "" || nodeInfo == nil {
 		return 0
 	}
-	imageScores := sumTemplateScores(nodeInfo, templateID)
-	score := calculatePriority(imageScores, 1)
-	return float64(score)
+	if getImageStateByNode(templateID, nodeInfo.ID()) != nil {
+		return float64(fwk.MaxNodeScore)
+	}
+	return 0
 }
 
 // calculatePriority 将镜像总分映射到 0~MaxNodeScore 区间：
@@ -175,15 +179,6 @@ func sumImageScores(nodeInfo *node.Node, images []*selctx.ImageSpec) int64 {
 		if state := getImageStateByNode(image.ImageID, nodeInfo.ID()); state != nil {
 			sum += int64(state.ScaledImageScore)
 		}
-	}
-	return sum
-}
-
-// sumTemplateScores 取节点上模板镜像的得分（未缓存则为 0）
-func sumTemplateScores(nodeInfo *node.Node, templateID string) int64 {
-	var sum int64 = 0
-	if state := getImageStateByNode(templateID, nodeInfo.ID()); state != nil {
-		sum += int64(state.ScaledImageScore)
 	}
 	return sum
 }

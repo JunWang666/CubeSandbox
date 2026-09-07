@@ -14,42 +14,56 @@ import (
 )
 
 // getFactorWeightedAverageScore 按启用的因子列表计算节点加权平均分：
-// 每个因子得到一个 0~100 区间的基础分（越高表示资源越空闲/负载越低），再乘以对应权重求和
+// 每个因子得到一个 0~100 区间的基础分（越高表示资源越空闲/负载越低），再乘以对应权重求和。
+// 因子基础分先经 clampFactorScore 收敛：超卖或指标异常时原始计算可能越界
+// （如配额使用率 >100% 得负分、创建并发上限原始值可超 100），Profile 流水线
+// 对 fail-closed 插件强制 [0,100]，越界会把调度打成全局失败
 func getFactorWeightedAverageScore(n *node.Node, enableWeightFactors []string) float64 {
 	scores := float64(0)
 	for _, v := range enableWeightFactors {
 		switch v {
 		case constants.WeightFactorCreateConcurrentLimit:
-			scores += getCreateLimitScore(n) * getFactorWeight(constants.WeightFactorCreateConcurrentLimit)
+			scores += clampFactorScore(getCreateLimitScore(n)) * getFactorWeight(constants.WeightFactorCreateConcurrentLimit)
 		case constants.WeightFactorMvmNum:
-			scores += getMvmNumScore(n) * getFactorWeight(constants.WeightFactorMvmNum)
+			scores += clampFactorScore(getMvmNumScore(n)) * getFactorWeight(constants.WeightFactorMvmNum)
 		case constants.WeightFactorMetricUpdate:
-			scores += getMetricUpdateDiff(n) * getFactorWeight(constants.WeightFactorMetricUpdate)
+			scores += clampFactorScore(getMetricUpdateDiff(n)) * getFactorWeight(constants.WeightFactorMetricUpdate)
 		case constants.WeightFactorLocalMetricUpdate:
-			scores += getMetricLocalUpdateDiff(n) * getFactorWeight(constants.WeightFactorLocalMetricUpdate)
+			scores += clampFactorScore(getMetricLocalUpdateDiff(n)) * getFactorWeight(constants.WeightFactorLocalMetricUpdate)
 		case constants.WeightFactorQuotaCpu:
-			scores += getQuotaCpuUsageScore(n) * getFactorWeight(constants.WeightFactorQuotaCpu)
+			scores += clampFactorScore(getQuotaCpuUsageScore(n)) * getFactorWeight(constants.WeightFactorQuotaCpu)
 		case constants.WeightFactorQuotaMem:
-			scores += getQuotaMemMbUsageScore(n) * getFactorWeight(constants.WeightFactorQuotaMem)
+			scores += clampFactorScore(getQuotaMemMbUsageScore(n)) * getFactorWeight(constants.WeightFactorQuotaMem)
 		case constants.WeightFactorCpuUtil:
-			scores += getCpuUtilScore(n) * getFactorWeight(constants.WeightFactorCpuUtil)
+			scores += clampFactorScore(getCpuUtilScore(n)) * getFactorWeight(constants.WeightFactorCpuUtil)
 		case constants.WeightFactorMemUsage:
-			scores += getMemMbUsageScore(n) * getFactorWeight(constants.WeightFactorMemUsage)
+			scores += clampFactorScore(getMemMbUsageScore(n)) * getFactorWeight(constants.WeightFactorMemUsage)
 		case constants.WeightFactorCpuLoadUsage:
-			scores += getCpuLoadUsageScore(n) * getFactorWeight(constants.WeightFactorCpuLoadUsage)
+			scores += clampFactorScore(getCpuLoadUsageScore(n)) * getFactorWeight(constants.WeightFactorCpuLoadUsage)
 		case constants.WeightFactorRealTimeCreateNum:
-			scores += getRealTimeCreateNumScore(n) * getFactorWeight(constants.WeightFactorRealTimeCreateNum)
+			scores += clampFactorScore(getRealTimeCreateNumScore(n)) * getFactorWeight(constants.WeightFactorRealTimeCreateNum)
 		case constants.WeightFactorLocalCreateNum:
-			scores += getLocalCreateNumScore(n) * getFactorWeight(constants.WeightFactorLocalCreateNum)
+			scores += clampFactorScore(getLocalCreateNumScore(n)) * getFactorWeight(constants.WeightFactorLocalCreateNum)
 		case constants.WeightFactorDataDiskUsage:
-			scores += getDataDiskUsageScore(n) * getFactorWeight(constants.WeightFactorDataDiskUsage)
+			scores += clampFactorScore(getDataDiskUsageScore(n)) * getFactorWeight(constants.WeightFactorDataDiskUsage)
 		case constants.WeightFactorStorageDiskUsage:
-			scores += getStorageUsageScore(n) * getFactorWeight(constants.WeightFactorStorageDiskUsage)
+			scores += clampFactorScore(getStorageUsageScore(n)) * getFactorWeight(constants.WeightFactorStorageDiskUsage)
 		case constants.WeightFactorSysDiskUsage:
-			scores += getSysDiskUsageScore(n) * getFactorWeight(constants.WeightFactorSysDiskUsage)
+			scores += clampFactorScore(getSysDiskUsageScore(n)) * getFactorWeight(constants.WeightFactorSysDiskUsage)
 		}
 	}
 	return scores
+}
+
+// clampFactorScore 将因子基础分收敛到约定的 [0,100] 区间
+func clampFactorScore(s float64) float64 {
+	if s < 0 {
+		return 0
+	}
+	if s > 100 {
+		return 100
+	}
+	return s
 }
 
 // getReciprocal 计算 v 占 base 的比例（0~1），base 为 0 时返回 0

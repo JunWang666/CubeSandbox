@@ -53,6 +53,8 @@ scheduler:
       quota_mem_usage: 1.0
 
     plugin_conf:
+      # template_id 因子是布尔打分：节点持有该模板本地副本=100，否则=0，
+      # 与模板尺寸无关（--template-size-bytes 只影响 image_id 因子记账）
       image_score:
         weight: 1.0
         enable_weight_factors:

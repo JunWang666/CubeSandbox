@@ -45,8 +45,11 @@ scheduler:
   node_max_mem_reserved_in_mb: 256
 
     # The realtime scorer compares current CPU and memory quota allocation.
-  # Request weights are temporarily omitted because the legacy scorer may
-  # exceed the strict Profile score range when they are enabled.
+    # Factor base scores are clamped to [0,100] at the scorer boundary
+    # (pkg/selector/score/utils.go clampFactorScore), so overcommitted quota
+    # factors no longer trip the Profile fail-closed score-range check.
+    # Request weights remain omitted to keep the burst objective purely
+    # allocation-driven.
   score:
     resource_weights:
       quota_cpu_usage: 1.0

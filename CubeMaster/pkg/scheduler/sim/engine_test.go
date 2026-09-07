@@ -164,6 +164,11 @@ func TestRunRoundTemplateMissFails(t *testing.T) {
 	approx(t, "empty_nodes_avg", s["empty_nodes_avg"], 2, 1e-9)
 }
 
+// TestRunRoundAllowsNonLocalTemplate: with remote restore allowed and nothing
+// preloaded, the first placement per node is a miss that warms the node's
+// cache; every later request of the same template hits. With 2 nodes and 4
+// requests the first two warm one node each (least-loaded scoring spreads
+// them) and the last two hit, giving a deterministic 2/4 hit rate.
 func TestRunRoundAllowsNonLocalTemplate(t *testing.T) {
 	bootstrapOnce(t)
 
@@ -185,5 +190,5 @@ func TestRunRoundAllowsNonLocalTemplate(t *testing.T) {
 
 	s := rr.Summary
 	approx(t, "success_rate", s["success_rate"], 1, 1e-9)
-	approx(t, "template_hit_rate", s["template_hit_rate"], 0, 1e-9)
+	approx(t, "template_hit_rate", s["template_hit_rate"], 0.5, 1e-9)
 }

@@ -40,9 +40,9 @@ const (
 	NoCandidateFail    NoCandidatePolicy = "fail"
 	NoCandidateBackoff NoCandidatePolicy = "backoff"
 
-	SelectionRandom  = "random"
-	SelectionSpread  = "spread"
-	SelectionHighest = "highest"
+	SelectionRandom  = "random"  // top_n 内按分数加权随机
+	SelectionSpread  = "spread"  // top_n 内确定性选取运行沙箱数最少的节点
+	SelectionHighest = "highest" // 严格选取评分最高的节点
 )
 
 var mandatoryGuardNames = []string{"node_safety", "cpu", "mem", "disk", "template_locality", "realtime_create_num"}
@@ -216,6 +216,13 @@ func compileLegacy(ctx context.Context, scheduler *config.WrapperSchedulerConf, 
 			})
 			set.addCloser(selector)
 		}
+	}
+	if len(pipeline.Scores) == 0 {
+		// 零 scorer 的 legacy 流水线没有打分阶段：终选退化为按枚举序的近似
+		// first-fit（priority_select_num=1 时永远选中首节点），会产生极端堆叠。
+		// 这通常是 score 配置缺失/遗漏而非有意为之，给出显眼告警
+		log.G(ctx).Warnf("legacy scheduler profile compiled with zero scorers; " +
+			"selection degenerates to first-fit stacking (check scheduler.score config)")
 	}
 	return pipeline, nil
 }
