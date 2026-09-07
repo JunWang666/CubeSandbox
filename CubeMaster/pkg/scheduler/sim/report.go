@@ -13,17 +13,19 @@ import (
 // ReportConfig echoes the run parameters into the report so results are
 // self-describing. Field set is part of the cross-tool report contract.
 type ReportConfig struct {
-	Tool            string  `json:"tool"`
-	Trace           string  `json:"trace"`
-	Workload        string  `json:"workload"`
-	Seed            int64   `json:"seed"`
-	Rounds          int     `json:"rounds"`
-	Nodes           int     `json:"nodes"`
-	NodeCPUMillis   int64   `json:"node_cpu_millis"`
-	NodeMemMiB      int64   `json:"node_mem_mib"`
-	InstanceType    string  `json:"instance_type"`
-	TemplatePreload float64 `json:"template_preload"`
-	Requests        int     `json:"requests"`
+	Tool                  string  `json:"tool"`
+	Trace                 string  `json:"trace"`
+	Workload              string  `json:"workload"`
+	Seed                  int64   `json:"seed"`
+	Rounds                int     `json:"rounds"`
+	Nodes                 int     `json:"nodes"`
+	NodeCPUMillis         int64   `json:"node_cpu_millis"`
+	NodeMemMiB            int64   `json:"node_mem_mib"`
+	InstanceType          string  `json:"instance_type"`
+	TemplatePreload       float64 `json:"template_preload"`
+	AllowNonLocalTemplate bool    `json:"allow_non_local_template"`
+	TemplateSizeBytes     int64   `json:"template_size_bytes"`
+	Requests              int     `json:"requests"`
 }
 
 // Report is the schedsim output document: run config, the cross-round mean

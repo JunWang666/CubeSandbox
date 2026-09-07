@@ -207,6 +207,8 @@ func RenderCompare(variants []VariantReport, generated time.Time) (string, error
 	fmt.Fprintf(&b, "| nodes | %d × %d millicores / %d MiB |\n", base.Nodes, base.NodeCPUMillis, base.NodeMemMiB)
 	fmt.Fprintf(&b, "| instance_type | %s |\n", base.InstanceType)
 	fmt.Fprintf(&b, "| template_preload | %s |\n", formatCompareNum(base.TemplatePreload))
+	fmt.Fprintf(&b, "| allow_non_local_template | %t |\n", base.AllowNonLocalTemplate)
+	fmt.Fprintf(&b, "| template_size_bytes | %d |\n", base.TemplateSizeBytes)
 	fmt.Fprintf(&b, "| seed / rounds | %d / %d |\n", base.Seed, base.Rounds)
 	b.WriteString("\nVariants share the same trace, node fleet, preload draw seeds and round count; only the scheduler config differs.\n\n")
 	b.WriteString("| role | name | config |\n| --- | --- | --- |\n")

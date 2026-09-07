@@ -163,3 +163,27 @@ func TestRunRoundTemplateMissFails(t *testing.T) {
 	approx(t, "active_nodes_avg", s["active_nodes_avg"], 0, 1e-9)
 	approx(t, "empty_nodes_avg", s["empty_nodes_avg"], 2, 1e-9)
 }
+
+func TestRunRoundAllowsNonLocalTemplate(t *testing.T) {
+	bootstrapOnce(t)
+
+	rr, err := RunRound(context.Background(), Params{
+		Trace:                 mkTrace(4, 1000, 60000, 1000, 2048, "tpl-remote"),
+		Nodes:                 2,
+		NodeCPUMillis:         64000,
+		NodeMemMiB:            65536,
+		InstanceType:          "sim",
+		TemplatePreload:       0,
+		AllowNonLocalTemplate: true,
+		TemplateSizeBytes:     1 << 30,
+		Seed:                  42,
+		RoundID:               3,
+	})
+	if err != nil {
+		t.Fatalf("RunRound: %v", err)
+	}
+
+	s := rr.Summary
+	approx(t, "success_rate", s["success_rate"], 1, 1e-9)
+	approx(t, "template_hit_rate", s["template_hit_rate"], 0, 1e-9)
+}

@@ -34,18 +34,20 @@ import (
 
 func main() {
 	var (
-		tracePath    = flag.String("trace", "", "trace file (cube-bench --dump-trace JSON), required")
-		configPath   = flag.String("config", "", "CubeMaster YAML config for the scheduler under test, required")
-		compareList  = flag.String("compare", "", "compare mode: comma-separated name=config.yaml variants; the first is the baseline. Supersedes --config")
-		outDir       = flag.String("out-dir", "", "compare mode: directory for per-variant JSON reports (default: a fresh temp dir)")
-		nodes        = flag.Int("nodes", 300, "number of simulated homogeneous nodes")
-		nodeCPUMilli = flag.Int64("node-cpu-millis", 64000, "per-node cpu quota in millicores")
-		nodeMemMiB   = flag.Int64("node-mem-mib", 131072, "per-node memory quota in MiB")
-		instanceType = flag.String("instance-type", "sim", "instance type all sim nodes register under")
-		preload      = flag.Float64("template-preload", 1.0, "fraction of nodes preloaded with a local replica of each template")
-		seed         = flag.Int64("seed", 42, "base seed; round i uses seed+i")
-		rounds       = flag.Int("rounds", 1, "number of simulation rounds")
-		out          = flag.String("o", "", "report output path (default: stdout)")
+		tracePath             = flag.String("trace", "", "trace file (cube-bench --dump-trace JSON), required")
+		configPath            = flag.String("config", "", "CubeMaster YAML config for the scheduler under test, required")
+		compareList           = flag.String("compare", "", "compare mode: comma-separated name=config.yaml variants; the first is the baseline. Supersedes --config")
+		outDir                = flag.String("out-dir", "", "compare mode: directory for per-variant JSON reports (default: a fresh temp dir)")
+		nodes                 = flag.Int("nodes", 300, "number of simulated homogeneous nodes")
+		nodeCPUMilli          = flag.Int64("node-cpu-millis", 64000, "per-node cpu quota in millicores")
+		nodeMemMiB            = flag.Int64("node-mem-mib", 131072, "per-node memory quota in MiB")
+		instanceType          = flag.String("instance-type", "sim", "instance type all sim nodes register under")
+		preload               = flag.Float64("template-preload", 1.0, "fraction of nodes preloaded with a local replica of each template")
+		allowNonLocalTemplate = flag.Bool("allow-non-local-template", false, "allow template requests to use nodes without a local replica")
+		templateSizeBytes     = flag.Int64("template-size-bytes", 1, "simulated size in bytes of each preloaded template")
+		seed                  = flag.Int64("seed", 42, "base seed; round i uses seed+i")
+		rounds                = flag.Int("rounds", 1, "number of simulation rounds")
+		out                   = flag.String("o", "", "report output path (default: stdout)")
 	)
 	flag.Parse()
 
@@ -59,18 +61,25 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *templateSizeBytes <= 0 {
+		fmt.Fprintln(os.Stderr, "schedsim: --template-size-bytes must be > 0")
+		os.Exit(2)
+	}
+
 	if *compareList != "" {
 		opts := compareOptions{
-			TracePath:    *tracePath,
-			OutDir:       *outDir,
-			Nodes:        *nodes,
-			NodeCPUMilli: *nodeCPUMilli,
-			NodeMemMiB:   *nodeMemMiB,
-			InstanceType: *instanceType,
-			Preload:      *preload,
-			Seed:         *seed,
-			Rounds:       *rounds,
-			Out:          *out,
+			TracePath:             *tracePath,
+			OutDir:                *outDir,
+			Nodes:                 *nodes,
+			NodeCPUMilli:          *nodeCPUMilli,
+			NodeMemMiB:            *nodeMemMiB,
+			InstanceType:          *instanceType,
+			Preload:               *preload,
+			Seed:                  *seed,
+			Rounds:                *rounds,
+			Out:                   *out,
+			AllowNonLocalTemplate: *allowNonLocalTemplate,
+			TemplateSizeBytes:     *templateSizeBytes,
 		}
 		if err := runCompareMode(*compareList, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "schedsim: %v\n", err)
@@ -79,12 +88,37 @@ func main() {
 		return
 	}
 
-	runSingle(*tracePath, *configPath, *nodes, *nodeCPUMilli, *nodeMemMiB, *instanceType, *preload, *seed, *rounds, *out)
+	// runSingle(*tracePath, *configPath, *nodes, *nodeCPUMilli, *nodeMemMiB, *instanceType, *preload, *seed, *rounds, *out)
+	runSingle(
+		*tracePath,
+		*configPath,
+		*nodes,
+		*nodeCPUMilli,
+		*nodeMemMiB,
+		*instanceType,
+		*preload,
+		*allowNonLocalTemplate,
+		*templateSizeBytes,
+		*seed,
+		*rounds,
+		*out,
+	)
 }
 
 // runSingle executes one simulation campaign against a single config and
 // writes the JSON report.
-func runSingle(tracePath, configPath string, nodes int, nodeCPUMilli, nodeMemMiB int64, instanceType string, preload float64, seed int64, rounds int, out string) {
+func runSingle(
+	tracePath, configPath string,
+	nodes int,
+	nodeCPUMilli, nodeMemMiB int64,
+	instanceType string,
+	preload float64,
+	allowNonLocalTemplate bool,
+	templateSizeBytes int64,
+	seed int64,
+	rounds int,
+	out string,
+) {
 	ctx := context.Background()
 
 	// config.Init dumps the whole parsed config to stdout; keep stdout clean
@@ -113,14 +147,16 @@ func runSingle(tracePath, configPath string, nodes int, nodeCPUMilli, nodeMemMiB
 	for i := 0; i < rounds; i++ {
 		roundSeed := seed + int64(i)
 		rr, err := sim.RunRound(ctx, sim.Params{
-			Trace:           trace,
-			Nodes:           nodes,
-			NodeCPUMillis:   nodeCPUMilli,
-			NodeMemMiB:      nodeMemMiB,
-			InstanceType:    instanceType,
-			TemplatePreload: preload,
-			Seed:            roundSeed,
-			RoundID:         i,
+			AllowNonLocalTemplate: allowNonLocalTemplate,
+			TemplateSizeBytes:     templateSizeBytes,
+			Trace:                 trace,
+			Nodes:                 nodes,
+			NodeCPUMillis:         nodeCPUMilli,
+			NodeMemMiB:            nodeMemMiB,
+			InstanceType:          instanceType,
+			TemplatePreload:       preload,
+			Seed:                  roundSeed,
+			RoundID:               i,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "schedsim: round %d: %v\n", i, err)
@@ -133,17 +169,19 @@ func runSingle(tracePath, configPath string, nodes int, nodeCPUMilli, nodeMemMiB
 
 	rep := &sim.Report{
 		Config: sim.ReportConfig{
-			Tool:            "schedsim",
-			Trace:           tracePath,
-			Workload:        trace.Workload,
-			Seed:            seed,
-			Rounds:          rounds,
-			Nodes:           nodes,
-			NodeCPUMillis:   nodeCPUMilli,
-			NodeMemMiB:      nodeMemMiB,
-			InstanceType:    instanceType,
-			TemplatePreload: preload,
-			Requests:        len(trace.Requests),
+			Tool:                  "schedsim",
+			Trace:                 tracePath,
+			Workload:              trace.Workload,
+			Seed:                  seed,
+			Rounds:                rounds,
+			Nodes:                 nodes,
+			NodeCPUMillis:         nodeCPUMilli,
+			NodeMemMiB:            nodeMemMiB,
+			InstanceType:          instanceType,
+			TemplatePreload:       preload,
+			AllowNonLocalTemplate: allowNonLocalTemplate,
+			TemplateSizeBytes:     templateSizeBytes,
+			Requests:              len(trace.Requests),
 		},
 		Summary: sim.MeanSummary(results),
 		Rounds:  results,

@@ -71,6 +71,14 @@ type Params struct {
 	// rng). 1.0 = every node has every template.
 	TemplatePreload float64
 
+	// AllowNonLocalTemplate allows template-bound requests to consider nodes
+	// without a local replica, modeling restore from shared remote storage.
+	AllowNonLocalTemplate bool
+
+	// TemplateSizeBytes is the simulated size of every preloaded template.
+	// Zero preserves the previous simulator behavior and is treated as 1 byte.
+	TemplateSizeBytes int64
+
 	// Seed drives template preload placement for this round. Round i of a
 	// multi-round run uses base seed + i.
 	Seed int64
@@ -95,7 +103,17 @@ func (p *Params) validate() error {
 	if p.TemplatePreload < 0 || p.TemplatePreload > 1 {
 		return fmt.Errorf("sim: template preload ratio %v out of [0,1]", p.TemplatePreload)
 	}
+	if p.TemplateSizeBytes < 0 {
+		return fmt.Errorf("sim: template size bytes %d must be >= 0", p.TemplateSizeBytes)
+	}
 	return nil
+}
+
+func (p *Params) effectiveTemplateSizeBytes() int64 {
+	if p.TemplateSizeBytes == 0 {
+		return 1
+	}
+	return p.TemplateSizeBytes
 }
 
 // SummaryKeys lists every key present in a round summary, in stable order.
@@ -310,7 +328,12 @@ func (e *engine) preloadTemplates() {
 			if e.p.TemplatePreload < 1 && rng.Float64() >= e.p.TemplatePreload {
 				continue
 			}
-			localcache.RegisterTemplateReplica(tplID, ns.id, 1)
+			// localcache.RegisterTemplateReplica(tplID, ns.id, 1)
+			localcache.RegisterTemplateReplica(
+				tplID,
+				ns.id,
+				e.p.effectiveTemplateSizeBytes(),
+			)
 			if e.replicas[tplID] == nil {
 				e.replicas[tplID] = make(map[string]bool)
 			}
@@ -351,10 +374,11 @@ func (e *engine) onCreate(ctx context.Context, ev event) {
 	selCtx.ReqRes = &selctx.RequestResource{
 		Cpu: *resource.NewMilliQuantity(req.CpuMillis, resource.DecimalSI),
 		Mem: *resource.NewQuantity(req.MemMiB*1024*1024, resource.BinarySI),
-		// The sim pairs with configs that enable the template_locality filter:
-		// requests insist on a local replica so locality quality is measurable.
-		TemplateID:            req.TemplateID,
-		AllowNonLocalTemplate: false,
+		// When remote restore is allowed, template locality becomes a scoring
+		// preference instead of a mandatory local-replica requirement.
+		TemplateID: req.TemplateID,
+		// AllowNonLocalTemplate: false,
+		AllowNonLocalTemplate: e.p.AllowNonLocalTemplate,
 	}
 
 	start := time.Now()
