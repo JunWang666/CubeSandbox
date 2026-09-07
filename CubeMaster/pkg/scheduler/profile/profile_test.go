@@ -10,12 +10,25 @@ import (
 	"testing"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/plugin"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/plugin/expr"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/score"
 )
 
 type trackingCloser struct{ closed bool }
+
+// stubScore is a minimal score.Selector with a configurable weight.
+type stubScore struct {
+	id     string
+	weight float64
+}
+
+func (s *stubScore) Select(*selctx.SelectorCtx) (node.NodeScoreList, error) { return nil, nil }
+func (s *stubScore) ID() string                                             { return s.id }
+func (s *stubScore) Weight() float64                                        { return s.weight }
+func (s *stubScore) Disable() bool                                          { return false }
 
 func (c *trackingCloser) Close() error {
 	c.closed = true
@@ -109,6 +122,36 @@ func TestCustomDefaultDoesNotCompileUnusedLegacyPlugins(t *testing.T) {
 	t.Cleanup(func() { _ = set.Close() })
 	if got := set.Match(&selctx.SelectorCtx{}); got.Name != "custom-default" {
 		t.Fatalf("default profile = %q", got.Name)
+	}
+}
+
+func TestLegacyCompileSkipsUnknownPluginsAndZeroWeights(t *testing.T) {
+	registry := profileRegistry(t)
+	zeroWeight := &stubScore{id: "zero", weight: 0}
+	if err := registry.RegisterScore(plugin.TypeGo, "zero_weight_scorer", func(context.Context, config.SchedulerProfilePluginConf) (score.Selector, error) {
+		return zeroWeight, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Scheduler: &config.WrapperSchedulerConf{SchedulerConf: config.SchedulerConf{
+		PrioritySelectNum: 1,
+		Filter:            &config.SchedulerFilterConf{EnableFilters: []string{"removed-plugin", "cpu"}},
+		Score: &config.SchedulerScoreConf{
+			EnableScorers:   []string{"removed-scorer", "zero_weight_scorer"},
+			ResourceWeights: map[string]float64{},
+		},
+	}}}
+	set, err := Compile(context.Background(), cfg, registry)
+	if err != nil {
+		t.Fatalf("legacy compile must tolerate stale plugin names and zero weights: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	pipeline := set.Match(&selctx.SelectorCtx{})
+	if len(pipeline.Filters) != 1 || pipeline.Filters[0].Name != "cpu" {
+		t.Fatalf("legacy filters = %+v", pipeline.Filters)
+	}
+	if len(pipeline.Scores) != 0 {
+		t.Fatalf("zero-weight scorer must be skipped, scores = %+v", pipeline.Scores)
 	}
 }
 

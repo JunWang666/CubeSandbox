@@ -22,19 +22,33 @@ type SelectorCtx struct {
 	Ctx             context.Context
 	ReqRes          *RequestResource
 	RequestLabels   map[string]string
-	ProfileName     string
 	SnapshotVersion string
 	lastBadFilters  []*node.Node
 	result          node.NodeList
 	snapshot        node.NodeList
 	snapshotFacts   map[string]SnapshotNodeFacts
 
+	// profileName is stamped by Select and may be read concurrently by the
+	// create path after a timeout, so it goes through atomic accessors.
+	profileName     atomic.Value // string
 	selName         string
 	rSelect         weighted.W
 	resultWithScore node.NodeScoreList
 
 	Affinity     Affinity
 	InstanceType string
+}
+
+// SetProfileName records the profile that routed this request.
+func (s *SelectorCtx) SetProfileName(name string) { s.profileName.Store(name) }
+
+// GetProfileName returns the stamped profile name, or "" if Select has not
+// stamped one yet.
+func (s *SelectorCtx) GetProfileName() string {
+	if value := s.profileName.Load(); value != nil {
+		return value.(string)
+	}
+	return ""
 }
 
 type Affinity struct {
