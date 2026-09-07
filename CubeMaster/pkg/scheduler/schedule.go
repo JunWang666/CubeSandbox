@@ -101,7 +101,7 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 		return nil, err
 	}
 
-	// 按 Profile 的选择策略（best / top_n）从评分结果中选出最终节点
+	// 按 Profile 的选择策略（highest / spread / random）从评分结果中选出最终节点
 	selected := selectNode(selCtx, pipeline)
 	if selected == nil && pipeline.NoCandidate == profile.NoCandidateBackoff {
 		if len(pipeline.Guards) == 0 {
@@ -165,10 +165,39 @@ func selectNode(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) *node.No
 	if selCtx == nil || pipeline == nil || selCtx.Nodes().Len() == 0 {
 		return nil
 	}
-	if pipeline.Selection == profile.SelectionHighest {
+	switch pipeline.Selection {
+	case profile.SelectionHighest:
 		return selCtx.Nodes()[0]
+	case profile.SelectionSpread:
+		return spreadSelect(selCtx, pipeline.TopN)
+	default:
+		return selCtx.LeastRandomSelect(pipeline.TopN)
 	}
-	return selCtx.LeastRandomSelect(pipeline.TopN)
+}
+
+// spreadSelect 实现摊平语义：在评分最高的前 topN 个候选中确定性选取当前运行
+// 沙箱数最少的节点，占用相同时保持评分顺序。与 random（top_n 内按分数加权随机）
+// 不同，spread 保证打分聚拢时放置仍然向空闲节点摊开。
+func spreadSelect(selCtx *selctx.SelectorCtx, topN int) *node.Node {
+	var candidates node.NodeList
+	if scored := selCtx.LeastScoreNodes(topN); scored.Len() > 0 {
+		candidates = make(node.NodeList, 0, scored.Len())
+		for i := range scored {
+			candidates = append(candidates, scored[i].OrigNode)
+		}
+	} else {
+		candidates = selCtx.LeastNodes(topN)
+	}
+	var best *node.Node
+	for i := range candidates {
+		if candidates[i] == nil {
+			continue
+		}
+		if best == nil || candidates[i].MvmNum < best.MvmNum {
+			best = candidates[i]
+		}
+	}
+	return best
 }
 
 func backoffSelectWithPipeline(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) (*node.Node, error) {

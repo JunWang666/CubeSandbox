@@ -25,6 +25,9 @@ go build -o /tmp/schedsim ./cmd/schedsim
   --node-mem-mib 131072 \              # 单节点内存配额（MiB）
   --instance-type sim \                # 所有节点注册的 instance type
   --template-preload 0.3 \             # 每个模板预置本地副本的节点比例
+  --template-size-bytes 1073741824 \   # 模拟模板尺寸（默认 1GiB；template_id 打分
+                                       # 是布尔的：有副本=100/无副本=0，尺寸只进
+                                       # image_id 因子的尺寸×副本比例记账）
   --seed 42 --rounds 3 \               # 第 i 轮 seed = seed+i
   -o report.json                       # 缺省写 stdout（注意此时 stdout 前有 config 噪声）
 ```
@@ -139,7 +142,7 @@ example.sim.yaml 把 `metric_update_timeout` 调到 86400s，同时引擎每次�
 | `jain_cpu` / `jain_mem` | Jain 公平指数 (Σx)²/(n·Σx²)；全 0 定义为 1（完全均衡） |
 | `fragmentation_ratio` | 对 trace 中**最大请求 shape**（max cpu_millis）：放不下该 shape 的节点的空闲 CPU 占总空闲 CPU 的比例。"空闲"与 cpu filter 同口径（配额×超卖比−已分配），"放不下"与 filter 的 `free > req` 判定互补（`free <= maxShape`） |
 | `herding_top1_share` | 被选中次数最多的节点占总成功放置的比例（羊群度） |
-| `template_hit_rate` | 成功放置中选中节点持有该模板本地副本的比例（分母为带模板的成功请求；仿真请求 `AllowNonLocalTemplate=false`，配合 template_locality filter 时恒为 1——该指标主要用于检测配置漂移） |
+| `template_hit_rate` | 成功放置中选中节点持有该模板本地副本的比例（分母为带模板的成功请求）。`AllowNonLocalTemplate=true` 时模拟缓存升温：远程落盘的模板随后在服务节点注册本地副本，同模板后续创建可命中，该指标因此能区分 locality 策略收益；`AllowNonLocalTemplate=false` 且配合 template_locality filter 时恒为 1（该形态下仅用于检测配置漂移） |
 | `active_nodes_avg` / `empty_nodes_avg` | 有/无运行中沙箱的节点数，时间平均 |
 
 指标计算均为纯函数（`pkg/scheduler/sim/metrics.go`），单测手算对拍。

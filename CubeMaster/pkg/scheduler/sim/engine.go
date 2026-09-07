@@ -73,6 +73,8 @@ type Params struct {
 
 	// AllowNonLocalTemplate allows template-bound requests to consider nodes
 	// without a local replica, modeling restore from shared remote storage.
+	// A restored template warms the node's cache: the engine registers a local
+	// replica on the placement node, so later same-template requests can hit.
 	AllowNonLocalTemplate bool
 
 	// TemplateSizeBytes is the simulated size of every preloaded template.
@@ -421,8 +423,23 @@ func (e *engine) onCreate(ctx context.Context, ev event) {
 		e.templatedSuccesses++
 		if e.replicas[req.TemplateID][ns.id] {
 			e.templateHits++
+		} else {
+			e.warmupReplica(req.TemplateID, ns.id)
 		}
 	}
+}
+
+// warmupReplica 模拟数据面的缓存升温：模板经远程 restore 落到节点后，在该节点
+// 注册本地副本，后续同模板创建即可命中（与真实 fake cubelet 行为模型一致：
+// miss 慢一次，随后升温）。仿真不建模 restore 延迟，副本在放置的同一虚拟时刻
+// 可见；副本计入 registered，轮末 cleanup 一并注销
+func (e *engine) warmupReplica(templateID, nodeID string) {
+	localcache.RegisterTemplateReplica(templateID, nodeID, e.p.effectiveTemplateSizeBytes())
+	if e.replicas[templateID] == nil {
+		e.replicas[templateID] = make(map[string]bool)
+	}
+	e.replicas[templateID][nodeID] = true
+	e.registered = append(e.registered, [2]string{templateID, nodeID})
 }
 
 func (e *engine) onExpire(ev event) {

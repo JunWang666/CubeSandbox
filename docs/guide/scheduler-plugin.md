@@ -30,6 +30,8 @@ scheduler:
         no_candidate: fail
 ```
 
+`selection.method` controls how the final node is picked from the scored candidates: `highest` takes the single highest-scored node; `spread` deterministically picks the node with the fewest running sandboxes among the top `top_n` candidates (ties keep score order), pushing placement apart; `random` (the default) draws a score-weighted random node among the top `top_n`. `top_n: -1` widens the candidate window to every node that passed filtering.
+
 Custom Profiles always run the `node_safety`, `cpu`, `mem`, `disk`, `template_locality`, and `realtime_create_num` guards. They cannot be disabled or repeated as optional filters. `node_safety` checks health, metric freshness, the MVM limit, and CPU-load validity on both the normal and backoff paths.
 
 ## Plugin types

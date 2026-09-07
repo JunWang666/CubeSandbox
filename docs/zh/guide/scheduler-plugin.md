@@ -30,6 +30,8 @@ scheduler:
         no_candidate: fail
 ```
 
+`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
+
 自定义 Profile 固定执行 `node_safety`、`cpu`、`mem`、`disk`、`template_locality` 和 `realtime_create_num` Guards，配置不能关闭或重复声明这些安全约束。其中 `node_safety` 会在正常路径和 backoff 路径检查健康度、指标新鲜度、MVM 上限及 CPU load 合法性。
 
 ## 插件类型

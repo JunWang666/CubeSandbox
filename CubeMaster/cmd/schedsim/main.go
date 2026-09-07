@@ -44,7 +44,7 @@ func main() {
 		instanceType          = flag.String("instance-type", "sim", "instance type all sim nodes register under")
 		preload               = flag.Float64("template-preload", 1.0, "fraction of nodes preloaded with a local replica of each template")
 		allowNonLocalTemplate = flag.Bool("allow-non-local-template", false, "allow template requests to use nodes without a local replica")
-		templateSizeBytes     = flag.Int64("template-size-bytes", 1, "simulated size in bytes of each preloaded template")
+		templateSizeBytes     = flag.Int64("template-size-bytes", 1<<30, "simulated size in bytes of each preloaded template; template_id scoring is boolean (cached=100/0) so size only feeds image_id factor accounting")
 		seed                  = flag.Int64("seed", 42, "base seed; round i uses seed+i")
 		rounds                = flag.Int("rounds", 1, "number of simulation rounds")
 		out                   = flag.String("o", "", "report output path (default: stdout)")
