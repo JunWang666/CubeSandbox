@@ -58,6 +58,12 @@ func RegisterBuiltins(registry *Registry) error {
 		"image_score": func(context.Context, config.SchedulerProfilePluginConf) (score.Selector, error) {
 			return score.NewImageScore(), nil
 		},
+		"resource_fit_score": func(
+			_ context.Context,
+			conf config.SchedulerProfilePluginConf,
+		) (score.Selector, error) {
+			return score.NewResourceFitScore(conf)
+		},
 	}
 	for name, factory := range scores {
 		if err := registry.RegisterScore(TypeGo, name, factory); err != nil {
