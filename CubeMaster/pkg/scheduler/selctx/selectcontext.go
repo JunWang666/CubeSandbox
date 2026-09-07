@@ -24,19 +24,33 @@ type SelectorCtx struct {
 	Ctx             context.Context
 	ReqRes          *RequestResource
 	RequestLabels   map[string]string
-	ProfileName     string
 	SnapshotVersion string
 	lastBadFilters  []*node.Node
 	result          node.NodeList
 	snapshot        node.NodeList
 	snapshotFacts   map[string]SnapshotNodeFacts
 
-	selName         string // 选择算法名称（random/sw/rw/rrw）
+	// profileName is stamped by Select and may be read concurrently by the
+	// create path after a timeout, so it goes through atomic accessors.
+	profileName     atomic.Value // string
+	selName         string       // 选择算法名称（random/sw/rw/rrw）
 	rSelect         weighted.W
 	resultWithScore node.NodeScoreList
 
 	Affinity     Affinity
 	InstanceType string
+}
+
+// SetProfileName records the profile that routed this request.
+func (s *SelectorCtx) SetProfileName(name string) { s.profileName.Store(name) }
+
+// GetProfileName returns the stamped profile name, or "" if Select has not
+// stamped one yet.
+func (s *SelectorCtx) GetProfileName() string {
+	if value := s.profileName.Load(); value != nil {
+		return value.(string)
+	}
+	return ""
 }
 
 // Affinity 节点亲和性配置：硬性选择器、兜底选择器与软性偏好评分

@@ -46,6 +46,10 @@ func Bootstrap(ctx context.Context, configPath string) error {
 	// The scheduler core logs per-request at Info/Warn; that would flood the
 	// sim output and pollute the Select latency measurement.
 	CubeLog.SetLevel(CubeLog.FATAL)
+	// The cluster gauge collector clones nodes from a background goroutine
+	// while the sim engine writes node metrics; localcache node fields are
+	// not race-safe across goroutines, so keep the collector off in-process.
+	scheduler.DisableClusterGauges()
 	task.InitTask(ctx, config.GetConfig())
 	if err := scheduler.InitScheduler(ctx); err != nil {
 		return fmt.Errorf("sim: InitScheduler: %w", err)

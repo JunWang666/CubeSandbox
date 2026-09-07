@@ -25,11 +25,12 @@ import (
 
 type fakeSchedulerPlugin struct {
 	schedulerplugin.UnimplementedSchedulerPluginServer
-	mu            sync.Mutex
-	lastSnapshot  string
-	invalidFilter bool
-	invalidScore  bool
-	failFilter    bool
+	mu               sync.Mutex
+	lastSnapshot     string
+	strictSingleSlot bool
+	invalidFilter    bool
+	invalidScore     bool
+	failFilter       bool
 }
 
 func (f *fakeSchedulerPlugin) Handshake(context.Context, *schedulerplugin.HandshakeRequest) (*schedulerplugin.HandshakeResponse, error) {
@@ -47,9 +48,14 @@ func (f *fakeSchedulerPlugin) Filter(_ context.Context, request *schedulerplugin
 	f.mu.Lock()
 	invalid := f.invalidFilter
 	fail := f.failFilter
+	strict := f.strictSingleSlot
+	lastSnapshot := f.lastSnapshot
 	f.mu.Unlock()
 	if fail {
 		return nil, status.Error(codes.Unavailable, "filter unavailable")
+	}
+	if strict && request.GetSnapshotVersion() != lastSnapshot {
+		return nil, status.Errorf(codes.FailedPrecondition, "snapshot %q is not synchronized", request.GetSnapshotVersion())
 	}
 	if invalid {
 		return &schedulerplugin.FilterResponse{SnapshotVersion: request.GetSnapshotVersion(), KeptIds: []string{"not-a-candidate"}}, nil
@@ -158,6 +164,41 @@ func TestExternalScoreRejectsOutOfRangeValues(t *testing.T) {
 	server.mu.Unlock()
 	if _, err := selector.Select(grpcSelection()); err == nil {
 		t.Fatal("out-of-range external score must be rejected")
+	}
+}
+
+func TestExternalFilterSyncAndCallAreAtomicUnderConcurrency(t *testing.T) {
+	connection, server := startPluginServer(t)
+	server.mu.Lock()
+	server.strictSingleSlot = true
+	server.mu.Unlock()
+	client, err := newClientFromConn(context.Background(), config.SchedulerProfilePluginConf{
+		Name: "fake", Timeout: time.Second,
+	}, "filter", connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := &filterPlugin{client: client}
+	t.Cleanup(func() { _ = selector.Close() })
+
+	// Each Select pushes a fresh snapshot version. With a strict single-slot
+	// server, any interleaving of SyncSnapshot and Filter across concurrent
+	// requests would fail; the client must keep sync+call atomic.
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := selector.Select(grpcSelection()); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent select failed: %v", err)
 	}
 }
 

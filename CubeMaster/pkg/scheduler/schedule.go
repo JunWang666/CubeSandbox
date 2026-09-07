@@ -55,7 +55,7 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 	if pipeline == nil {
 		return nil, ret.Err(errorcode.ErrorCode_MasterInternalError, "scheduler profile is not initialized")
 	}
-	selCtx.ProfileName = pipeline.Name
+	selCtx.SetProfileName(pipeline.Name)
 
 	// 预过滤：取出候选节点集合
 	if err := runPreFilter(selCtx); err != nil {
@@ -573,9 +573,9 @@ func runProfileScores(selCtx *selctx.SelectorCtx, scores []profile.ScorePlugin) 
 	}
 	sort.SliceStable(result, func(i, j int) bool { return result[i].Score > result[j].Score })
 	if log.IsDebug() {
-		log.G(selCtx.Ctx).Debugf("runScoreFilter profile=%s:%v", selCtx.ProfileName, result.String())
+		log.G(selCtx.Ctx).Debugf("runScoreFilter profile=%s:%v", selCtx.GetProfileName(), result.String())
 	} else {
-		log.G(selCtx.Ctx).Infof("runScoreFilter profile=%s:%v", selCtx.ProfileName, result.Len())
+		log.G(selCtx.Ctx).Infof("runScoreFilter profile=%s:%v", selCtx.GetProfileName(), result.Len())
 	}
 	selCtx.SetNodeScoreList(result)
 	if selCtx.Nodes().Len() == 0 {
