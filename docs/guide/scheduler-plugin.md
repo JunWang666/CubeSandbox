@@ -1,6 +1,8 @@
 # Extensible scheduler plugins
 
-CubeMaster can route each request to a scheduling Profile composed of mandatory safety guards, optional filters, weighted scores, selection settings, and failure policies. If `scheduler.profiles` is absent, the existing filter/score configuration is compiled into a compatible `default` Profile.
+CubeMaster can route each request to a scheduling Profile composed of mandatory safety guards, optional filters, weighted scores, selection settings, and failure policies.
+
+Three built-in Profiles ship inside the binary (`CubeMaster/pkg/base/config/scheduler_factory.yaml`): `burst_balance` and `template_reuse`, selected by the request label `workload=burst_balance` / `workload=template_reuse`, plus `mixed_binpack` as the default for everything else. When the configuration contains neither `scheduler.profiles` nor the legacy `scheduler.filter` / `scheduler.score` blocks, this built-in set is injected automatically, so a zero-config deployment still schedules with real strategies. Any explicit `scheduler.profiles` or legacy filter/score configuration replaces the built-in set entirely; with only legacy filter/score present, it is compiled into a compatible `default` Profile as before.
 
 ## Profile configuration
 
