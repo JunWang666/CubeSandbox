@@ -1,6 +1,8 @@
 # 可扩展调度插件
 
-CubeMaster 支持按请求场景选择调度 Profile。每个 Profile 由不可关闭的安全 Guards、可选 Filter、带权 Score、选点方式和失败策略组成。未配置 `profiles` 时，系统把原有 `filter`、`score`、`postscore` 和 `priority_select_num` 编译为 `default` Profile，保持原有行为。
+CubeMaster 支持按请求场景选择调度 Profile。每个 Profile 由不可关闭的安全 Guards、可选 Filter、带权 Score、选点方式和失败策略组成。
+
+二进制内置三条出厂 Profile（`CubeMaster/pkg/base/config/scheduler_factory.yaml`）：`burst_balance`、`template_reuse` 通过请求 label `workload=burst_balance` / `workload=template_reuse` 选中，其余请求落入默认的 `mixed_binpack`。当配置中既没有 `scheduler.profiles` 也没有 legacy 的 `scheduler.filter` / `scheduler.score` 时，系统自动注入这套出厂策略，零配置部署也能按真实策略调度。一旦显式配置了 `scheduler.profiles` 或 legacy filter/score 中的任意一项，出厂策略整体不生效；仅配置 legacy 项时，系统仍把 `filter`、`score`、`postscore` 和 `priority_select_num` 编译为兼容的 `default` Profile，保持原有行为。
 
 ## Profile 配置
 
