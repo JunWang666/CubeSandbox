@@ -214,6 +214,7 @@ func (l *local) delNodeCache(ctx context.Context, n *node.Node) {
 	if l.templateNodeCache != nil {
 		l.templateNodeCache.Delete(n.ID())
 	}
+	deleteNodeTemplateCreateCounters(n.ID())
 	l.cache.Delete(n.ID())
 	l.delSortedNodes(n)
 

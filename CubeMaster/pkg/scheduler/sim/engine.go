@@ -87,6 +87,13 @@ type Params struct {
 	// RoundID uniquifies injected node IDs so rounds never collide inside the
 	// process-wide localcache.
 	RoundID int
+
+	// Perf switches the round to performance mode: every scheduling decision
+	// runs through the sim-side staged pipeline replica (perf.go) instead of
+	// the opaque scheduler.Select, so per-stage wall-clock latencies and
+	// scheduling throughput are recorded in addition to the quality summary.
+	// Placement semantics are identical to scheduler.Select by construction.
+	Perf bool
 }
 
 func (p *Params) validate() error {
@@ -141,6 +148,9 @@ var SummaryKeys = []string{
 type RoundResult struct {
 	Seed    int64              `json:"seed"`
 	Summary map[string]float64 `json:"summary"`
+	// Perf is set only in performance mode: per-stage scheduling latencies
+	// and the round's scheduling throughput.
+	Perf *PerfSummary `json:"perf,omitempty"`
 }
 
 // nodeState is the simulator's own book on a node; localcache mirrors it via
@@ -218,6 +228,11 @@ type engine struct {
 	sampler   TimeWeightedAvg
 	latencyMs []float64
 
+	// perf mode: staged driver and per-request stage timings.
+	driver *perfDriver
+	stages *stageSamples
+	wall   time.Duration
+
 	successes          int
 	failures           int
 	templatedSuccesses int
@@ -228,8 +243,11 @@ type engine struct {
 
 // RunRound executes one full simulation round: inject nodes, preload template
 // replicas, replay the trace on a virtual clock, then withdraw the round's
-// nodes/replicas from localcache. The real scheduler core decides placements;
-// the wall-clock cost of every Select call is recorded as scheduling latency.
+// nodes/replicas from localcache. In quality mode the real scheduler core
+// (scheduler.Select) decides placements and its wall-clock cost is recorded
+// as scheduling latency; in performance mode (Params.Perf) the sim-side
+// staged pipeline replica decides placements and additionally records
+// per-stage latencies and the replay's real-clock duration (throughput).
 func RunRound(ctx context.Context, p Params) (*RoundResult, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
@@ -241,10 +259,21 @@ func RunRound(ctx context.Context, p Params) (*RoundResult, error) {
 		placements:  make(map[int]*placement),
 		nodeSuccess: make(map[string]int),
 	}
+	if p.Perf {
+		driver, err := newPerfDriver(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer driver.close()
+		e.driver = driver
+		e.stages = newStageSamples()
+	}
 	e.injectNodes()
 	defer e.cleanup()
 	e.preloadTemplates()
+	start := time.Now()
 	e.runEvents(ctx)
+	e.wall = time.Since(start)
 	return e.result(), nil
 }
 
@@ -384,8 +413,19 @@ func (e *engine) onCreate(ctx context.Context, ev event) {
 	}
 
 	start := time.Now()
-	selected, err := scheduler.Select(selCtx)
-	e.latencyMs = append(e.latencyMs, float64(time.Since(start))/float64(time.Millisecond))
+	var selected *node.Node
+	var err error
+	if e.driver != nil {
+		// Performance mode: the sim-side staged replica of scheduler.Select
+		// decides the placement and reports per-stage wall-clock latencies.
+		var st stageTimes
+		selected, st, err = e.driver.selectStaged(selCtx)
+		e.stages.add(st)
+		e.latencyMs = append(e.latencyMs, st.total)
+	} else {
+		selected, err = scheduler.Select(selCtx)
+		e.latencyMs = append(e.latencyMs, float64(time.Since(start))/float64(time.Millisecond))
+	}
 
 	if err != nil || selected == nil {
 		e.failures++
@@ -561,7 +601,11 @@ func (e *engine) result() *RoundResult {
 		"active_nodes_avg":     mean.ActiveNodes,
 		"empty_nodes_avg":      mean.EmptyNodes,
 	}
-	return &RoundResult{Seed: e.p.Seed, Summary: summary}
+	rr := &RoundResult{Seed: e.p.Seed, Summary: summary}
+	if e.driver != nil {
+		rr.Perf = e.stages.summarize(e.wall, total)
+	}
+	return rr
 }
 
 func ratio(num, den int64) float64 {
