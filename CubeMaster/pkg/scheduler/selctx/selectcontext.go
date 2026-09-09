@@ -30,7 +30,11 @@ type SelectorCtx struct {
 
 	// profileName is stamped by Select and may be read concurrently by the
 	// create path after a timeout, so it goes through atomic accessors.
-	profileName     atomic.Value // string
+	profileName atomic.Value // string
+	// rejectReason is stamped by filters whose all-reject explains a later
+	// no_node failure (e.g. the realtime create concurrency guard); filters
+	// run concurrently, so it goes through atomic accessors.
+	rejectReason    atomic.Value // string
 	selName         string
 	rSelect         weighted.W
 	resultWithScore node.NodeScoreList
@@ -47,6 +51,27 @@ func (s *SelectorCtx) SetProfileName(name string) { s.profileName.Store(name) }
 func (s *SelectorCtx) GetProfileName() string {
 	if value := s.profileName.Load(); value != nil {
 		return value.(string)
+	}
+	return ""
+}
+
+// RejectReasonConcurrencyLimit marks a no-candidate outcome caused by the
+// realtime_create_num guard rejecting every candidate (cluster-wide create
+// concurrency saturated). The value is used verbatim as the reason label of
+// scheduler_attempts_total.
+const RejectReasonConcurrencyLimit = "concurrency_limit"
+
+// SetRejectReason stamps the reason that explains a subsequent no-candidate
+// failure; "" clears it. Select clears the stamp at entry so retries of a
+// reused SelectorCtx never leak a stale reason into a new attempt.
+func (s *SelectorCtx) SetRejectReason(reason string) { s.rejectReason.Store(reason) }
+
+// GetRejectReason returns the stamped reject reason, or "" if none.
+func (s *SelectorCtx) GetRejectReason() string {
+	if value := s.rejectReason.Load(); value != nil {
+		if reason, ok := value.(string); ok {
+			return reason
+		}
 	}
 	return ""
 }

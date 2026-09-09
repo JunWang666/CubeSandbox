@@ -59,5 +59,11 @@ func (l *realtimecreatelimit) Select(selCtx *selctx.SelectorCtx) (node.NodeList,
 	} else {
 		log.G(selCtx.Ctx).Infof("%v select_size:%v", l.ID(), nodes.Len())
 	}
+	// 全部候选都被创建并发上限剔除时打上拒绝原因戳：随后的 no_node 失败
+	// 在指标里归类为 concurrency_limit 而非笼统的 no_node。部分剔除属于
+	// 正常过滤，不打戳。
+	if inList.Len() > 0 && nodes.Len() == 0 {
+		selCtx.SetRejectReason(selctx.RejectReasonConcurrencyLimit)
+	}
 	return nodes, nil
 }

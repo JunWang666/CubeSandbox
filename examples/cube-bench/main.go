@@ -236,8 +236,9 @@ func parseConfig() *Config {
 		cfg.Templates = []TemplateSpec{{TemplateID: cfg.Template, Weight: 1}}
 	}
 	if cfg.Workload == "mixed_spec" && len(cfg.Templates) < 2 {
-		fmt.Fprintln(os.Stderr, "ERROR: workload mixed_spec requires --templates with at least 2 templates, e.g.")
-		fmt.Fprintln(os.Stderr, "  --templates 'tpl-1c2g:6:1000:2048,tpl-2c4g:3:2000:4096,tpl-8c16g:1:8000:16384'  # 6:3:1 for 1C2G/2C4G/8C16G")
+		fmt.Fprintln(os.Stderr, "ERROR: workload mixed_spec needs a template pool with at least 2 templates.")
+		fmt.Fprintln(os.Stderr, "  Drop -t/--template to use the built-in 6:3:1 pool (1C2G/2C4G/8C16G), or pass --templates explicitly, e.g.")
+		fmt.Fprintln(os.Stderr, "  --templates 'tpl-1c2g:6:1000:2048,tpl-2c4g:3:2000:4096,tpl-8c16g:1:8000:16384'")
 		os.Exit(1)
 	}
 

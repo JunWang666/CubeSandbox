@@ -210,6 +210,11 @@ func RenderCompare(variants []VariantReport, generated time.Time) (string, error
 	fmt.Fprintf(&b, "| allow_non_local_template | %t |\n", base.AllowNonLocalTemplate)
 	fmt.Fprintf(&b, "| template_size_bytes | %d |\n", base.TemplateSizeBytes)
 	fmt.Fprintf(&b, "| seed / rounds | %d / %d |\n", base.Seed, base.Rounds)
+	mode := base.Mode
+	if mode == "" {
+		mode = "quality"
+	}
+	fmt.Fprintf(&b, "| mode | %s |\n", mode)
 	b.WriteString("\nVariants share the same trace, node fleet, preload draw seeds and round count; only the scheduler config differs.\n\n")
 	b.WriteString("| role | name | config |\n| --- | --- | --- |\n")
 	for i, v := range variants {
@@ -270,6 +275,8 @@ func RenderCompare(variants []VariantReport, generated time.Time) (string, error
 		b.WriteString(" |\n")
 	}
 
+	renderPerfSection(&b, variants)
+
 	b.WriteString("\n## Conclusions\n\n")
 	fmt.Fprintf(&b, "Only |Δ%%| ≥ %s with a known improvement direction is listed; metrics whose direction depends on the policy goal (allocation rates, node counts) never produce a verdict.\n",
 		formatCompareNum(compareVerdictThreshold))
@@ -309,6 +316,76 @@ func writeCompareList(b *strings.Builder, lines []string) {
 	sort.Strings(lines)
 	for _, l := range lines {
 		b.WriteString(l + "\n")
+	}
+}
+
+// renderPerfSection appends the performance-mode stage table when the
+// variants were run with --mode=performance. Values are the cross-round
+// aggregates from each variant's report (means of per-round percentiles).
+// Quality-mode reports carry no Perf block and the section is omitted.
+func renderPerfSection(b *strings.Builder, variants []VariantReport) {
+	anyPerf := false
+	for i := range variants {
+		if variants[i].Report.Perf != nil {
+			anyPerf = true
+		}
+	}
+	if !anyPerf {
+		return
+	}
+
+	b.WriteString("\n## Scheduling overhead (performance mode; cross-round means)\n\n")
+	fmt.Fprintf(b, "| stage metric")
+	for _, v := range variants {
+		fmt.Fprintf(b, " | %s", v.Name)
+	}
+	b.WriteString(" |\n| ---")
+	for range variants {
+		b.WriteString(" | ---")
+	}
+	b.WriteString(" |\n")
+	perfRow := func(label string, get func(*PerfSummary) float64) {
+		fmt.Fprintf(b, "| %s", label)
+		for i := range variants {
+			b.WriteString(" | ")
+			perf := variants[i].Report.Perf
+			if perf == nil {
+				b.WriteString("—")
+			} else {
+				b.WriteString(formatCompareNum(get(perf)))
+			}
+		}
+		b.WriteString(" |\n")
+	}
+	for _, stage := range PerfStageKeys {
+		stage := stage
+		perfRow(stage+"_p50_ms", func(p *PerfSummary) float64 { return p.Stages[stage].P50Ms })
+		perfRow(stage+"_p95_ms", func(p *PerfSummary) float64 { return p.Stages[stage].P95Ms })
+		perfRow(stage+"_p99_ms", func(p *PerfSummary) float64 { return p.Stages[stage].P99Ms })
+	}
+	perfRow("throughput_rps", func(p *PerfSummary) float64 { return p.ThroughputRPS })
+	perfRow("wall_seconds", func(p *PerfSummary) float64 { return p.WallSeconds })
+
+	// Δ% vs baseline for the two headline overhead numbers.
+	if variants[0].Report.Perf != nil {
+		base := variants[0].Report.Perf
+		fmt.Fprintf(b, "\nOverhead vs baseline (%s):", variants[0].Name)
+		for i := 1; i < len(variants); i++ {
+			perf := variants[i].Report.Perf
+			if perf == nil {
+				continue
+			}
+			p99Delta := "—"
+			if base.Stages["total"] != nil && base.Stages["total"].P99Ms != 0 && perf.Stages["total"] != nil {
+				p99Delta = fmt.Sprintf("%+.1f%%", (perf.Stages["total"].P99Ms-base.Stages["total"].P99Ms)/base.Stages["total"].P99Ms*100)
+			}
+			rpsDelta := "—"
+			if base.ThroughputRPS != 0 {
+				rpsDelta = fmt.Sprintf("%+.1f%%", (perf.ThroughputRPS-base.ThroughputRPS)/base.ThroughputRPS*100)
+			}
+			fmt.Fprintf(b, "\n- **%s**: total_p99 %s, throughput %s", variants[i].Name, p99Delta, rpsDelta)
+		}
+		b.WriteString("\n")
 	}
 }
 
