@@ -245,7 +245,7 @@ type SnapshotNode struct {
 	LocalTemplates          []string               `protobuf:"bytes,21,rep,name=local_templates,json=localTemplates,proto3" json:"local_templates,omitempty"`
 	TemplateLocal           bool                   `protobuf:"varint,22,opt,name=template_local,json=templateLocal,proto3" json:"template_local,omitempty"`
 	SnapshotStorageWritable bool                   `protobuf:"varint,23,opt,name=snapshot_storage_writable,json=snapshotStorageWritable,proto3" json:"snapshot_storage_writable,omitempty"`
-	Reserved                int64                  `protobuf:"varint,24,opt,name=reserved,proto3" json:"reserved,omitempty"` // in-flight reservation, populated when reservation management is enabled
+	Reserved                int64                  `protobuf:"varint,24,opt,name=reserved,proto3" json:"reserved,omitempty"` // in-flight scheduling reservations held by this CubeMaster replica
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
