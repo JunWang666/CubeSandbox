@@ -110,7 +110,16 @@ type Node struct {
 	RealTimeCreateNum int64 `json:"RealTimeCreateNum,omitempty"`
 
 	LocalCreateNum int64 `json:"LocalCreateNum,omitempty"`
-	NicQueues      int64 `json:"nic_queues,omitempty"`
+
+	// ReservedNum counts this CubeMaster's in-flight scheduling reservations
+	// on the node (a node was selected but the create has not finished or
+	// failed yet). It is master-local, never persisted to Redis, and only
+	// best-effort: localcache's reservation registry is the authoritative
+	// accounting. Exposed so snapshots (CEL / gRPC plugins) can see pending
+	// placement pressure as SnapshotNode.reserved.
+	ReservedNum int64 `json:"ReservedNum,omitempty"`
+
+	NicQueues int64 `json:"nic_queues,omitempty"`
 
 	NodeLabels     map[string]string `json:"NodeLabels,omitempty"`
 	LocalTemplates []string          `json:"LocalTemplates,omitempty"`
@@ -206,9 +215,11 @@ func (n *Node) Clone() *Node {
 		return nil
 	}
 	// Clone provides a best-effort read-side snapshot. Mutable counters such
-	// as LocalCreateNum and schedulingDisabled are read atomically. Fields are
-	// copied explicitly so the atomic noCopy marker is never copied by value.
+	// as LocalCreateNum / ReservedNum and schedulingDisabled are read
+	// atomically. Fields are copied explicitly so the atomic noCopy marker is
+	// never copied by value.
 	localCreateNum := atomic.LoadInt64(&n.LocalCreateNum)
+	reservedNum := atomic.LoadInt64(&n.ReservedNum)
 	schedulingDisabled := n.SchedulingDisabled()
 	cloned := &Node{
 		Index: n.Index, InsID: n.InsID, UUID: n.UUID, IP: n.IP,
@@ -226,7 +237,7 @@ func (n *Node) Clone() *Node {
 		DataDiskUsagePer: n.DataDiskUsagePer, StorageDiskUsagePer: n.StorageDiskUsagePer,
 		SysDiskUsagePer: n.SysDiskUsagePer, MvmNum: n.MvmNum, MetricUpdate: n.MetricUpdate,
 		MetricLocalUpdateAt: n.MetricLocalUpdateAt, RealTimeCreateNum: n.RealTimeCreateNum,
-		LocalCreateNum: localCreateNum, NicQueues: n.NicQueues,
+		LocalCreateNum: localCreateNum, ReservedNum: reservedNum, NicQueues: n.NicQueues,
 	}
 	cloned.SetSchedulingDisabled(schedulingDisabled)
 	if n.VirtualNodeQuotaArray != nil {
@@ -274,6 +285,10 @@ func (n *Node) HostIP() string { return n.IP }
 
 func (n *Node) LocalCreateNumIncrBy(i int64) int64 {
 	return atomic.AddInt64(&n.LocalCreateNum, i)
+}
+
+func (n *Node) ReservedNumIncrBy(i int64) int64 {
+	return atomic.AddInt64(&n.ReservedNum, i)
 }
 
 func (n *Node) Labels() map[string]string {

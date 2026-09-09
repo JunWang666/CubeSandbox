@@ -36,6 +36,8 @@ scheduler:
 
 Custom Profiles always run the `node_safety`, `cpu`, `mem`, `disk`, `template_locality`, and `realtime_create_num` guards. They cannot be disabled or repeated as optional filters. `node_safety` checks health, metric freshness, the MVM limit, and CPU-load validity on both the normal and backoff paths.
 
+After a node is selected, CubeMaster re-reads it and atomically reserves the request's CPU and memory quota, one MVM slot, and one create-concurrency slot, so concurrent creates stop piling onto a node whose metrics have not caught up yet. A conflict reselects another node (bounded retries); the reservation is released as soon as the Cubelet create returns, on failure as well as success, where the next Cubelet metric report takes the accounting over. Multiple CubeMaster replicas coordinate these reservations through per-node Redis counters and degrade to local-only reservations when Redis is unavailable. The count of a replica's in-flight reservations is exposed to plugins as `node.reserved`.
+
 ## Plugin types
 
 - `go` (default): compiled into CubeMaster and registered by name through the unified Registry.
@@ -58,7 +60,7 @@ External plugin example:
           circuit_breaker_cooldown: 30s
 ```
 
-The versioned protocol is in `CubeMaster/api/services/schedulerplugin/v1/plugin.proto`. CubeMaster calls `Handshake`, then `SyncSnapshot`, followed by batched `Filter` or `Score` requests. Each scheduling attempt gets a fresh snapshot version and concurrent attempts interleave, so plugin servers must key snapshots by `snapshot_version` (with a small eviction bound) rather than keeping a single latest slot. A Unix Domain Socket is recommended in production. A runnable server is available in `CubeMaster/examples/scheduler-plugin`:
+The versioned protocol is in `pkgs/proto/services/schedulerplugin/v1/plugin.proto`. CubeMaster calls `Handshake`, then `SyncSnapshot`, followed by batched `Filter` or `Score` requests. Each scheduling attempt gets a fresh snapshot version and concurrent attempts interleave, so plugin servers must key snapshots by `snapshot_version` (with a small eviction bound) rather than keeping a single latest slot. A Unix Domain Socket is recommended in production. A runnable server is available in `CubeMaster/examples/scheduler-plugin`:
 
 ```bash
 cd CubeMaster
