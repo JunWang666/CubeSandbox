@@ -72,6 +72,8 @@ scheduler:
           workload: template_reuse
       scores:
         # Main objective: prefer nodes holding a local template replica.
+        # 权重 0.7/0.2/0.3 经 schedsim 多 seed 对照实验裁决：压到 0.1/0/0.9
+        # 会在高负载下牺牲模板本地命中（见 docs/dev/scheduler-sim-report.md）
         - name: image_score
           type: go
           weight: 0.7

@@ -188,6 +188,70 @@ cost at any setting in this workload. Recommendation: keep 3.0 for maximal
 consolidation; if node-level burst risk matters more than empty-node count,
 1.5 buys 2× herding relief for ~2 extra active nodes.
 
+## template_reuse weight comparison (300 nodes, 5 seeds, seeds 42–46)
+
+> Added 2026-09-10 on the merged baseline (`fix2-template-reuse` worktree).
+> Arbitrates the shipped `template_reuse` weights (image_score /
+> template_local_pressure / real_time_weighted_average = **0.7/0.2/0.3**)
+> against the rejected-PR proposal **0.1/0/0.9** ("let realtime load dominate,
+> avoid persistent hotspots on replica nodes"). Variants: `baseline` =
+> 0.7/0.2/0.3, `rt-dominated` = 0.1/−/0.9 (pressure scorer removed), `mid` =
+> 0.5/0.2/0.5, `rt-hot` = 0.7/0.2/0.9. Values are mean ± 95% CI across rounds.
+
+### Standard template_storm trace (300 req, 30/s, U(30s,90s))
+
+| metric | baseline 0.7/0.2/0.3 | rt-dominated 0.1/0/0.9 | rt-hot 0.7/0.2/0.9 |
+| --- | --- | --- | --- |
+| success_rate | 1.0000 ± 0 | 1.0000 ± 0 | 1.0000 ± 0 |
+| template_hit_rate | 1.000 ± 0 | 1.000 ± 0 | 1.000 ± 0 |
+| jain_cpu | 0.245 ± 0.015 | 0.243 ± 0.014 | 0.243 ± 0.015 |
+| load_cv_cpu | 2.306 ± 0.066 | 2.303 ± 0.063 | 2.319 ± 0.085 |
+| herding_top1_share | 0.0127 ± 0.0019 | 0.0127 ± 0.0019 | 0.0127 ± 0.0019 |
+| active_nodes_avg | 79.0 ± 4.5 | 78.5 ± 3.9 | 78.5 ± 4.5 |
+| sched_latency_p50_ms | 0.601 ± 0.179 | 0.581 ± 0.193 | 0.610 ± 0.197 |
+
+At this load the variants are indistinguishable: locality is perfect for all
+three, and balance/herding differ only within noise. The realtime score deltas
+between nodes are too small to move placement at any weight, so the claimed
+hotspot-relief benefit of 0.1/0/0.9 does not exist in the nominal regime.
+
+### Hot template_storm trace (1500 req, ~62/s, lifetime U(60s,180s))
+
+To make the weights discriminate, the storm was pushed until replica-holding
+nodes ran hot (avg concurrency ≈ 7.5k sandboxes; the ~90 preload nodes carry
+~86% of effective CPU while cluster-wide allocation stays ~9%):
+
+| metric | baseline 0.7/0.2/0.3 | rt-dominated 0.1/0/0.9 | mid 0.5/0.2/0.5 | rt-hot 0.7/0.2/0.9 |
+| --- | --- | --- | --- | --- |
+| success_rate | 1.0000 ± 0 | 1.0000 ± 0 | 1.0000 ± 0 | 1.0000 ± 0 |
+| **template_hit_rate** | **1.000 ± 0** | **0.953 ± 0.004** | 1.000 ± 0 | 1.000 ± 0 |
+| jain_cpu | 0.286 ± 0.018 | 0.442 ± 0.002 | 0.283 ± 0.016 | 0.285 ± 0.017 |
+| load_cv_cpu | 1.833 ± 0.065 | 1.471 ± 0.010 | 1.846 ± 0.057 | 1.831 ± 0.062 |
+| herding_top1_share | 0.0107 ± 0.0006 | 0.0060 ± 0 | 0.0107 ± 0.0006 | 0.0107 ± 0.0006 |
+| active_nodes_avg | 89.9 ± 5.3 | 142.0 ± 0.8 | 89.6 ± 5.2 | 89.7 ± 5.1 |
+| sched_latency_p50_ms | 0.593 ± 0.166 | 0.572 ± 0.160 | 0.589 ± 0.171 | 0.597 ± 0.169 |
+
+**Reading.** There is a phase boundary between image weight 0.1 and 0.5: while
+the boolean image score (replica = 100, none = 0) dominates the realtime deltas,
+placement is identical for every locality-preserving setting — 0.5/0.2/0.5 and
+0.7/0.2/0.9 change *nothing* versus shipped. Below the boundary,
+`rt-dominated`'s balance gains (Jain +55%, CV −20%, herding 1.07% → 0.60%) come
+entirely from breaking locality: hit rate drops 1.000 → 0.953 (4.7% of creates
+pay a remote template restore) and placement spills onto 58% more nodes — i.e.
+the profile degenerates toward legacy least-loaded, which is what the default /
+burst_balance profiles are already for.
+
+**Decision: keep 0.7/0.2/0.3.** The strategy contract for TemplateReuse ("pick
+among template-runnable nodes first, then spread by same-template create
+pressure") makes locality the primary objective; the sim shows the 0.1/0/0.9
+proposal only trades locality away, and shows no benefit for it in the nominal
+regime. Spreading *within* replica nodes is the job of
+`template_local_pressure` + top-3 spread. Caveat: the sim engine never drives
+the in-flight create counters (`localcache.IncrNodeTemplateCreate`), so
+`template_local_pressure` scores a constant 100 here and its anti-herding
+benefit is asserted from code semantics, not from this experiment — the sim
+arbitrates only the image-vs-realtime axis.
+
 ## Trade-offs and caveats
 
 - **Locality vs balance is a real, quantified trade**: template_reuse buys a
@@ -227,4 +291,15 @@ legacy_firstfit=<example.sim.yaml without the score: section> \
 /tmp/schedsim --mode=performance --compare legacy=...,burst_balance=... \
   --trace /tmp/burst.trace.json --nodes 300 --rounds 5 --seed 42 \
   --allow-non-local-template=true -o perf.md
+
+# template_reuse weight comparison: hot storm trace + 4 weight variants
+cd examples/cube-bench && go run . --workload template_storm --total 1500 \
+  --rate 60 --lifetime "60,180" --dry-run --no-tui --seed 42 \
+  --templates "tpl-storm:1:2000:4096" --dump-trace /tmp/storm-hot.trace.json
+cd ../../CubeMaster
+/tmp/schedsim --compare baseline=cmd/schedsim/template_reuse.profiles.sim.yaml,\
+rt-dominated=<same with image 0.1, no template_local_pressure, realtime 0.9>,\
+mid=<same with 0.5/0.2/0.5>,rt-hot=<same with 0.7/0.2/0.9> \
+  --trace /tmp/storm-hot.trace.json --nodes 300 --template-preload 0.3 \
+  --rounds 5 --seed 42 --allow-non-local-template=true -o weights.md
 ```
