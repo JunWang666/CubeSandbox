@@ -8,10 +8,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime/debug"
 )
 
+// BuildVersion returns the VCS revision stamped into the running binary by
+// the Go tool ("<revision>", or "<revision>-dirty" when the build tree had
+// uncommitted changes), or "" when the binary carries no VCS info (e.g.
+// built with -buildvcs=false or outside a VCS checkout).
+func BuildVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var rev string
+	dirty := false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return ""
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return rev
+}
+
 // ReportConfig echoes the run parameters into the report so results are
-// self-describing. Field set is part of the cross-tool report contract.
+// self-describing. Field set is part of the cross-tool report contract;
+// consumers must tolerate the omitempty fields being absent in reports
+// written by older binaries.
 type ReportConfig struct {
 	Tool                  string  `json:"tool"`
 	Trace                 string  `json:"trace"`
@@ -29,6 +60,14 @@ type ReportConfig struct {
 	// Mode is "quality" (default) or "performance"; empty means quality for
 	// reports written before the flag existed.
 	Mode string `json:"mode,omitempty"`
+	// Version is the code version stamped into the binary by the Go tool
+	// ("<vcs revision>" or "<vcs revision>-dirty"); empty when the binary
+	// carries no VCS info.
+	Version string `json:"version,omitempty"`
+	// MetricSyncInterval is the effective scheduler.metric_update_timeout in
+	// seconds — the node-metric freshness window the scheduler core checked
+	// against during the run.
+	MetricSyncInterval float64 `json:"metric_sync_interval,omitempty"`
 }
 
 // Report is the schedsim output document: run config, the cross-round mean

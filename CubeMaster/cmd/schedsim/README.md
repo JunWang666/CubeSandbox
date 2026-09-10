@@ -75,7 +75,8 @@ schedsim \
   无法在同进程内重建），变体间只有调度配置不同，其余变量全部受控；
 - 每个变体的单跑 JSON 落在 `--out-dir`（缺省为临时目录），可直接喂给
   `cube-bench compare` 与真机结果交叉对比；
-- Markdown 报告含：每指标逐轮均值±样本标准差、相对 baseline 的 Δ%、
+- Markdown 报告含：每指标逐轮均值±95% 置信区间半宽（1.96·σ/√n，n≥2 时展示，
+  与 `cube-bench compare` 同口径）、相对 baseline 的 Δ%、
   按指标方向判定的 improved/regressed 结论（|Δ%| ≥ 5% 才列入）；
   方向依赖策略目标的指标（分配率、活跃/空节点数）只报数值不下结论。
 
@@ -102,6 +103,13 @@ go run ./cmd/schedsim --trace /tmp/storm.trace.json \
 
 `cpu_millis`/`mem_mib` 为 0 的请求会被拒绝加载并提示 trace 缺少规格标注。
 多轮结果取各轮均值落在 `summary`，逐轮明细在 `rounds[]`。
+
+报告 `config` 块还记录两项运行元数据（均为可选字段，旧版二进制产出的报告
+可能缺失，消费方须容忍缺省）：`version`（构建时 Go 工具写入的 vcs
+revision，工作区有未提交改动时带 `-dirty` 后缀；`cube-bench compare` 的
+config highlights 会展示它）与 `metric_sync_interval`（实际生效的
+`scheduler.metric_update_timeout`，单位秒——即调度核心判定节点指标新鲜度
+的窗口）。
 
 ## 设计
 
