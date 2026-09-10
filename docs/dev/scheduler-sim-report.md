@@ -111,6 +111,23 @@ of `scheduler.Select` (`pkg/scheduler/sim/perf.go`, equivalence with the real
 `Select` covered by `TestPerfModeMatchesQualityMode`) and times every stage on
 the wall clock. Cross-round means below; `total` is the full decision.
 
+The report also carries a process-overhead block (`perf.overhead` in the JSON,
+extra rows in the compare markdown) covering the schedsim process's own cost
+over the replay window (the same window `wall_seconds` measures):
+
+- `cpu_seconds` — cumulative process CPU time (user + system, `/proc/self/stat`
+  utime+stime) consumed during the replay;
+- `avg_cpu_cores` — `cpu_seconds / wall_seconds`, the average number of CPU
+  cores the process kept busy (×100 = percent of one core);
+- `peak_rss_mib` — peak resident set size (`/proc/self/status` VmHWM) in MiB,
+  a process-lifetime high-water mark;
+- `heap_alloc_mib` / `heap_sys_mib` — Go heap in use / obtained from the OS
+  (`runtime.ReadMemStats`) at the end of the replay, in MiB.
+
+The procfs-derived fields are Linux-only; elsewhere they are omitted and the
+Go heap gauges still report. Cross-round aggregation sums CPU seconds, takes
+the max peak RSS, and averages the heap gauges.
+
 | stage P50 (ms) | legacy | burst_balance | legacy | template_reuse | legacy | mixed_binpack |
 | --- | --- | --- | --- | --- | --- | --- |
 | workload | burst | burst | storm | storm | mixed | mixed |

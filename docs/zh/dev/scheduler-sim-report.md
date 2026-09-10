@@ -101,6 +101,22 @@ first-fit 堆叠的模板命中率反而更高（0.668 vs 0.594）：集中放�
 与真实 `Select` 的等价性由 `TestPerfModeMatchesQualityMode` 保证）驱动每次决策，
 并按墙钟记录各阶段耗时。下表为跨轮均值；`total` 为完整决策耗时。
 
+报告还带一组进程级开销指标（JSON 中的 `perf.overhead` 块，compare 报告里的
+附加行），度量 schedsim 进程自身在回放窗口（即 `wall_seconds` 覆盖的同一窗口）
+内的开销：
+
+- `cpu_seconds`——回放期间消耗的进程累计 CPU 时间（用户态+内核态，
+  取自 `/proc/self/stat` 的 utime+stime）；
+- `avg_cpu_cores`——`cpu_seconds / wall_seconds`，回放期间平均占用的核数
+  （×100 即单核百分比）；
+- `peak_rss_mib`——峰值常驻内存（`/proc/self/status` 的 VmHWM），单位 MiB，
+  是进程生命周期的高水位；
+- `heap_alloc_mib` / `heap_sys_mib`——回放结束时 Go 堆在用 / 已向 OS 申请的
+  内存（`runtime.ReadMemStats`），单位 MiB。
+
+其中 procfs 来源的字段仅 Linux 输出，其他平台省略，Go 堆指标全平台可用。
+跨轮聚合口径：CPU 秒求和、峰值 RSS 取各轮最大值、Go 堆指标取各轮均值。
+
 | 阶段 P50（ms） | legacy | burst_balance | legacy | template_reuse | legacy | mixed_binpack |
 | --- | --- | --- | --- | --- | --- | --- |
 | 负载 | burst | burst | storm | storm | mixed | mixed |

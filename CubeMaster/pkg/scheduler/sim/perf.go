@@ -69,6 +69,9 @@ type PerfSummary struct {
 	// ThroughputRPS is requests (success + failure) per wall second — the
 	// standalone scheduling-core throughput under zero queueing.
 	ThroughputRPS float64 `json:"throughput_rps"`
+	// Overhead is the schedsim process's own CPU/memory cost over the replay
+	// window (procfs + runtime.ReadMemStats, see procoverhead.go).
+	Overhead *ProcessOverhead `json:"overhead,omitempty"`
 }
 
 // stageTimes carries one request's per-stage latency in milliseconds.
@@ -185,7 +188,39 @@ func AggregatePerf(rounds []*RoundResult, totalRequests int) *PerfSummary {
 		}
 		out.Stages[k] = st
 	}
+	out.Overhead = aggregateOverhead(rounds, wall)
 	return out
+}
+
+// aggregateOverhead pools per-round process overhead: CPU seconds sum across
+// rounds, average cores recompute from the pooled totals (wall already sums),
+// peak RSS takes the max (it is a high-water mark), and the Go heap gauges
+// average over the rounds that reported them.
+func aggregateOverhead(rounds []*RoundResult, wall float64) *ProcessOverhead {
+	var out ProcessOverhead
+	var present int
+	for _, r := range rounds {
+		if r.Perf == nil || r.Perf.Overhead == nil {
+			continue
+		}
+		oh := r.Perf.Overhead
+		out.CPUSeconds += oh.CPUSeconds
+		if oh.PeakRSSMiB > out.PeakRSSMiB {
+			out.PeakRSSMiB = oh.PeakRSSMiB
+		}
+		out.HeapAllocMiB += oh.HeapAllocMiB
+		out.HeapSysMiB += oh.HeapSysMiB
+		present++
+	}
+	if present == 0 {
+		return nil
+	}
+	out.HeapAllocMiB /= float64(present)
+	out.HeapSysMiB /= float64(present)
+	if wall > 0 {
+		out.AvgCPUCores = out.CPUSeconds / wall
+	}
+	return &out
 }
 
 func meanOf(vals []float64) float64 {
