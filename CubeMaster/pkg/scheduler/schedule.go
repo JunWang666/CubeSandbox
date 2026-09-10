@@ -56,6 +56,9 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 		return nil, ret.Err(errorcode.ErrorCode_MasterInternalError, "scheduler profile is not initialized")
 	}
 	selCtx.SetProfileName(pipeline.Name)
+	// A SelectorCtx may be reused across handleCubelet retries; drop any
+	// reject reason stamped by a previous attempt before this one starts.
+	selCtx.SetRejectReason("")
 
 	// 预过滤：取出候选节点集合
 	if err := runPreFilter(selCtx); err != nil {
@@ -78,10 +81,10 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 	freezeSnapshot(selCtx)
 
 	// 主过滤：并行执行所有过滤插件，节点必须通过全部过滤
-	if err := runProfileFilters(selCtx, pipeline.Guards); err != nil {
+	if err := runProfileFilters(selCtx, pluginKindGuard, pipeline.Guards); err != nil {
 		return nil, err
 	}
-	if err := runProfileFilters(selCtx, pipeline.Filters); err != nil {
+	if err := runProfileFilters(selCtx, pluginKindFilter, pipeline.Filters); err != nil {
 		legacy := len(pipeline.Guards) == 0
 		if pipeline.NoCandidate != profile.NoCandidateBackoff ||
 			(legacy && pipelineHasTemplateGuard(selCtx, pipeline)) ||
@@ -205,10 +208,10 @@ func backoffSelectWithPipeline(selCtx *selctx.SelectorCtx, pipeline *profile.Pip
 		return nil, err
 	}
 	freezeSnapshot(selCtx)
-	if err := runProfileFilters(selCtx, pipeline.Guards); err != nil {
+	if err := runProfileFilters(selCtx, pluginKindGuard, pipeline.Guards); err != nil {
 		return nil, err
 	}
-	if err := runProfileFilters(selCtx, pipeline.Filters); err != nil {
+	if err := runProfileFilters(selCtx, pluginKindFilter, pipeline.Filters); err != nil {
 		return nil, err
 	}
 	if err := runProfileScores(selCtx, pipeline.Scores); err != nil {
@@ -318,7 +321,8 @@ func runFilter(selCtx *selctx.SelectorCtx, filters []filter.Selector) error {
 // runProfileFilters 并发执行 Profile 中的一组过滤插件：
 // 每个插件独立运行并校验其返回的候选节点，只有被全部插件保留的节点才进入结果；
 // 插件失败按 Failure 策略决定 fail-open（放行全部候选）或 fail-closed（直接报错）
-func runProfileFilters(selCtx *selctx.SelectorCtx, filters []profile.FilterPlugin) error {
+// kind 区分 guard/filter 两类执行点，仅用于逐插件耗时指标的标签。
+func runProfileFilters(selCtx *selctx.SelectorCtx, kind string, filters []profile.FilterPlugin) error {
 	if len(filters) == 0 {
 		return nil
 	}
@@ -350,7 +354,9 @@ func runProfileFilters(selCtx *selctx.SelectorCtx, filters []profile.FilterPlugi
 				results[index].err = fmt.Errorf("filter plugin %q is nil", filters[index].Name)
 				return nil
 			}
+			pluginStart := time.Now()
 			results[index].nodes, results[index].err = filters[index].Selector.Select(selCtx)
+			ObservePluginDuration(ProfileNameOf(selCtx), kind, filters[index].Name, time.Since(pluginStart))
 			return nil
 		})
 	}
@@ -492,7 +498,9 @@ func runProfileScores(selCtx *selctx.SelectorCtx, scores []profile.ScorePlugin) 
 				results[index].skip = true
 				return nil
 			}
+			pluginStart := time.Now()
 			results[index].nodes, results[index].err = selector.Select(selCtx)
+			ObservePluginDuration(ProfileNameOf(selCtx), pluginKindScore, scores[index].Name, time.Since(pluginStart))
 			return nil
 		})
 	}

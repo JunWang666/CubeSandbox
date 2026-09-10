@@ -80,7 +80,7 @@ func executorContext() *selctx.SelectorCtx {
 
 func TestRunProfileFiltersFailOpenKeepsCandidateUniverse(t *testing.T) {
 	selection := executorContext()
-	err := runProfileFilters(selection, []profile.FilterPlugin{
+	err := runProfileFilters(selection, pluginKindFilter, []profile.FilterPlugin{
 		{Name: "only-n1", Selector: executorFilter{id: "only-n1", keep: map[string]bool{"n1": true}}, Failure: profile.FilterFailClosed},
 		{Name: "broken", Selector: executorFilter{id: "broken", err: errors.New("boom")}, Failure: profile.FilterFailOpen},
 	})
@@ -94,7 +94,7 @@ func TestRunProfileFiltersFailOpenKeepsCandidateUniverse(t *testing.T) {
 
 func TestRunProfileFiltersFailClosed(t *testing.T) {
 	selection := executorContext()
-	err := runProfileFilters(selection, []profile.FilterPlugin{{
+	err := runProfileFilters(selection, pluginKindFilter, []profile.FilterPlugin{{
 		Name: "broken", Selector: executorFilter{id: "broken", err: errors.New("boom")}, Failure: profile.FilterFailClosed,
 	}})
 	if err == nil {
@@ -107,7 +107,7 @@ func TestRunProfileFiltersFailClosed(t *testing.T) {
 
 func TestRunProfileFiltersRejectsNonCandidateNode(t *testing.T) {
 	selection := executorContext()
-	err := runProfileFilters(selection, []profile.FilterPlugin{{
+	err := runProfileFilters(selection, pluginKindFilter, []profile.FilterPlugin{{
 		Name: "foreign-node", Selector: foreignNodeFilter{}, Failure: profile.FilterFailClosed,
 	}})
 	if err == nil {
@@ -117,7 +117,7 @@ func TestRunProfileFiltersRejectsNonCandidateNode(t *testing.T) {
 
 func TestRunProfileFiltersEmptyResultIsNoCandidateError(t *testing.T) {
 	selection := executorContext()
-	err := runProfileFilters(selection, []profile.FilterPlugin{{
+	err := runProfileFilters(selection, pluginKindFilter, []profile.FilterPlugin{{
 		Name: "empty", Selector: executorFilter{id: "empty", keep: map[string]bool{}}, Failure: profile.FilterFailClosed,
 	}})
 	if !isNoCandidateError(err) {
@@ -127,7 +127,7 @@ func TestRunProfileFiltersEmptyResultIsNoCandidateError(t *testing.T) {
 
 func TestRunProfileFiltersInvalidOutputHonorsFailOpen(t *testing.T) {
 	selection := executorContext()
-	err := runProfileFilters(selection, []profile.FilterPlugin{{
+	err := runProfileFilters(selection, pluginKindFilter, []profile.FilterPlugin{{
 		Name: "foreign-node", Selector: foreignNodeFilter{}, Failure: profile.FilterFailOpen,
 	}})
 	if err != nil {

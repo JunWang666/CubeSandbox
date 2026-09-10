@@ -281,3 +281,138 @@ func TestObservedNodeCapacityUsesRawAllocated(t *testing.T) {
 		t.Fatalf("allocated = (%v, %v), want raw (400, 512)", cpuAlloc, memAlloc)
 	}
 }
+
+func TestObserveScheduleAttemptRefinesNoNodeWithRejectReason(t *testing.T) {
+	noNodeBefore := counterValue(t, schedulerAttempts, DefaultProfile, metricResultError, attemptReasonNoNode)
+	concurrencyBefore := counterValue(t, schedulerAttempts, DefaultProfile, metricResultError, attemptReasonConcurrencyLimit)
+
+	noRes := ret.Err(errorcode.ErrorCode_SelectNodesNoRes, "no res")
+	// A no_node failure with a guard-stamped reject reason keeps that reason...
+	observeScheduleAttempt(DefaultProfile, noRes, selctx.RejectReasonConcurrencyLimit, time.Millisecond)
+	// ...while an unstamped no_node failure stays in the plain bucket.
+	observeScheduleAttempt(DefaultProfile, noRes, "", time.Millisecond)
+	// The stamp must not re-label non-no_node failures.
+	observeScheduleAttempt(DefaultProfile, ret.Err(errorcode.ErrorCode_SelectNodesFailed, "prefilter"), selctx.RejectReasonConcurrencyLimit, time.Millisecond)
+
+	if got := counterValue(t, schedulerAttempts, DefaultProfile, metricResultError, attemptReasonConcurrencyLimit); got != concurrencyBefore+1 {
+		t.Fatalf("concurrency_limit attempts delta = %v, want 1", got-concurrencyBefore)
+	}
+	if got := counterValue(t, schedulerAttempts, DefaultProfile, metricResultError, attemptReasonNoNode); got != noNodeBefore+1 {
+		t.Fatalf("no_node attempts delta = %v, want 1", got-noNodeBefore)
+	}
+}
+
+func TestObserveSelectUsesStampedRejectReason(t *testing.T) {
+	stamped := &selctx.SelectorCtx{}
+	stamped.SetRejectReason(selctx.RejectReasonConcurrencyLimit)
+	before := counterValue(t, schedulerAttempts, DefaultProfile, metricResultError, attemptReasonConcurrencyLimit)
+
+	// nil node + nil error normalizes to no_node, then the stamp refines it.
+	observeSelect(stamped, nil, nil, time.Now())
+
+	if got := counterValue(t, schedulerAttempts, DefaultProfile, metricResultError, attemptReasonConcurrencyLimit); got != before+1 {
+		t.Fatalf("concurrency_limit attempts delta = %v, want 1", got-before)
+	}
+}
+
+func TestObservePluginDuration(t *testing.T) {
+	filterBefore := histogramCount(t, pluginDuration, DefaultProfile, "filter/test-plugin", pluginKindFilter)
+	scoreBefore := histogramCount(t, pluginDuration, DefaultProfile, "score/test-plugin", pluginKindScore)
+
+	ObservePluginDuration(DefaultProfile, pluginKindFilter, "filter/test-plugin", time.Millisecond)
+	ObservePluginDuration(DefaultProfile, pluginKindScore, "score/test-plugin", 2*time.Millisecond)
+
+	if got := histogramCount(t, pluginDuration, DefaultProfile, "filter/test-plugin", pluginKindFilter); got != filterBefore+1 {
+		t.Fatalf("filter plugin duration count delta = %v, want 1", got-filterBefore)
+	}
+	if got := histogramCount(t, pluginDuration, DefaultProfile, "score/test-plugin", pluginKindScore); got != scoreBefore+1 {
+		t.Fatalf("score plugin duration count delta = %v, want 1", got-scoreBefore)
+	}
+}
+
+func TestNodeLoadJain(t *testing.T) {
+	nodes := []nodeResourceStat{
+		{quotaCpuMilli: 1000, quotaMemMB: 2048, cpuUsageMilli: 500, memUsageMB: 512},
+		{quotaCpuMilli: 1000, quotaMemMB: 2048, cpuUsageMilli: 250, memUsageMB: 1024},
+		// Zero mem quota must be skipped, same as in nodeLoadCV.
+		{quotaCpuMilli: 1000, quotaMemMB: 0, cpuUsageMilli: 750, memUsageMB: 4096},
+	}
+
+	cpuJain, memJain := nodeLoadJain(nodes)
+	// cpu ratios 0.5 / 0.25 / 0.75: (1.5)² / (3 * 0.875).
+	wantCPU := 2.25 / (3 * 0.875)
+	if math.Abs(cpuJain-wantCPU) > 1e-9 {
+		t.Fatalf("cpu Jain = %v, want %v", cpuJain, wantCPU)
+	}
+	// mem ratios 0.25 / 0.5: (0.75)² / (2 * 0.3125).
+	wantMem := 0.5625 / (2 * 0.3125)
+	if math.Abs(memJain-wantMem) > 1e-9 {
+		t.Fatalf("mem Jain = %v, want %v", memJain, wantMem)
+	}
+
+	// Perfectly even load is exactly 1.
+	even := []nodeResourceStat{
+		{quotaCpuMilli: 1000, cpuUsageMilli: 500},
+		{quotaCpuMilli: 1000, cpuUsageMilli: 500},
+	}
+	if cpuJain, _ := nodeLoadJain(even); cpuJain != 1 {
+		t.Fatalf("even load Jain = %v, want 1", cpuJain)
+	}
+	// Empty cluster aligns with the CV semantics: 0, never NaN.
+	if cpuJain, memJain := nodeLoadJain(nil); cpuJain != 0 || memJain != 0 {
+		t.Fatalf("empty nodes Jain = (%v, %v), want (0, 0)", cpuJain, memJain)
+	}
+	// All-idle nodes are perfectly even: 1, never NaN.
+	idle := []nodeResourceStat{{quotaCpuMilli: 1000, quotaMemMB: 2048}}
+	if cpuJain, memJain := nodeLoadJain(idle); cpuJain != 1 || memJain != 1 {
+		t.Fatalf("idle nodes Jain = (%v, %v), want (1, 1)", cpuJain, memJain)
+	}
+}
+
+func TestHerdingWindow(t *testing.T) {
+	w := &herdingWindow{ring: make([]string, herdingWindowSize), counts: make(map[string]int)}
+
+	if got := w.add("n1"); got != 1 {
+		t.Fatalf("single decision share = %v, want 1", got)
+	}
+	if got := w.add("n2"); got != 0.5 {
+		t.Fatalf("split decision share = %v, want 0.5", got)
+	}
+	// Fill the rest of the window with n1: 99 x n1, 1 x n2.
+	var got float64
+	for i := 0; i < herdingWindowSize-2; i++ {
+		got = w.add("n1")
+	}
+	if got != 0.99 {
+		t.Fatalf("full window share = %v, want 0.99", got)
+	}
+	// The window is full: the next insert evicts the oldest entry (n1),
+	// leaving 98 x n1, 2 x n2.
+	if got := w.add("n2"); got != 0.98 {
+		t.Fatalf("share after eviction = %v, want 0.98", got)
+	}
+}
+
+func TestHerdingWindowEvictionBookkeeping(t *testing.T) {
+	w := &herdingWindow{ring: make([]string, herdingWindowSize), counts: make(map[string]int)}
+	w.add("n1")
+	for i := 0; i < herdingWindowSize-1; i++ {
+		w.add("n2")
+	}
+	// Window: 1 x n1, 99 x n2. Evict n1, insert n3: top stays n2 at 99%.
+	if got := w.add("n3"); got != 0.99 {
+		t.Fatalf("share = %v, want 0.99", got)
+	}
+	// Now 99 consecutive n3 inserts evict all n2: the window ends with
+	// 100 x n3.
+	var got float64
+	for i := 0; i < herdingWindowSize-1; i++ {
+		got = w.add("n3")
+	}
+	if got != 1 {
+		t.Fatalf("final share = %v, want 1 (n3 only)", got)
+	}
+	if len(w.counts) != 1 {
+		t.Fatalf("counts map leaked nodes: %v", w.counts)
+	}
+}

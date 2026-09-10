@@ -3,6 +3,19 @@
 > Branch: `feat/scheduler-eval-plugin` (scheduler plugin system, scenario profiles, schedsim, cube-bench rework)
 > Date: 2026-09-07 | Environment: real control plane + simulated data plane on a single 96C/246G dev box
 
+> **⚠ Timeliness notice (2026-09-09).** The A/B numbers below were measured
+> **before the `selection.method: spread` fix** (commit `93f2f457`): at that
+> time `spread` was a silent no-op identical to `random` (this report's own
+> issue #1), so none of the three scenario profiles actually ran their stated
+> selection semantics, and the legacy side compiled with zero scorers, i.e.
+> near-first-fit stacking (issue #3). Read "legacy" below as *unscored
+> first-fit* and every profile's placement as *score-sorted but near-random
+> within top_n*. The post-fix picture from the simulator (same traces, same
+> workload presets, 5 seeds) is in the section
+> [Re-evaluation after the spread fix](#re-evaluation-after-the-spread-fix-2026-09-09)
+> at the bottom, and in full detail in
+> [Scheduler Simulator Evaluation Report](./scheduler-sim-report).
+
 This report records a **real control-plane** A/B benchmark of the scheduler strategy profiles. Every component is a real process — real CubeMaster / CubeAPI (Rust) binaries built from the branch, MariaDB, Redis, and real cube-bench traffic — except the data plane (Kubelets), which is simulated because the box has no KVM. It serves as evidence for acceptance criterion 6 (quantified default-vs-new-strategy comparison).
 
 ## Topology and fidelity
@@ -59,9 +72,31 @@ Server-side cross-check: `sandbox_create_duration_seconds` means match the clien
 2. **Profile compilation panics at boot when `scheduler.score.plugin_conf.<scorer>` is missing** (`imagescore.go:37-38`, `realtimescore.go:27-28`, `multifactorscore.go:23-24`) instead of returning a config validation error; the sim example yamls also fail to document that the `score:` block is required.
 3. **The legacy default pipeline compiles with zero scorers** when the conf has no `score:` section; with `priority_select_num=1` it degenerates to near-deterministic first-fit, producing the extreme concentration (238/node).
 
+## Re-evaluation after the spread fix (2026-09-09)
+
+`spread` selection is real now (`schedule.go` `spreadSelect`), the sim baseline
+gained a least-loaded scorer, and the matrix was re-run in schedsim (same
+workload presets and trace parameters, 300 simulated nodes, 30% template
+preload with remote-restore warming, seeds 42–46, quality + performance modes).
+Full data: [Scheduler Simulator Evaluation Report](./scheduler-sim-report).
+Headline corrections to the verdicts above:
+
+| pair (300 nodes, mean of 5 seeds) | old conclusion (broken spread) | post-fix sim result |
+| --- | --- | --- |
+| burst: legacy vs burst_balance | profiles "spread wider, +84% latency" | Placement-neutral vs the *scored* legacy (Jain 0.567 both, hit 0.594 both, success 1.0). Vs the true unscored first-fit legacy, spread behavior is the big win: Jain 0.418→0.567, herding 1.3%→0.4%, CV −21%. The old legacy advantage came from zero-scorer stacking, not from a real policy. |
+| template_storm: legacy vs template_reuse | "hit-rate decisions up, real latency 34% worse" | Decision quality is unambiguous post-fix: template_hit_rate 1.000 vs 0.324 (legacy) / 0.573 (first-fit), i.e. the locality scorer does exactly what it claims. Cost: balance concentrates on replica nodes (Jain 0.243, active nodes 78/300) — the intended locality-vs-balance trade. Whether the latency regression persists on a real data plane depends on restore cost and must be re-measured there. |
+| mixed_spec: legacy vs mixed_binpack | "nominally a packer, actually the most spread variant (37/50 nodes)" | With real spread semantics the packer packs: 7.26/300 active nodes (legacy 165.5), template_hit 0.956, success 1.0, fragmentation 0 (fleet only ~2.3% allocated). Trade-offs: herding 16% and decision P99 +63% (1.56→2.54 ms). The old "binpack is insensitive" observation was an artifact of the no-op `spread` pick, not of `resource_fit_score`. |
+
+Framework overhead measured directly (performance mode, per-stage wall-clock):
+profiles add the mandatory-guards stage (~0.09 ms P50) but drop legacy's
+optional-filter stage (~0.06 ms); net decision-cost delta is +3%…+13% P50,
+dominated everywhere by prefilter candidate enumeration (~65% of total).
+Scheduling-core throughput is ~1.0–1.4k decisions/s per master process on a
+4 vCPU box, single-digit millisecond P99 throughout.
+
 ## Follow-up experiments
 
-- Implement real `spread` semantics (or switch to `method: highest`) and rerun this matrix, to separate "spread selection is broken" from "binpack scorer is insensitive under overcommit".
+- ~~Implement real `spread` semantics (or switch to `method: highest`) and rerun this matrix~~ — **done** (commit `93f2f457`); sim re-run above. A real-cluster rerun of this exact matrix is still open and needed to re-validate the latency axis (the fake's 800 ms cold-start model interacts with placement width).
 - Correlate fake load metrics with occupancy (so `node_safety` engages) and rerun, to see the comparison once legacy concentration is constrained.
 - 3 repeats per cell to quantify herd variance (identical reruns here saw 52–102 misses; directions were stable).
 
