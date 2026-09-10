@@ -36,6 +36,31 @@ func TestInjectFactorySchedulerProfilesOnEmptyScheduler(t *testing.T) {
 	assert.Equal(t, map[string]string{"workload": "template_reuse"}, byName["template_reuse"].Route.Labels)
 	assert.Equal(t, []string{"workload"}, sched.ProfileRouteLabelKeys)
 
+	// BurstBalance 通过实时资源水位 + 创建并发双 scorer 与 Top-3 spread
+	// 组合，把突发创建压力在候选节点间打散
+	burstBalance := byName["burst_balance"]
+	if assert.Len(t, burstBalance.Scores, 2) {
+		assert.Equal(t, "real_time_weighted_average", burstBalance.Scores[0].Name)
+		assert.InDelta(t, 1.0, burstBalance.Scores[0].Weight, 1e-9)
+		assert.Equal(t, "create_concurrency_score", burstBalance.Scores[1].Name)
+		assert.InDelta(t, 1.0, burstBalance.Scores[1].Weight, 1e-9)
+	}
+	assert.Equal(t, "spread", burstBalance.Selection.Method)
+	assert.Equal(t, 3, burstBalance.Selection.TopN)
+
+	// TemplateReuse 以模板本地性为主目标，权重经 schedsim 多 seed 对照
+	// 实验裁决（见 docs/dev/scheduler-sim-report.md 的 template_reuse
+	// 权重对照章节）；template_local_pressure 必须存在，用于分散同模板
+	// 在途创建压力，避免副本节点排队羊群
+	templateReuseWeights := make(map[string]float64)
+	for _, scorer := range byName["template_reuse"].Scores {
+		templateReuseWeights[scorer.Name] = scorer.Weight
+	}
+	assert.Len(t, byName["template_reuse"].Scores, 3)
+	assert.InDelta(t, 0.7, templateReuseWeights["image_score"], 1e-9)
+	assert.InDelta(t, 0.2, templateReuseWeights["template_local_pressure"], 1e-9)
+	assert.InDelta(t, 0.3, templateReuseWeights["real_time_weighted_average"], 1e-9)
+
 	// 内置 scorer 的构造函数会读全局 plugin_conf，缺失时启动即 panic，
 	// 所以 score 子树必须随出厂策略一并注入；enable_scorers 保持为空，
 	// 不激活 legacy 评分流水线
