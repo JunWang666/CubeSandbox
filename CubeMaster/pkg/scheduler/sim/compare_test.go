@@ -5,6 +5,7 @@
 package sim
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +57,8 @@ func TestRenderCompare(t *testing.T) {
 		"# schedsim A/B Comparison Report",
 		"| baseline | legacy | `legacy.sim.yaml` |",
 		"| candidate | spread | `spread.sim.yaml` |",
-		// identical rounds render exactly 0 stddev, not an epsilon residue
+		"95% CI half-width 1.96·σ/√n",
+		// identical rounds render exactly 0 CI, not an epsilon residue
 		"0.9 ± 0", "0.99 ± 0",
 		// success_rate 0.9 -> 0.99 = +10.0%
 		"+10.0%",
@@ -99,7 +101,7 @@ func TestRenderCompare(t *testing.T) {
 	}
 }
 
-func TestRenderCompareSingleSampleNoStddev(t *testing.T) {
+func TestRenderCompareSingleSampleNoCI(t *testing.T) {
 	variants := compareFixture()
 	// Drop rounds: the top-level summary becomes the single sample.
 	for i := range variants {
@@ -110,10 +112,29 @@ func TestRenderCompareSingleSampleNoStddev(t *testing.T) {
 		t.Fatalf("RenderCompare: %v", err)
 	}
 	if strings.Contains(out, "0.9 ±") || strings.Contains(out, "0.99 ±") {
-		t.Fatalf("single-sample report must not render stddev in cells:\n%s", out)
+		t.Fatalf("single-sample report must not render a CI in cells:\n%s", out)
 	}
 	if !strings.Contains(out, "+10.0%") {
 		t.Fatalf("single-sample delta missing:\n%s", out)
+	}
+}
+
+func TestRenderCompareCIHalfWidth(t *testing.T) {
+	variants := compareFixture()
+	// success_rate rounds 0.5 and 1.0: mean 0.75, sd = √0.125, so the
+	// 95% CI half-width is 1.96·√0.125/√2 = 0.49.
+	for _, side := range variants {
+		side.Report.Rounds = []*RoundResult{
+			{Seed: 42, Summary: map[string]float64{"success_rate": 0.5}},
+			{Seed: 43, Summary: map[string]float64{"success_rate": 1.0}},
+		}
+	}
+	out, err := RenderCompare(variants, time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatalf("RenderCompare: %v", err)
+	}
+	if !strings.Contains(out, "0.75 ± 0.49") {
+		t.Fatalf("report missing CI cell \"0.75 ± 0.49\":\n%s", out)
 	}
 }
 
@@ -142,6 +163,10 @@ func TestAggregateVariantMissingKeys(t *testing.T) {
 	}
 	if st.mean != 0.75 || st.sd != 0.3535533905932738 {
 		t.Fatalf("success_rate mean/sd = %v/%v, want 0.75/0.35355...", st.mean, st.sd)
+	}
+	// 95% CI half-width = 1.96·σ/√n = 1.96·0.35355…/√2 = 0.49.
+	if !st.hasCI || math.Abs(st.ci-0.49) > 1e-9 {
+		t.Fatalf("success_rate ci = %v (hasCI=%v), want ~0.49", st.ci, st.hasCI)
 	}
 	// Keys absent from every round are simply not present.
 	if _, ok := agg["load_cv_cpu"]; ok {

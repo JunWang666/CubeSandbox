@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -363,6 +364,34 @@ func renderDryRunBanner(cfg *Config) {
 	fmt.Println()
 }
 
+// buildVersion returns the VCS revision stamped into the binary by the Go
+// tool ("<revision>", or "<revision>-dirty" when the build tree had
+// uncommitted changes), or "" when the binary carries no VCS info (e.g.
+// built with -buildvcs=false or via `go run` from outside a checkout).
+func buildVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var rev string
+	dirty := false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return ""
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return rev
+}
+
 func exportJSON(results []IterResult, cfg *Config) {
 	var okResults []IterResult
 	for _, r := range results {
@@ -432,6 +461,11 @@ func exportJSON(results []IterResult, cfg *Config) {
 		"network_allow_out":    cfg.networkFP.AllowOut,
 		"network_rules":        cfg.networkFP.Rules,
 		"network_inject_rules": cfg.networkFP.InjectRules,
+	}
+	// Code version of the bench binary; omitted when the binary carries no
+	// VCS info. `cube-bench compare` surfaces it via configHighlightKeys.
+	if v := buildVersion(); v != "" {
+		configBlock["version"] = v
 	}
 	if cfg.Scheduled {
 		configBlock["workload"] = workloadDisplayName(cfg)

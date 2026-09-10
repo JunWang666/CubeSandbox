@@ -67,6 +67,11 @@ type variantStats struct {
 	n    int
 	mean float64
 	sd   float64 // sample standard deviation; 0 when n < 2
+	// ci is the half-width of the 95% confidence interval of the mean
+	// (1.96·σ/√n, same convention as cube-bench compare); valid only when
+	// hasCI is true (n ≥ 2).
+	ci    float64
+	hasCI bool
 }
 
 // aggregateVariant computes per-metric stats across the variant's rounds.
@@ -96,6 +101,8 @@ func aggregateVariant(v *VariantReport) map[string]variantStats {
 		st := variantStats{n: len(vals), mean: sampleMean(vals)}
 		if st.n >= 2 {
 			st.sd = sampleStdDev(vals)
+			st.ci = 1.96 * st.sd / math.Sqrt(float64(st.n))
+			st.hasCI = true
 		}
 		out[key] = st
 	}
@@ -215,6 +222,11 @@ func RenderCompare(variants []VariantReport, generated time.Time) (string, error
 		mode = "quality"
 	}
 	fmt.Fprintf(&b, "| mode | %s |\n", mode)
+	// All variants are run by the same schedsim binary, so the code version is
+	// a shared run property; empty for binaries built without VCS info.
+	if base.Version != "" {
+		fmt.Fprintf(&b, "| version | `%s` |\n", base.Version)
+	}
 	b.WriteString("\nVariants share the same trace, node fleet, preload draw seeds and round count; only the scheduler config differs.\n\n")
 	b.WriteString("| role | name | config |\n| --- | --- | --- |\n")
 	for i, v := range variants {
@@ -225,7 +237,7 @@ func RenderCompare(variants []VariantReport, generated time.Time) (string, error
 		fmt.Fprintf(&b, "| %s | %s | `%s` |\n", role, v.Name, v.ConfigPath)
 	}
 
-	b.WriteString("\n## Metrics (mean across rounds; ± is the sample stddev, n = rounds)\n\n")
+	b.WriteString("\n## Metrics (mean across rounds; ± is the 95% CI half-width 1.96·σ/√n, shown when n = rounds ≥ 2)\n\n")
 	var hdr strings.Builder
 	hdr.WriteString("| metric")
 	for _, v := range variants {
@@ -243,8 +255,8 @@ func RenderCompare(variants []VariantReport, generated time.Time) (string, error
 			b.WriteString(" | ")
 			if !row.present[i] {
 				b.WriteString("—")
-			} else if row.stats[i].n >= 2 {
-				fmt.Fprintf(&b, "%s ± %s", formatCompareNum(row.stats[i].mean), formatCompareNum(row.stats[i].sd))
+			} else if row.stats[i].hasCI {
+				fmt.Fprintf(&b, "%s ± %s", formatCompareNum(row.stats[i].mean), formatCompareNum(row.stats[i].ci))
 			} else {
 				b.WriteString(formatCompareNum(row.stats[i].mean))
 			}
