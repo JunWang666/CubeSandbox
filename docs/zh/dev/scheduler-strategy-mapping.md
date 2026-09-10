@@ -19,6 +19,31 @@
 通用 Mandatory Guards + 并行 Filter + 并行 Score + Top-N 选点组合承载，
 Guards 决定"能不能跑"，策略只决定可行节点之间的优先级。
 
+## 零配置注入与 legacy 兼容
+
+上述三条策略同时也是**零配置默认值**：当部署完全没有配置
+`scheduler.profiles`、`scheduler.filter` 和 `scheduler.score` 时，
+`preHandleScheduler`（`CubeMaster/pkg/base/config/config.go`）会注入内嵌在
+`scheduler_factory.yaml` 中的出厂三 Profile。此时调度行为由出厂策略决定
+（mandatory guards + 出厂 scorer + spread 选点），**不等同于**引入 Profile
+机制之前的旧静态注册行为。
+
+要保留旧行为，只需显式配置任一 legacy 键
+（`scheduler.filter.enable_filters` 和/或 `scheduler.score.enable_scorers`）：
+注入是 all-or-nothing 的，此时整体跳过，`profile.Compile` 会通过
+`compileLegacy` 从旧静态配置重建流水线，保留旧的容错语义（未知插件名、
+零权重 scorer 均跳过）。
+
+兼容性由两级测试锁定：
+
+- 编译层：`CubeMaster/pkg/scheduler/profile/profile_test.go` 中的
+  `TestLegacyCompileSkipsUnknownPluginsAndZeroWeights` 与
+  `TestProfileRoutingAndLegacyFallback`；
+- 同输入选点：`CubeMaster/pkg/scheduler/profile_compat_test.go` 中的
+  `TestLegacyAndExplicitProfileSelectIdentically` 用相同节点状态与同一请求
+  分别执行 legacy 编译产出的流水线和语义等价的显式 Profile 流水线，
+  断言两边每节点最终分数、排序与选中节点完全一致。
+
 ## BurstBalance（突发均衡）
 
 **Profile 组成**（`burst_balance`）：
