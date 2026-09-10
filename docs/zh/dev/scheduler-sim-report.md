@@ -187,6 +187,62 @@ first-fit 堆叠的模板命中率反而更高（0.668 vs 0.594）：集中放�
 微弱出现（≤0.03%）。本负载下各档成功率均为 1。建议：追求最大装箱保持 3.0；若更
 在意单节点突发风险而非空节点数，1.5 可以用约 2 个额外活跃节点换取羊群度下降 20%。
 
+## template_reuse 权重对照（300 节点，5 个 seed，seed 42–46）
+
+> 2026-09-10 在合并后基线（`fix2-template-reuse` worktree）上增补。裁决出厂
+> `template_reuse` 权重（image_score / template_local_pressure /
+> real_time_weighted_average = **0.7/0.2/0.3**）与被否决 PR 的提案
+> **0.1/0/0.9**（"让实时负载主导，避免副本节点持续热点化"）。变体：
+> `baseline` = 0.7/0.2/0.3，`rt-dominated` = 0.1/−/0.9（去掉压力打分器），
+> `mid` = 0.5/0.2/0.5，`rt-hot` = 0.7/0.2/0.9。数值为逐轮均值 ± 95% CI。
+
+### 标准 template_storm trace（300 请求，30/s，U(30s,90s)）
+
+| 指标 | baseline 0.7/0.2/0.3 | rt-dominated 0.1/0/0.9 | rt-hot 0.7/0.2/0.9 |
+| --- | --- | --- | --- |
+| success_rate | 1.0000 ± 0 | 1.0000 ± 0 | 1.0000 ± 0 |
+| template_hit_rate | 1.000 ± 0 | 1.000 ± 0 | 1.000 ± 0 |
+| jain_cpu | 0.245 ± 0.015 | 0.243 ± 0.014 | 0.243 ± 0.015 |
+| load_cv_cpu | 2.306 ± 0.066 | 2.303 ± 0.063 | 2.319 ± 0.085 |
+| herding_top1_share | 0.0127 ± 0.0019 | 0.0127 ± 0.0019 | 0.0127 ± 0.0019 |
+| active_nodes_avg | 79.0 ± 4.5 | 78.5 ± 3.9 | 78.5 ± 4.5 |
+| sched_latency_p50_ms | 0.601 ± 0.179 | 0.581 ± 0.193 | 0.610 ± 0.197 |
+
+该负载下三个变体无法区分：本地命中率均为 1.000，均衡/羊群差异都在噪声内。
+节点间实时分数差太小，任何权重都撼不动放置结果——0.1/0/0.9 宣称的"防热点"
+收益在常规负载下并不存在。
+
+### 高负载 template_storm trace（1500 请求，约 62/s，生命周期 U(60s,180s)）
+
+为了让权重可区分，把风暴推高到副本节点真正吃紧（平均并发 ≈ 7.5k 沙箱；
+约 90 个预置节点承担约 86% 有效 CPU，集群整体分配率仍约 9%）：
+
+| 指标 | baseline 0.7/0.2/0.3 | rt-dominated 0.1/0/0.9 | mid 0.5/0.2/0.5 | rt-hot 0.7/0.2/0.9 |
+| --- | --- | --- | --- | --- |
+| success_rate | 1.0000 ± 0 | 1.0000 ± 0 | 1.0000 ± 0 | 1.0000 ± 0 |
+| **template_hit_rate** | **1.000 ± 0** | **0.953 ± 0.004** | 1.000 ± 0 | 1.000 ± 0 |
+| jain_cpu | 0.286 ± 0.018 | 0.442 ± 0.002 | 0.283 ± 0.016 | 0.285 ± 0.017 |
+| load_cv_cpu | 1.833 ± 0.065 | 1.471 ± 0.010 | 1.846 ± 0.057 | 1.831 ± 0.062 |
+| herding_top1_share | 0.0107 ± 0.0006 | 0.0060 ± 0 | 0.0107 ± 0.0006 | 0.0107 ± 0.0006 |
+| active_nodes_avg | 89.9 ± 5.3 | 142.0 ± 0.8 | 89.6 ± 5.2 | 89.7 ± 5.1 |
+| sched_latency_p50_ms | 0.593 ± 0.166 | 0.572 ± 0.160 | 0.589 ± 0.171 | 0.597 ± 0.169 |
+
+**解读。** image 权重 0.1 与 0.5 之间存在相变边界：只要布尔 image 分
+（有副本=100，无副本=0）压得住实时分差，所有保留本地性的设置放置结果完全
+一致——0.5/0.2/0.5 和 0.7/0.2/0.9 相对出厂**没有任何**变化。跌破边界后，
+`rt-dominated` 的均衡收益（Jain +55%、CV −20%、羊群 1.07% → 0.60%）全部
+来自打破本地性：命中率 1.000 → 0.953（4.7% 的创建要走远程模板恢复），
+放置外溢到多 58% 的节点——即退化为 legacy least-loaded，而那正是默认 /
+burst_balance 策略已有的职责。
+
+**结论：维持 0.7/0.2/0.3。** TemplateReuse 的策略契约（"只在模板可运行节点
+中选择，再按同模板创建压力分散"）以本地性为第一目标；仿真显示 0.1/0/0.9
+只是在拿本地性换均衡，且在常规负载下换不到任何收益。副本节点**内部**的分散
+由 `template_local_pressure` + top-3 spread 负责。注意：sim 引擎不会驱动在途
+创建计数（`localcache.IncrNodeTemplateCreate`），`template_local_pressure`
+在仿真中恒为 100 分，其防羊群收益只能依据代码语义推断、需真机验证——本次
+仿真裁决的只是 image 对 realtime 这一根轴。
+
 ## 权衡与注意事项
 
 - **本地化与均衡是可量化的真实权衡**：template_reuse 用 Jain 0.243 换 1.000
@@ -225,4 +281,15 @@ legacy_firstfit=<去掉 score: 段的 example.sim.yaml> \
 /tmp/schedsim --mode=performance --compare legacy=...,burst_balance=... \
   --trace /tmp/burst.trace.json --nodes 300 --rounds 5 --seed 42 \
   --allow-non-local-template=true -o perf.md
+
+# template_reuse 权重对照：高负载 storm trace + 4 个权重变体
+cd examples/cube-bench && go run . --workload template_storm --total 1500 \
+  --rate 60 --lifetime "60,180" --dry-run --no-tui --seed 42 \
+  --templates "tpl-storm:1:2000:4096" --dump-trace /tmp/storm-hot.trace.json
+cd ../../CubeMaster
+/tmp/schedsim --compare baseline=cmd/schedsim/template_reuse.profiles.sim.yaml,\
+rt-dominated=<同配置改 image 0.1、去掉 template_local_pressure、realtime 0.9>,\
+mid=<同配置改 0.5/0.2/0.5>,rt-hot=<同配置改 0.7/0.2/0.9> \
+  --trace /tmp/storm-hot.trace.json --nodes 300 --template-preload 0.3 \
+  --rounds 5 --seed 42 --allow-non-local-template=true -o weights.md
 ```
