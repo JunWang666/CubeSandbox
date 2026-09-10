@@ -230,6 +230,9 @@ type engine struct {
 	driver *perfDriver
 	stages *stageSamples
 	wall   time.Duration
+	// procBegin/procEnd bracket runEvents in perf mode; the process overhead
+	// is the delta between the two samples.
+	procBegin, procEnd procUsageSample
 
 	successes          int
 	failures           int
@@ -269,9 +272,15 @@ func RunRound(ctx context.Context, p Params) (*RoundResult, error) {
 	e.injectNodes()
 	defer e.cleanup()
 	e.preloadTemplates()
+	if p.Perf {
+		e.procBegin = sampleProcUsage()
+	}
 	start := time.Now()
 	e.runEvents(ctx)
 	e.wall = time.Since(start)
+	if p.Perf {
+		e.procEnd = sampleProcUsage()
+	}
 	return e.result(), nil
 }
 
@@ -602,6 +611,7 @@ func (e *engine) result() *RoundResult {
 	rr := &RoundResult{Seed: e.p.Seed, Summary: summary}
 	if e.driver != nil {
 		rr.Perf = e.stages.summarize(e.wall, total)
+		rr.Perf.Overhead = overheadBetween(e.procBegin, e.procEnd, e.wall)
 	}
 	return rr
 }
