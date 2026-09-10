@@ -56,9 +56,21 @@ const (
 	// attemptReasonPreFilter maps ErrorCode_SelectNodesFailed: the
 	// pre-selector (or backoff selector) call itself failed.
 	attemptReasonPreFilter = "prefilter"
+	// attemptReasonConcurrencyLimit refines no_node failures when a guard
+	// stamped the selector context with an all-reject cause; the value is
+	// selctx.RejectReasonConcurrencyLimit (single source of truth, since the
+	// filter package cannot import this package).
+	attemptReasonConcurrencyLimit = selctx.RejectReasonConcurrencyLimit
 	// attemptReasonError covers everything else (panic recovery, internal
 	// errors, ...).
 	attemptReasonError = "error"
+)
+
+// Plugin pipeline stage kinds for scheduler_plugin_duration_seconds.
+const (
+	pluginKindGuard  = "guard"
+	pluginKindFilter = "filter"
+	pluginKindScore  = "score"
 )
 
 // Reschedule reason categories for handleCubelet retries, derived from the
@@ -87,6 +99,8 @@ const (
 	resourceLabel       = "resource"
 	quotaTypeLabel      = "type"
 	shapeLabel          = "shape"
+	pluginLabel         = "plugin"
+	kindLabel           = "kind"
 	fragmentShapeMaxMVM = "max_mvm"
 )
 
@@ -155,18 +169,56 @@ var (
 		Name: "scheduler_fragmented_capacity_ratio",
 		Help: "Ratio of free capacity stranded on nodes that cannot fit the reference shape (see fragmentedCapacityRatio), by shape.",
 	}, []string{shapeLabel})
+
+	// pluginDuration measures the per-plugin execution latency inside a
+	// profile pipeline. Plugin names come from the operator's config and
+	// profile names from a bounded set, so the label cardinality stays small.
+	pluginDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "scheduler_plugin_duration_seconds",
+		Help:    "Execution latency of a single scheduler plugin invocation, by profile, plugin and pipeline stage kind (guard/filter/score).",
+		Buckets: prometheus.ExponentialBuckets(0.00005, 2, 16), // 50µs .. ~1.6s
+	}, []string{profileLabel, pluginLabel, kindLabel})
+
+	nodeLoadJainGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "scheduler_node_load_jain",
+		Help: "Jain fairness index of per-node load ratio (usage / raw quota) across healthy nodes; 1 means perfectly even.",
+	}, []string{resourceLabel})
+
+	herdingTop1ShareGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "scheduler_herding_top1_share",
+		Help: "Share of the most-picked node among the last herdingWindowSize successful scheduling decisions; 1 means every recent decision landed on the same node.",
+	})
 )
 
 // ObserveScheduleAttempt records one Select call: the attempts counter with a
 // classified result/reason, and the duration histogram (observed for both
 // success and failure).
 func ObserveScheduleAttempt(profile string, err error, d time.Duration) {
+	observeScheduleAttempt(profile, err, "", d)
+}
+
+// observeScheduleAttempt is ObserveScheduleAttempt with an optional reject
+// reason stamped on the selector context: a no_node failure whose guard
+// rejected every candidate is re-labeled with that reason (e.g.
+// concurrency_limit) so admission-style rejections stay distinguishable from
+// plain resource exhaustion.
+func observeScheduleAttempt(profile string, err error, rejectReason string, d time.Duration) {
 	result, reason := metricResultSuccess, attemptReasonNone
 	if err != nil {
 		result, reason = metricResultError, classifyAttemptError(err)
+		if reason == attemptReasonNoNode && rejectReason != "" {
+			reason = rejectReason
+		}
 	}
 	schedulerAttempts.WithLabelValues(profile, result, reason).Inc()
 	schedulerDuration.WithLabelValues(profile).Observe(d.Seconds())
+}
+
+// ObservePluginDuration records one plugin invocation inside a profile
+// pipeline. Both successes and failures are observed: plugin latency matters
+// most when a plugin is slow enough to trip its failure policy.
+func ObservePluginDuration(profile, kind, plugin string, d time.Duration) {
+	pluginDuration.WithLabelValues(profile, plugin, kind).Observe(d.Seconds())
 }
 
 // classifyAttemptError maps the Select failure error code to a small reason
@@ -248,11 +300,65 @@ func observeSelect(selCtx *selctx.SelectorCtx, selected *node.Node, err error, s
 	if err == nil && selected == nil {
 		err = ret.Err(errorcode.ErrorCode_SelectNodesNoRes, ErrNoRes.Error())
 	}
-	ObserveScheduleAttempt(ProfileNameOf(selCtx), err, time.Since(start))
+	observeScheduleAttempt(ProfileNameOf(selCtx), err, rejectReasonOf(selCtx), time.Since(start))
 	if err != nil {
 		return
 	}
 	RecordDecision(ProfileNameOf(selCtx), templateLocalHit(selCtx, selected))
+	herdingTop1ShareGauge.Set(herdingDecisions.add(selected.ID()))
+}
+
+// rejectReasonOf returns the all-reject cause a guard stamped on the selector
+// context ("" when none); it refines the reason label of no_node failures.
+func rejectReasonOf(selCtx *selctx.SelectorCtx) string {
+	if selCtx == nil {
+		return ""
+	}
+	return selCtx.GetRejectReason()
+}
+
+// herdingWindowSize is the number of most recent successful scheduling
+// decisions considered by the herding (top-1 node share) gauge.
+const herdingWindowSize = 100
+
+// herdingWindow is a concurrency-safe fixed-size ring of the most recent
+// decision node IDs with per-node counts, used to compute the top-1 share.
+type herdingWindow struct {
+	mu     sync.Mutex
+	ring   []string
+	counts map[string]int
+	head   int
+	size   int
+}
+
+var herdingDecisions = &herdingWindow{
+	ring:   make([]string, herdingWindowSize),
+	counts: make(map[string]int),
+}
+
+// add records one decision node ID and returns the resulting top-1 share:
+// count of the most frequent node in the window divided by the window size.
+func (w *herdingWindow) add(id string) float64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.size == herdingWindowSize {
+		evicted := w.ring[w.head]
+		if w.counts[evicted]--; w.counts[evicted] == 0 {
+			delete(w.counts, evicted)
+		}
+	} else {
+		w.size++
+	}
+	w.ring[w.head] = id
+	w.head = (w.head + 1) % herdingWindowSize
+	w.counts[id]++
+	top := 0
+	for _, count := range w.counts {
+		if count > top {
+			top = count
+		}
+	}
+	return float64(top) / float64(w.size)
 }
 
 // templateLocalHit reports whether the selected node holds a local replica of
@@ -312,12 +418,11 @@ func sumClusterQuota(nodes []nodeResourceStat, fn nodeCapacityFunc) clusterQuota
 	return q
 }
 
-// nodeLoadCV returns the coefficient of variation of per-node load ratios
-// (usage / raw quota), computed over nodes with a positive quota. An empty
-// set or zero mean yields 0.
-func nodeLoadCV(nodes []nodeResourceStat) (cpuCV, memCV float64) {
-	cpuRatios := make([]float64, 0, len(nodes))
-	memRatios := make([]float64, 0, len(nodes))
+// nodeLoadRatios projects nodes into per-node load ratios (usage / raw quota)
+// per resource, skipping nodes with a non-positive quota for that resource.
+func nodeLoadRatios(nodes []nodeResourceStat) (cpuRatios, memRatios []float64) {
+	cpuRatios = make([]float64, 0, len(nodes))
+	memRatios = make([]float64, 0, len(nodes))
 	for _, n := range nodes {
 		if n.quotaCpuMilli > 0 {
 			cpuRatios = append(cpuRatios, float64(n.cpuUsageMilli)/float64(n.quotaCpuMilli))
@@ -326,7 +431,22 @@ func nodeLoadCV(nodes []nodeResourceStat) (cpuCV, memCV float64) {
 			memRatios = append(memRatios, float64(n.memUsageMB)/float64(n.quotaMemMB))
 		}
 	}
+	return cpuRatios, memRatios
+}
+
+// nodeLoadCV returns the coefficient of variation of per-node load ratios
+// (usage / raw quota), computed over nodes with a positive quota. An empty
+// set or zero mean yields 0.
+func nodeLoadCV(nodes []nodeResourceStat) (cpuCV, memCV float64) {
+	cpuRatios, memRatios := nodeLoadRatios(nodes)
 	return cvOfRatios(cpuRatios), cvOfRatios(memRatios)
+}
+
+// nodeLoadJain returns the Jain fairness index of the same per-node load
+// ratios, computed at the same collection point as nodeLoadCV.
+func nodeLoadJain(nodes []nodeResourceStat) (cpuJain, memJain float64) {
+	cpuRatios, memRatios := nodeLoadRatios(nodes)
+	return jainOfRatios(cpuRatios), jainOfRatios(memRatios)
 }
 
 // cvOfRatios computes population stddev / mean; the full node set is
@@ -349,6 +469,25 @@ func cvOfRatios(ratios []float64) float64 {
 		sq += d * d
 	}
 	return math.Sqrt(sq/float64(len(ratios))) / mean
+}
+
+// jainOfRatios computes the Jain fairness index (Σx)²/(n·Σx²), in (0,1]; 1
+// means perfectly even. An empty set yields 0, aligned with the empty-cluster
+// semantics of cvOfRatios; an all-zero set (every node idle) is perfectly
+// even load and yields 1.
+func jainOfRatios(ratios []float64) float64 {
+	if len(ratios) == 0 {
+		return 0
+	}
+	var sum, sq float64
+	for _, r := range ratios {
+		sum += r
+		sq += r * r
+	}
+	if sq == 0 {
+		return 1
+	}
+	return sum * sum / (float64(len(ratios)) * sq)
 }
 
 // countActiveEmptyNodes splits nodes into active (running microVMs or any
@@ -473,6 +612,10 @@ func collectClusterGauges() {
 	cpuCV, memCV := nodeLoadCV(stats)
 	nodeLoadCVGauge.WithLabelValues(resourceLabelCPU).Set(cpuCV)
 	nodeLoadCVGauge.WithLabelValues(resourceLabelMem).Set(memCV)
+
+	cpuJain, memJain := nodeLoadJain(stats)
+	nodeLoadJainGauge.WithLabelValues(resourceLabelCPU).Set(cpuJain)
+	nodeLoadJainGauge.WithLabelValues(resourceLabelMem).Set(memJain)
 
 	active, empty := countActiveEmptyNodes(stats)
 	activeNodesGauge.Set(float64(active))

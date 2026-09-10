@@ -360,11 +360,13 @@ func admitSelectedHost(selected *node.Node, getNode func(string) (*node.Node, bo
 func (c *createSandboxContext) callCubelet() bool {
 
 	localcache.IncrNodeConcurrent(c.selectHost)
+	untrackTemplateCreate := trackTemplateCreate(c.selectHost, c.selctx)
 	defer func() {
 		if r := recover(); r != nil {
 			log.G(c.ctx).Fatalf("Handle panic:%+v", string(debug.Stack()))
 			c.setMasterRsp(int(errorcode.ErrorCode_ReqCubeAPIFailed), "panic fatal error")
 		}
+		untrackTemplateCreate()
 		localcache.DecrNodeConcurrent(c.selectHost)
 		c.cubeletEndTime = time.Now()
 	}()

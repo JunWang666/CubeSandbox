@@ -64,6 +64,18 @@ func RegisterBuiltins(registry *Registry) error {
 		) (score.Selector, error) {
 			return score.NewResourceFitScore(conf)
 		},
+		"create_concurrency_score": func(
+			_ context.Context,
+			conf config.SchedulerProfilePluginConf,
+		) (score.Selector, error) {
+			return score.NewCreateConcurrencyScore(conf)
+		},
+		"template_local_pressure": func(
+			_ context.Context,
+			conf config.SchedulerProfilePluginConf,
+		) (score.Selector, error) {
+			return score.NewTemplateLocalPressureScore(conf)
+		},
 	}
 	for name, factory := range scores {
 		if err := registry.RegisterScore(TypeGo, name, factory); err != nil {
