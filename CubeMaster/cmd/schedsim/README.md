@@ -47,10 +47,18 @@ go build -o /tmp/schedsim ./cmd/schedsim
   各阶段（`prefilter/guards/filter/score/pick/total`）的 P50/P95/P99/均值、
   本轮回放墙钟时长 `wall_seconds` 与决策吞吐 `throughput_rps`（请求数/墙钟秒，
   即零排队下的调度核心吞吐）。跨轮聚合取各轮分位数的均值。
+  `perf.overhead` 块记录 schedsim 进程自身在回放窗口内的开销：
+  `cpu_seconds`（累计进程 CPU 时间，`/proc/self/stat` utime+stime）、
+  `avg_cpu_cores`（cpu_seconds/wall_seconds，平均占用核数）、
+  `peak_rss_mib`（峰值常驻内存，`/proc/self/status` VmHWM，进程生命周期高水位）、
+  `heap_alloc_mib`/`heap_sys_mib`（回放结束时的 Go 堆在用/已申请，
+  `runtime.ReadMemStats`）。procfs 字段仅 Linux 输出（其余平台省略），
+  Go 堆指标全平台可用；跨轮聚合：CPU 秒求和、峰值 RSS 取 max、Go 堆取均值。
   注意：performance 模式仍用虚拟时钟推进到达/到期事件（不 sleep），
   "真实时钟"指对每次调度决策的墙钟测量，而非按 trace 速率实时 pacing。
 - compare 模式透传 `--mode`：所有变体同模式对比，报告追加
-  "Scheduling overhead" 分阶段耗时表与相对 baseline 的开销差。
+  "Scheduling overhead" 分阶段耗时表（含进程级 CPU/内存开销行）与相对
+  baseline 的开销差。
 
 ```bash
 schedsim --mode=performance \
