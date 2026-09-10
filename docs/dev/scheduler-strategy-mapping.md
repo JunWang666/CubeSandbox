@@ -23,6 +23,34 @@ Mandatory Guards + parallel Filter + parallel Score + Top-N selection pipeline:
 guards decide *whether a node can run the request at all*, strategies only order
 the feasible candidates.
 
+## Zero-config injection and legacy compatibility
+
+The three strategies above are also the *zero-config default*: when a
+deployment configures none of `scheduler.profiles`, `scheduler.filter` or
+`scheduler.score`, `preHandleScheduler`
+(`CubeMaster/pkg/base/config/config.go`) injects the embedded factory profiles
+from `scheduler_factory.yaml`. Scheduling then follows the factory profiles —
+mandatory guards, factory scorers and spread selection — which is **not**
+identical to the pre-profile legacy static registration.
+
+To keep the legacy behavior, configure at least one legacy key
+(`scheduler.filter.enable_filters` and/or `scheduler.score.enable_scorers`):
+injection is all-or-nothing and is then skipped entirely, and
+`profile.Compile` rebuilds the pipeline from the legacy config via
+`compileLegacy`, preserving the old tolerance semantics (unknown plugin names
+and zero-weight scorers are skipped).
+
+Compatibility is pinned by tests at two levels:
+
+- compile layer: `TestLegacyCompileSkipsUnknownPluginsAndZeroWeights` and
+  `TestProfileRoutingAndLegacyFallback` in
+  `CubeMaster/pkg/scheduler/profile/profile_test.go`;
+- same-input selection: `TestLegacyAndExplicitProfileSelectIdentically` in
+  `CubeMaster/pkg/scheduler/profile_compat_test.go` runs the legacy-compiled
+  pipeline and a semantically equivalent explicit profile over the same node
+  state and the same request, and asserts identical per-node final scores,
+  ordering and selected node.
+
 ## BurstBalance
 
 **Profile composition** (`burst_balance`):

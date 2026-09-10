@@ -6,6 +6,15 @@
 # legacy scheduler.filter / scheduler.score block. Any explicit scheduler
 # policy configuration replaces this file entirely (all-or-nothing).
 #
+# IMPORTANT: with this file injected, scheduling follows the three factory
+# profiles below (mandatory guards + factory scorers + spread selection); that
+# is NOT identical to the pre-profile legacy static registration. To keep the
+# legacy behavior on an existing deployment, configure at least one legacy key
+# (scheduler.filter.enable_filters and/or scheduler.score.enable_scorers):
+# injection is then skipped entirely and profile.Compile rebuilds the pipeline
+# from the legacy config (compileLegacy), preserving the old tolerance
+# semantics (unknown plugin names and zero-weight scorers are skipped).
+#
 # Three built-in strategies:
 #   - burst_balance   route: labels {workload: burst_balance}
 #                     突发均衡：高并发同规格请求按资源水位与创建并发在候选节点间打散
