@@ -366,6 +366,27 @@ func renderPerfSection(b *strings.Builder, variants []VariantReport) {
 	perfRow("throughput_rps", func(p *PerfSummary) float64 { return p.ThroughputRPS })
 	perfRow("wall_seconds", func(p *PerfSummary) float64 { return p.WallSeconds })
 
+	// Process-level overhead (procfs CPU/RSS + Go heap); absent from reports
+	// written before overhead sampling existed, and zero/omitted off Linux.
+	overheadRow := func(label string, get func(*ProcessOverhead) float64) {
+		fmt.Fprintf(b, "| %s", label)
+		for i := range variants {
+			b.WriteString(" | ")
+			perf := variants[i].Report.Perf
+			if perf == nil || perf.Overhead == nil {
+				b.WriteString("—")
+			} else {
+				b.WriteString(formatCompareNum(get(perf.Overhead)))
+			}
+		}
+		b.WriteString(" |\n")
+	}
+	overheadRow("proc_cpu_seconds", func(o *ProcessOverhead) float64 { return o.CPUSeconds })
+	overheadRow("proc_avg_cpu_cores", func(o *ProcessOverhead) float64 { return o.AvgCPUCores })
+	overheadRow("proc_peak_rss_mib", func(o *ProcessOverhead) float64 { return o.PeakRSSMiB })
+	overheadRow("go_heap_alloc_mib", func(o *ProcessOverhead) float64 { return o.HeapAllocMiB })
+	overheadRow("go_heap_sys_mib", func(o *ProcessOverhead) float64 { return o.HeapSysMiB })
+
 	// Δ% vs baseline for the two headline overhead numbers.
 	if variants[0].Report.Perf != nil {
 		base := variants[0].Report.Perf

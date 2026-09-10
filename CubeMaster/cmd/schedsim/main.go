@@ -177,6 +177,10 @@ func runSingle(
 		if rr.Perf != nil {
 			fmt.Fprintf(os.Stderr, "schedsim: round %d perf: total_p50=%.3fms total_p99=%.3fms throughput=%.0f decisions/s\n",
 				i, rr.Perf.Stages["total"].P50Ms, rr.Perf.Stages["total"].P99Ms, rr.Perf.ThroughputRPS)
+			if oh := rr.Perf.Overhead; oh != nil {
+				fmt.Fprintf(os.Stderr, "schedsim: round %d overhead: cpu=%.2fs (%.2f cores avg) peak_rss=%.1fMiB heap_alloc=%.1fMiB heap_sys=%.1fMiB\n",
+					i, oh.CPUSeconds, oh.AvgCPUCores, oh.PeakRSSMiB, oh.HeapAllocMiB, oh.HeapSysMiB)
+			}
 		}
 	}
 
