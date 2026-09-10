@@ -24,9 +24,10 @@ timeliness notice for what changed since it was written.
 | overcommit | cpu_ratio 3.0 / mem_ratio 2.0 (except the overcommit tuning arm) |
 | template_preload | 0.3 (30% of nodes hold a local replica of each template) |
 | allow_non_local_template | true (cold nodes restore remotely and warm their cache, modeling the fake-cubelet behavior of the real A/B) |
-| seeds / rounds | base seed 42, 5 rounds (seeds 42–46) per variant; 95% CI = mean ± t(0.975, n−1)·s/√n |
+| seeds / rounds | base seed 42, 5 rounds (seeds 42–46) per variant; tooling 95% CI = mean ± 1.96·s/√n (aligned with cube-bench compare) — the tables below predate that change and use the t(0.975, n−1) multiplier, so they are ~1.4× wider than what current tooling emits |
 | variants | `legacy` = `cmd/schedsim/example.sim.yaml` (least-loaded top-1 scoring); `legacy_firstfit` = same minus the `score:` section (degenerates to near-first-fit, the pre-fix behavior documented in the real A/B report); plus the scenario profile matching the workload |
 | mode | `quality` (virtual clock, quality metrics) and `performance` (per-stage wall-clock timing) |
+| report metadata | every run's JSON report records `config.version` (git revision of the binary, `-dirty` when uncommitted) and `config.metric_sync_interval` (effective `scheduler.metric_update_timeout` in seconds) |
 
 `legacy_firstfit` exists because the real A/B report's "legacy" ran with zero
 scorers (its issue #3); the shipped sim example config already carries
@@ -200,6 +201,11 @@ consolidation; if node-level burst risk matters more than empty-node count,
   quality-mode P50 differences under ±10% should not be over-read. Balance,
   hit-rate and consolidation metrics are near-deterministic (CI ≪ 1%) and are
   the reliable signals.
+- **CI convention change**: schedsim compare used to render the sample
+  standard deviation, and this report's tables were computed with the
+  t(0.975, n−1) multiplier; the tooling now emits mean ± 1.96·s/√n (the
+  cube-bench compare convention), so freshly generated reports show ~1.4×
+  tighter intervals at n=5 than the tables here.
 - Performance mode measures the sim-side staged replica of `Select`. Its
   per-request total matches the quality-mode `sched_latency` within ~10%
   (same pipeline, minus the metrics hook), and placement-quality summaries of

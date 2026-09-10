@@ -22,9 +22,10 @@ sim 侧分阶段复刻实现），对比 legacy 调度配置与三个场景策�
 | 超卖 | cpu_ratio 3.0 / mem_ratio 2.0（overcommit 调优组除外） |
 | template_preload | 0.3（30% 节点预置每个模板的本地副本） |
 | allow_non_local_template | true（冷节点远程 restore 并升温本地缓存，对齐真机 A/B 的 fake-cubelet 行为模型） |
-| seed / 轮数 | 基准 seed 42，每变体 5 轮（seed 42–46）；95% 置信区间 = 均值 ± t(0.975, n−1)·s/√n |
+| seed / 轮数 | 基准 seed 42，每变体 5 轮（seed 42–46）；工具链 95% 置信区间 = 均值 ± 1.96·s/√n（与 cube-bench compare 对齐）——下文各表早于该改动，使用 t(0.975, n−1) 乘子，因此比当前工具产出的区间宽约 1.4 倍 |
 | 变体 | `legacy` = `cmd/schedsim/example.sim.yaml`（least-loaded top-1 打分）；`legacy_firstfit` = 同配置去掉 `score:` 段（退化为近似 first-fit，即真机 A/B 记录的修复前行为）；外加与负载匹配的场景策略 |
 | 模式 | `quality`（虚拟时钟、质量指标）与 `performance`（分阶段墙钟计时） |
+| 报告元数据 | 每次运行的 JSON 报告在 `config.version`（二进制的 git revision，有未提交改动时带 `-dirty` 后缀）与 `config.metric_sync_interval`（实际生效的 `scheduler.metric_update_timeout`，秒）记录代码版本与指标同步周期 |
 
 设置 `legacy_firstfit` 的原因：真机 A/B 报告里的 "legacy" 是在零 scorer 下
 运行的（该报告问题清单第 3 条）；而仓库自带的 sim 示例配置已带 least-loaded
@@ -180,6 +181,9 @@ first-fit 堆叠的模板命中率反而更高（0.668 vs 0.594）：集中放�
 - **n=5 的共享 4 vCPU 机器上延迟 CI 很宽**（P99 ±40–100%）；quality 模式 P50
   ±10% 以内的差异不应过度解读。均衡、命中率、装箱类指标接近确定（CI ≪ 1%），
   是可靠的结论依据。
+- **CI 口径变更**：schedsim compare 原先渲染的是样本标准差，且本报告各表用
+  t(0.975, n−1) 乘子计算；工具现已改为均值 ± 1.96·s/√n（cube-bench compare
+  口径），n=5 时新报告区间比下表窄约 1.4 倍。
 - performance 模式测量的是 sim 侧分阶段复刻的 `Select`：其逐请求 total 与
   quality 模式的 `sched_latency` 相差约 10%（同一流水线，少一个指标 hook），
   两种模式的放置质量摘要在 tie-break 噪声范围内一致。
