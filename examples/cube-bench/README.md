@@ -104,6 +104,9 @@ export CUBE_TEMPLATE_ID=<your-template-id>
 # Scheduled workload presets (Poisson arrivals + per-sandbox lifetimes)
 ./bin/cube-bench --workload burst -t <template-id>
 ./bin/cube-bench --workload template_storm -t <template-id> --seed 7
+# mixed_spec has a built-in 6:3:1 template pool (1C2G/2C4G/8C16G); pass
+# --templates to point it at real template IDs.
+./bin/cube-bench --workload mixed_spec
 ./bin/cube-bench --workload mixed_spec \
   --templates 'tpl-1c2g:6:1000:2048,tpl-2c4g:3:2000:4096,tpl-8c16g:1:8000:16384'
 
@@ -125,7 +128,7 @@ A preset only supplies flag **defaults** — any flag you pass explicitly wins
 |---|---|---|---|---|
 | `burst` | 500 | 50 | 10–120 | single (`-t`) |
 | `template_storm` | 300 | 30 | 30–90 | single (`-t`) |
-| `mixed_spec` | 400 | 10 | 30–300 | **requires `--templates`** with ≥2 entries, e.g. weights `6:3:1` for 1C2G/2C4G/8C16G |
+| `mixed_spec` | 400 | 10 | 30–300 | built-in `6:3:1` pool for 1C2G/2C4G/8C16G (`tpl-1c2g:6:1000:2048,tpl-2c4g:3:2000:4096,tpl-8c16g:1:8000:16384`); `--templates` overrides |
 
 In scheduled mode the whole request sequence is **pre-generated** from `--seed`
 (same seed ⇒ identical sequence): Poisson inter-arrival times

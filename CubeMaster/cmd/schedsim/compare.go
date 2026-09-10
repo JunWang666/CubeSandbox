@@ -30,6 +30,7 @@ type compareOptions struct {
 	TemplateSizeBytes     int64
 	Seed                  int64
 	Rounds                int
+	Mode                  string
 	Out                   string
 }
 
@@ -120,6 +121,7 @@ func runCompareMode(compareList string, opts compareOptions) error {
 			"--template-size-bytes", fmt.Sprint(opts.TemplateSizeBytes),
 			"--seed", fmt.Sprint(opts.Seed),
 			"--rounds", fmt.Sprint(opts.Rounds),
+			"--mode", opts.Mode,
 			"-o", jsonPath,
 		}
 		fmt.Fprintf(os.Stderr, "schedsim compare: running variant %q (%s)\n", name, cfgPath)

@@ -24,12 +24,38 @@ go build -o /tmp/schedsim ./cmd/schedsim
   --node-cpu-millis 64000 \            # 单节点 CPU 配额（毫核）
   --node-mem-mib 131072 \              # 单节点内存配额（MiB）
   --instance-type sim \                # 所有节点注册的 instance type
-  --template-preload 0.3 \             # 每个模板预置本地副本的节点比例
+  --template-preload 0.3 \             # 每个模板预置本地副本的节点比例（默认 0.3，
+                                       # 对齐 template_storm 实验口径：30% 节点预置）
   --template-size-bytes 1073741824 \   # 模拟模板尺寸（默认 1GiB；template_id 打分
                                        # 是布尔的：有副本=100/无副本=0，尺寸只进
                                        # image_id 因子的尺寸×副本比例记账）
   --seed 42 --rounds 3 \               # 第 i 轮 seed = seed+i
+  --mode quality \                     # quality（默认）| performance
   -o report.json                       # 缺省写 stdout（注意此时 stdout 前有 config 噪声）
+```
+
+## 运行模式（--mode）
+
+- **quality（默认）**：虚拟时钟 + 固定 seed，回答"新策略是否改善调度质量"，
+  结果稳定可复现。调度决策走真实的 `scheduler.Select`，只记录整次决策耗时
+  （`sched_latency_p50/p95/p99_ms`）。
+- **performance**：回答"新框架/策略/插件增加了多少运行开销"。每次调度决策改走
+  sim 侧的分阶段驱动（`pkg/scheduler/sim/perf.go`，逐阶段复刻
+  `scheduler.Select`：prefilter → 快照冻结 → guards → filter → score → pick，
+  含 backoff/no-candidate 语义，等价性由 `TestPerfModeMatchesQualityMode` 保证），
+  对每请求记录各阶段真实墙钟耗时；报告新增 `perf` 块：
+  各阶段（`prefilter/guards/filter/score/pick/total`）的 P50/P95/P99/均值、
+  本轮回放墙钟时长 `wall_seconds` 与决策吞吐 `throughput_rps`（请求数/墙钟秒，
+  即零排队下的调度核心吞吐）。跨轮聚合取各轮分位数的均值。
+  注意：performance 模式仍用虚拟时钟推进到达/到期事件（不 sleep），
+  "真实时钟"指对每次调度决策的墙钟测量，而非按 trace 速率实时 pacing。
+- compare 模式透传 `--mode`：所有变体同模式对比，报告追加
+  "Scheduling overhead" 分阶段耗时表与相对 baseline 的开销差。
+
+```bash
+schedsim --mode=performance \
+  --compare legacy=example.sim.yaml,burst=burst_balance.profiles.sim.yaml \
+  --trace /tmp/burst.trace.json --nodes 300 --rounds 3 -o perf-compare.md
 ```
 
 ## 多策略对比（--compare）

@@ -26,6 +26,9 @@ type ReportConfig struct {
 	AllowNonLocalTemplate bool    `json:"allow_non_local_template"`
 	TemplateSizeBytes     int64   `json:"template_size_bytes"`
 	Requests              int     `json:"requests"`
+	// Mode is "quality" (default) or "performance"; empty means quality for
+	// reports written before the flag existed.
+	Mode string `json:"mode,omitempty"`
 }
 
 // Report is the schedsim output document: run config, the cross-round mean
@@ -35,6 +38,9 @@ type Report struct {
 	Config  ReportConfig       `json:"config"`
 	Summary map[string]float64 `json:"summary"`
 	Rounds  []*RoundResult     `json:"rounds"`
+	// Perf is the cross-round performance aggregate, present only in
+	// performance mode. Stage percentiles are means of the per-round values.
+	Perf *PerfSummary `json:"perf,omitempty"`
 }
 
 // MeanSummary averages per-round summaries key by key. Only keys from

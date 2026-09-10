@@ -79,6 +79,10 @@ scheduler:
         - name: image_score
           type: go
           weight: 0.7
+        # 与出厂 template_reuse 对齐：同模板在途创建压力越小分越高
+        - name: template_local_pressure
+          type: go
+          weight: 0.2
 
         - name: real_time_weighted_average
           type: go
