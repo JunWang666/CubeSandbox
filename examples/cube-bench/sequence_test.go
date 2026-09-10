@@ -217,6 +217,34 @@ func TestApplyWorkloadPreset(t *testing.T) {
 	if cfg.Total != 400 || cfg.Rate != 10 || cfg.LifetimeMin != 30 || cfg.LifetimeMax != 300 {
 		t.Fatalf("mixed_spec preset not applied: %+v", cfg)
 	}
+	// The mixed_spec preset ships the built-in 6:3:1 template pool.
+	presetTemplates, err := parseTemplates(cfg.TemplatesRaw)
+	if err != nil {
+		t.Fatalf("mixed_spec preset templates unparseable: %v", err)
+	}
+	if len(presetTemplates) != 3 || presetTemplates[0].Weight != 6 || presetTemplates[1].Weight != 3 ||
+		presetTemplates[2].Weight != 1 || presetTemplates[0].CpuMillis != 1000 ||
+		presetTemplates[1].CpuMillis != 2000 || presetTemplates[2].CpuMillis != 8000 {
+		t.Fatalf("mixed_spec preset templates = %+v", presetTemplates)
+	}
+
+	// An explicit --templates still wins over the preset pool.
+	cfg = &Config{Workload: "mixed_spec", TemplatesRaw: "tpl-x:2:500:1024,tpl-y:1:1000:2048"}
+	if err := applyWorkloadPreset(cfg, map[string]bool{"templates": true}); err != nil {
+		t.Fatalf("applyWorkloadPreset: %v", err)
+	}
+	if cfg.TemplatesRaw != "tpl-x:2:500:1024,tpl-y:1:1000:2048" {
+		t.Fatalf("explicit --templates overridden by preset: %q", cfg.TemplatesRaw)
+	}
+	// An explicit -t keeps the single-template interpretation (mixed_spec
+	// validation in parseConfig rejects it downstream).
+	cfg = &Config{Workload: "mixed_spec"}
+	if err := applyWorkloadPreset(cfg, map[string]bool{"t": true}); err != nil {
+		t.Fatalf("applyWorkloadPreset: %v", err)
+	}
+	if cfg.TemplatesRaw != "" {
+		t.Fatalf("explicit -t must suppress the preset pool, got %q", cfg.TemplatesRaw)
+	}
 
 	if err := applyWorkloadPreset(&Config{Workload: "nope"}, map[string]bool{}); err == nil {
 		t.Fatal("unknown workload returned nil error")

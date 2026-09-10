@@ -37,12 +37,21 @@ type workloadPreset struct {
 	rate    float64
 	lifeMin float64 // seconds
 	lifeMax float64 // seconds
+	// templatesRaw is the preset default for --templates, in the same
+	// "id[:weight[:cpuMillis:memMiB]],..." syntax. Empty means the workload
+	// has no built-in template pool.
+	templatesRaw string
 }
 
 var workloadPresets = map[string]workloadPreset{
 	"burst":          {total: 500, rate: 50, lifeMin: 10, lifeMax: 120},
 	"template_storm": {total: 300, rate: 30, lifeMin: 30, lifeMax: 90},
-	"mixed_spec":     {total: 400, rate: 10, lifeMin: 30, lifeMax: 300},
+	// mixed_spec ships the design-doc template mix: 1C2G:2C4G:8C16G = 6:3:1.
+	// An explicit --templates (or -t/--template) still overrides it.
+	"mixed_spec": {
+		total: 400, rate: 10, lifeMin: 30, lifeMax: 300,
+		templatesRaw: "tpl-1c2g:6:1000:2048,tpl-2c4g:3:2000:4096,tpl-8c16g:1:8000:16384",
+	},
 }
 
 // applyWorkloadPreset fills cfg with preset defaults for flags the user did
@@ -60,6 +69,12 @@ func applyWorkloadPreset(cfg *Config, explicit map[string]bool) error {
 	}
 	if !explicit["lifetime"] {
 		cfg.LifetimeMin, cfg.LifetimeMax, cfg.hasLifetime = p.lifeMin, p.lifeMax, true
+	}
+	// The preset template pool only applies when the user gave no template
+	// input at all: --templates wins, and an explicit -t/--template keeps the
+	// legacy single-template interpretation (and its mixed_spec validation).
+	if p.templatesRaw != "" && !explicit["templates"] && !explicit["t"] && !explicit["template"] {
+		cfg.TemplatesRaw = p.templatesRaw
 	}
 	return nil
 }

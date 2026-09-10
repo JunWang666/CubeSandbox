@@ -136,10 +136,13 @@ func newClientFromConn(ctx context.Context, conf config.SchedulerProfilePluginCo
 	}
 	handshakeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	response, err := c.rpc.Handshake(handshakeCtx, &schedulerplugin.HandshakeRequest{
+	handshakeRequest := &schedulerplugin.HandshakeRequest{
 		ProtocolVersion: ProtocolVersion,
 		PluginName:      name,
-	})
+	}
+	handshakeStart := time.Now()
+	response, err := c.rpc.Handshake(handshakeCtx, handshakeRequest)
+	c.observeRPC(rpcMethodHandshake, handshakeStart, handshakeRequest, response, err)
 	if err != nil {
 		_ = connection.Close()
 		return nil, fmt.Errorf("external scheduler plugin %q handshake: %w", name, err)
@@ -192,7 +195,7 @@ func (c *client) reject(err error) error {
 // keep held across the following Filter/Score RPC: SnapshotVersion is unique
 // per scheduling attempt, so without that atomicity a concurrent request can
 // overwrite a single-slot plugin's snapshot between this sync and the query.
-func (c *client) syncSnapshotLocked(selection *selctx.SelectorCtx) error {
+func (c *client) syncSnapshotLocked(selection *selctx.SelectorCtx) (err error) {
 	if selection.SnapshotVersion == "" {
 		return errors.New("scheduler snapshot version is empty")
 	}
@@ -206,10 +209,12 @@ func (c *client) syncSnapshotLocked(selection *selctx.SelectorCtx) error {
 		request.Nodes = append(request.Nodes, snapshotNode(selection, candidate))
 	}
 	var response *schedulerplugin.SnapshotResponse
-	if err := c.call(selection.Ctx, func(ctx context.Context) error {
-		var err error
-		response, err = c.rpc.SyncSnapshot(ctx, request)
-		return err
+	rpcStart := time.Now()
+	defer func() { c.observeRPC(rpcMethodSyncSnapshot, rpcStart, request, response, err) }()
+	if err = c.call(selection.Ctx, func(ctx context.Context) error {
+		var rpcErr error
+		response, rpcErr = c.rpc.SyncSnapshot(ctx, request)
+		return rpcErr
 	}); err != nil {
 		return fmt.Errorf("external scheduler plugin %q sync snapshot: %w", c.name, err)
 	}
@@ -295,7 +300,7 @@ func NewFilter(ctx context.Context, conf config.SchedulerProfilePluginConf) (fil
 func (p *filterPlugin) ID() string   { return "filter/grpc/" + p.client.name }
 func (p *filterPlugin) Close() error { return p.client.Close() }
 
-func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (node.NodeList, error) {
+func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (result node.NodeList, err error) {
 	p.client.syncMu.Lock()
 	defer p.client.syncMu.Unlock()
 	if err := p.client.syncSnapshotLocked(selection); err != nil {
@@ -312,10 +317,12 @@ func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (node.NodeList, err
 		CandidateIds:    ids,
 	}
 	var response *schedulerplugin.FilterResponse
-	if err := p.client.call(selection.Ctx, func(ctx context.Context) error {
-		var err error
-		response, err = p.client.rpc.Filter(ctx, request)
-		return err
+	rpcStart := time.Now()
+	defer func() { p.client.observeRPC(rpcMethodFilter, rpcStart, request, response, err) }()
+	if err = p.client.call(selection.Ctx, func(ctx context.Context) error {
+		var rpcErr error
+		response, rpcErr = p.client.rpc.Filter(ctx, request)
+		return rpcErr
 	}); err != nil {
 		return nil, fmt.Errorf("external scheduler filter %q: %w", p.client.name, err)
 	}
@@ -332,7 +339,7 @@ func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (node.NodeList, err
 		}
 		kept[id] = struct{}{}
 	}
-	result := make(node.NodeList, 0, len(kept))
+	result = make(node.NodeList, 0, len(kept))
 	for _, candidate := range candidates {
 		if _, ok := kept[candidate.ID()]; ok {
 			result = append(result, candidate)
@@ -364,7 +371,7 @@ func (p *scorePlugin) Weight() float64 { return p.weight }
 func (p *scorePlugin) Disable() bool   { return false }
 func (p *scorePlugin) Close() error    { return p.client.Close() }
 
-func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (node.NodeScoreList, error) {
+func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (result node.NodeScoreList, err error) {
 	p.client.syncMu.Lock()
 	defer p.client.syncMu.Unlock()
 	if err := p.client.syncSnapshotLocked(selection); err != nil {
@@ -381,10 +388,12 @@ func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (node.NodeScoreList,
 		CandidateIds:    ids,
 	}
 	var response *schedulerplugin.ScoreResponse
-	if err := p.client.call(selection.Ctx, func(ctx context.Context) error {
-		var err error
-		response, err = p.client.rpc.Score(ctx, request)
-		return err
+	rpcStart := time.Now()
+	defer func() { p.client.observeRPC(rpcMethodScore, rpcStart, request, response, err) }()
+	if err = p.client.call(selection.Ctx, func(ctx context.Context) error {
+		var rpcErr error
+		response, rpcErr = p.client.rpc.Score(ctx, request)
+		return rpcErr
 	}); err != nil {
 		return nil, fmt.Errorf("external scheduler score %q: %w", p.client.name, err)
 	}
@@ -408,7 +417,7 @@ func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (node.NodeScoreList,
 	if len(values) != len(candidates) {
 		return nil, p.client.reject(fmt.Errorf("external scheduler score %q returned %d scores for %d candidates", p.client.name, len(values), len(candidates)))
 	}
-	result := make(node.NodeScoreList, 0, len(candidates))
+	result = make(node.NodeScoreList, 0, len(candidates))
 	for _, candidate := range candidates {
 		result = append(result, &node.NodeScore{
 			InsID: candidate.ID(), Score: values[candidate.ID()], MvmNum: candidate.MvmNum, OrigNode: candidate,

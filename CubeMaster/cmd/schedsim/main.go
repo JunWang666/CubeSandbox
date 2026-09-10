@@ -42,11 +42,12 @@ func main() {
 		nodeCPUMilli          = flag.Int64("node-cpu-millis", 64000, "per-node cpu quota in millicores")
 		nodeMemMiB            = flag.Int64("node-mem-mib", 131072, "per-node memory quota in MiB")
 		instanceType          = flag.String("instance-type", "sim", "instance type all sim nodes register under")
-		preload               = flag.Float64("template-preload", 1.0, "fraction of nodes preloaded with a local replica of each template")
+		preload               = flag.Float64("template-preload", 0.3, "fraction of nodes preloaded with a local replica of each template")
 		allowNonLocalTemplate = flag.Bool("allow-non-local-template", false, "allow template requests to use nodes without a local replica")
 		templateSizeBytes     = flag.Int64("template-size-bytes", 1<<30, "simulated size in bytes of each preloaded template; template_id scoring is boolean (cached=100/0) so size only feeds image_id factor accounting")
 		seed                  = flag.Int64("seed", 42, "base seed; round i uses seed+i")
 		rounds                = flag.Int("rounds", 1, "number of simulation rounds")
+		mode                  = flag.String("mode", "quality", "run mode: quality (virtual clock, scheduling-quality metrics) | performance (staged wall-clock timing of every scheduling decision + throughput)")
 		out                   = flag.String("o", "", "report output path (default: stdout)")
 	)
 	flag.Parse()
@@ -58,6 +59,10 @@ func main() {
 	}
 	if *rounds <= 0 {
 		fmt.Fprintln(os.Stderr, "schedsim: --rounds must be > 0")
+		os.Exit(2)
+	}
+	if *mode != "quality" && *mode != "performance" {
+		fmt.Fprintf(os.Stderr, "schedsim: --mode must be quality or performance, got %q\n", *mode)
 		os.Exit(2)
 	}
 
@@ -77,6 +82,7 @@ func main() {
 			Preload:               *preload,
 			Seed:                  *seed,
 			Rounds:                *rounds,
+			Mode:                  *mode,
 			Out:                   *out,
 			AllowNonLocalTemplate: *allowNonLocalTemplate,
 			TemplateSizeBytes:     *templateSizeBytes,
@@ -101,6 +107,7 @@ func main() {
 		*templateSizeBytes,
 		*seed,
 		*rounds,
+		*mode,
 		*out,
 	)
 }
@@ -117,6 +124,7 @@ func runSingle(
 	templateSizeBytes int64,
 	seed int64,
 	rounds int,
+	mode string,
 	out string,
 ) {
 	ctx := context.Background()
@@ -157,6 +165,7 @@ func runSingle(
 			TemplatePreload:       preload,
 			Seed:                  roundSeed,
 			RoundID:               i,
+			Perf:                  mode == "performance",
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "schedsim: round %d: %v\n", i, err)
@@ -165,6 +174,10 @@ func runSingle(
 		results = append(results, rr)
 		fmt.Fprintf(os.Stderr, "schedsim: round %d (seed %d): success_rate=%.4f cpu_alloc_rate=%.4f template_hit_rate=%.4f\n",
 			i, roundSeed, rr.Summary["success_rate"], rr.Summary["cpu_alloc_rate"], rr.Summary["template_hit_rate"])
+		if rr.Perf != nil {
+			fmt.Fprintf(os.Stderr, "schedsim: round %d perf: total_p50=%.3fms total_p99=%.3fms throughput=%.0f decisions/s\n",
+				i, rr.Perf.Stages["total"].P50Ms, rr.Perf.Stages["total"].P99Ms, rr.Perf.ThroughputRPS)
+		}
 	}
 
 	rep := &sim.Report{
@@ -182,9 +195,13 @@ func runSingle(
 			AllowNonLocalTemplate: allowNonLocalTemplate,
 			TemplateSizeBytes:     templateSizeBytes,
 			Requests:              len(trace.Requests),
+			Mode:                  mode,
 		},
 		Summary: sim.MeanSummary(results),
 		Rounds:  results,
+	}
+	if mode == "performance" {
+		rep.Perf = sim.AggregatePerf(results, len(trace.Requests))
 	}
 	if err := sim.WriteReport(out, rep); err != nil {
 		fmt.Fprintf(os.Stderr, "schedsim: %v\n", err)

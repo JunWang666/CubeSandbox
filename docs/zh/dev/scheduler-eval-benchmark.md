@@ -3,6 +3,15 @@
 > 分支：`feat/scheduler-eval-plugin`（含调度插件系统、场景 Profile、schedsim、cube-bench 改造）
 > 日期：2026-09-07 ｜ 环境：单台 96C/246G 开发机上的真实控制面 + 模拟数据面
 
+> **⚠ 时效说明（2026-09-09）。** 下文 A/B 数据测量于 **`selection.method: spread`
+> 修复之前**（修复见 `93f2f457`）：当时 `spread` 是静默 no-op、等价于 `random`
+> （即本报告问题清单第 1 条），三个场景 Profile 都没有真正执行其声明的选择语义；
+> 且 legacy 侧以零 scorer 编译，退化为近似 first-fit 堆叠（第 3 条）。阅读下文时请把
+> "legacy" 理解为*无打分的 first-fit*，把各 Profile 的放置理解为*有打分但 top_n 内
+> 近似随机*。修复后的复测结论见文末
+> [spread 修复后的复测（2026-09-09）](#spread-修复后的复测-2026-09-09)，完整数据见
+> [调度仿真评测报告](./scheduler-sim-report)。
+
 本文记录对调度策略 Profile 的一次**真实控制面** A/B 实测：除数据面（Cubelet）为模拟外，全部组件为真实进程——真实编译的 CubeMaster / CubeAPI（Rust）二进制、MariaDB、Redis，以及真实的 cube-bench 压测流量。本报告是验收标准 6（默认策略 vs 新策略的量化对比）的实证材料。
 
 ## 测试拓扑与保真度
@@ -58,9 +67,27 @@ cube-bench ──HTTP──▶ CubeAPI(:3000) ──HTTP──▶ CubeMaster(:80
 2. **缺少 `scheduler.score.plugin_conf.<scorer>` 时 Profile 编译在启动期 panic**（`imagescore.go:37-38`、`realtimescore.go:27-28`、`multifactorscore.go:23-24`），而非给出配置校验错误；sim 示例 yaml 也未写明 `score:` 块是必需的。
 3. **legacy 默认流水线在无 `score:` 配置时编译出零 scorer**，配合 `priority_select_num=1` 退化为近似确定性 first-fit，导致极端堆叠（238/节点）。
 
+## spread 修复后的复测（2026-09-09）
+
+`spread` 选择语义已修复（`schedule.go` `spreadSelect`），sim 基线已带 least-loaded
+打分，本矩阵在 schedsim 中复跑（相同 workload 预设与 trace 参数，300 个模拟节点，
+30% 模板预置 + 远程 restore 升温模型，seed 42–46，quality + performance 两种模式）。
+完整数据见[调度仿真评测报告](./scheduler-sim-report)。对上文物结论的修正要点：
+
+| 对照（300 节点，5 seed 均值） | 旧结论（spread 失效时） | 修复后 sim 结果 |
+| --- | --- | --- |
+| burst：legacy vs burst_balance | 新策略"摊得更开，延迟 +84%" | 相对*带打分的* legacy 放置中性（Jain 均 0.567、命中率均 0.594、成功率 1.0）。相对真正无打分的 first-fit legacy，摊平才是主要收益：Jain 0.418→0.567、羊群度 1.3%→0.4%、CV −21%。旧 legacy 的优势来自零 scorer 堆叠，不是真实策略效果。 |
+| template_storm：legacy vs template_reuse | "决策命中率升了，真实延迟却差 34%" | 修复后决策质量没有歧义：template_hit_rate = 1.000，legacy 0.324 / first-fit 0.573——locality 打分完全达到设计目标。代价是负载集中在副本节点上（Jain 0.243、活跃节点 78/300），这是本地化与均衡的预期取舍。旧报告的延迟回退是否在真实数据面仍存在，取决于 restore 成本，需要在真机上复测。 |
+| mixed_spec：legacy vs mixed_binpack | "名义装箱，实际最分散（37/50 节点）" | 有了真 spread 语义后装箱器确实装箱：活跃节点 7.26/300（legacy 165.5），template_hit 0.956，成功率 1.0，碎片率 0（集群分配率仅 ~2.3%）。代价：羊群度 16%、决策 P99 +63%（1.56→2.54 ms）。旧报告"装箱打分不敏感"的观察是 spread no-op 的假象，不是 `resource_fit_score` 的问题。 |
+
+框架开销的直接测量（performance 模式，分阶段墙钟计时）：Profile 流水线新增强制
+guards 阶段（P50 约 0.09ms），但省去了 legacy 的可选 filter 阶段（约 0.06ms）；
+决策总成本净增 +3%…+13%（P50），各阶段中 prefilter 候选枚举始终占大头（约 65%）。
+4 vCPU 机器上调度核心吞吐约 1.0–1.4k 次决策/秒/进程，P99 全程个位数毫秒。
+
 ## 后续实验建议
 
-- 实现真正的 `spread` 语义（或改用 `method: highest`）后复跑本矩阵，分离"spread 失效"与"装箱打分在 overcommit 下不敏感"两个因素；
+- ~~实现真正的 `spread` 语义（或改用 `method: highest`）后复跑本矩阵~~ —— **已完成**（`93f2f457`），sim 复测见上。真机集群上复跑同一矩阵仍待做：延迟轴需要真机验证（fake 的 800ms 冷启动模型与放置宽度存在耦合）；
 - fake 负载指标与占用率联动（使 `node_safety` 生效）后复跑，观察 legacy 堆叠行为被约束后的对比；
 - 每组 3 次重复以量化惊群方差（本次同配置复跑 miss 数在 52–102 间波动，方向稳定）。
 

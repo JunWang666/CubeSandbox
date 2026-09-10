@@ -348,6 +348,8 @@ export default withMermaid(defineConfig({
                 { text: 'Overview', link: '/dev/' },
                 { text: 'Redis Key Convention', link: '/dev/redis-key-spec' },
                 { text: 'Scheduler Eval Benchmark', link: '/dev/scheduler-eval-benchmark' },
+                { text: 'Scheduler Sim Report', link: '/dev/scheduler-sim-report' },
+                { text: 'Scheduler Strategy Mapping', link: '/dev/scheduler-strategy-mapping' },
                 { text: 'Factory Profiles Load Test', link: '/dev/scheduler-factory-loadtest' }
               ]
             }
@@ -562,6 +564,8 @@ export default withMermaid(defineConfig({
                 { text: '概览', link: '/zh/dev/' },
                 { text: 'Redis Key 命名规范', link: '/zh/dev/redis-key-spec' },
                 { text: '调度策略基准报告', link: '/zh/dev/scheduler-eval-benchmark' },
+                { text: '调度仿真评测报告', link: '/zh/dev/scheduler-sim-report' },
+                { text: '调度策略与指标映射', link: '/zh/dev/scheduler-strategy-mapping' },
                 { text: '出厂策略负载压测报告', link: '/zh/dev/scheduler-factory-loadtest' }
               ]
             }
