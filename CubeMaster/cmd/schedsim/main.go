@@ -139,10 +139,16 @@ func runSingle(
 		os.Exit(1)
 	}
 
-	if sc := config.GetConfig().Scheduler; sc != nil && sc.MetricUpdateTimeout < time.Hour {
-		fmt.Fprintf(os.Stderr, "schedsim: note: scheduler.metric_update_timeout=%v is short; the sim refreshes "+
-			"node metrics on every placement, but a large value (e.g. 86400s) is recommended for slow machines\n",
-			sc.MetricUpdateTimeout)
+	// The effective metric_update_timeout (defaults applied by config.Init) is
+	// recorded into the report config as the metric sync interval.
+	var metricSyncInterval float64
+	if sc := config.GetConfig().Scheduler; sc != nil {
+		metricSyncInterval = sc.MetricUpdateTimeout.Seconds()
+		if sc.MetricUpdateTimeout < time.Hour {
+			fmt.Fprintf(os.Stderr, "schedsim: note: scheduler.metric_update_timeout=%v is short; the sim refreshes "+
+				"node metrics on every placement, but a large value (e.g. 86400s) is recommended for slow machines\n",
+				sc.MetricUpdateTimeout)
+		}
 	}
 
 	trace, err := sim.LoadTrace(tracePath)
@@ -196,6 +202,8 @@ func runSingle(
 			TemplateSizeBytes:     templateSizeBytes,
 			Requests:              len(trace.Requests),
 			Mode:                  mode,
+			Version:               sim.BuildVersion(),
+			MetricSyncInterval:    metricSyncInterval,
 		},
 		Summary: sim.MeanSummary(results),
 		Rounds:  results,
