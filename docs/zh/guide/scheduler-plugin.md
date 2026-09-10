@@ -36,6 +36,8 @@ scheduler:
 
 自定义 Profile 固定执行 `node_safety`、`cpu`、`mem`、`disk`、`template_locality` 和 `realtime_create_num` Guards，配置不能关闭或重复声明这些安全约束。其中 `node_safety` 会在正常路径和 backoff 路径检查健康度、指标新鲜度、MVM 上限及 CPU load 合法性。
 
+选定节点后，CubeMaster 会重读该节点并原子预留本次请求的 CPU、内存配额、一个 MVM 槽位和一个创建并发槽位，避免并发创建在节点指标更新前反复落到同一节点。预留冲突会换节点有限重选；Cubelet 创建调用返回后（无论成功或失败）即释放预留，成功场景由下一次节点指标上报接管记账。多 CubeMaster 副本通过按节点的 Redis 计数协调预留，Redis 不可用时退化为本地预留。本副本持有的在途预留数以 `node.reserved` 暴露给插件。
+
 ## 插件类型
 
 - `go`（默认）：编译进 CubeMaster，通过统一 Registry 按名称注册。
@@ -58,7 +60,7 @@ CEL 提供基于版本化 protobuf 的强类型只读对象 `node` 与 `request`
           circuit_breaker_cooldown: 30s
 ```
 
-协议位于 `CubeMaster/api/services/schedulerplugin/v1/plugin.proto`。调用顺序为 `Handshake`、`SyncSnapshot`，再批量调用 `Filter` 或 `Score`。每次调度尝试都会生成新的快照版本，且并发请求会交错调用，因此插件服务端必须按 `snapshot_version` 键存快照（并设置淘汰上限），不能只保留单个"最新"槽位。生产环境建议使用 Unix Domain Socket。可运行示例位于 `CubeMaster/examples/scheduler-plugin`：
+协议位于 `pkgs/proto/services/schedulerplugin/v1/plugin.proto`。调用顺序为 `Handshake`、`SyncSnapshot`，再批量调用 `Filter` 或 `Score`。每次调度尝试都会生成新的快照版本，且并发请求会交错调用，因此插件服务端必须按 `snapshot_version` 键存快照（并设置淘汰上限），不能只保留单个"最新"槽位。生产环境建议使用 Unix Domain Socket。可运行示例位于 `CubeMaster/examples/scheduler-plugin`：
 
 ```bash
 cd CubeMaster
