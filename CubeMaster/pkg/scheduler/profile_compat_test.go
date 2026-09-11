@@ -99,7 +99,7 @@ func compatNodes() node.NodeList {
 			Healthy: true, MvmNum: int64(i * 3),
 			CpuTotal: 64000, CpuLoadUsage: float64(1000 * (i + 1)),
 			QuotaCpu: 64000, QuotaCpuUsage: int64(8000 * (i + 1)),
-			CpuUtil: float64(10 * (i + 1)),
+			CpuUtil:  float64(10 * (i + 1)),
 			QuotaMem: 131072, QuotaMemUsage: int64(8192 * (i + 1)),
 			MemMBTotal: 131072, MemUsage: int64(8192 * (i + 1)),
 			StorageDiskUsagePer: 10, SysDiskUsagePer: 10, DataDiskUsagePer: 10,
