@@ -143,8 +143,8 @@ var (
 
 	// clusterQuotaGauge exposes summed cluster resources: allocated is the raw
 	// accounted usage (never EffectiveAllocated — it collapses to 0 under
-	// ignore_redis_allocation), capacity is the overcommitted quota
-	// (quota * overcommit_ratio). cpu in millicores, mem in MB.
+	// ignore_redis_allocation), capacity is the raw node-reported quota.
+	// cpu is reported in millicores and mem in MB.
 	clusterQuotaGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "scheduler_cluster_quota",
 		Help: "Summed cluster quota seen by the scheduler (cpu in millicores, mem in MB), by resource and type (allocated/capacity).",
@@ -382,18 +382,18 @@ type nodeResourceStat struct {
 	mvmNum        int64
 }
 
-// nodeCapacityFunc resolves one node's overcommitted schedulable capacity and
+// nodeCapacityFunc resolves one node's schedulable capacity and
 // its raw allocated usage, in cpu millicores / mem MB. The allocated side must
 // stay the raw accounted usage: EffectiveAllocated collapses to 0 under
 // ignore_redis_allocation, which would silently zero the quota gauge, the
 // node load CV and the fragmentation ratio.
 type nodeCapacityFunc func(n nodeResourceStat) (cpuCapMilli, memCapMB, cpuAllocMilli, memAllocMB int64)
 
-// observedNodeCapacity applies the overcommit ratio to capacity but reports
-// the raw allocated usage, per the metrics definition (design doc §3.1).
-func observedNodeCapacity(cfg *config.WrapperSchedulerConf, n nodeResourceStat) (int64, int64, int64, int64) {
-	return cfg.EffectiveQuotaCpu(n.instanceType, n.quotaCpuMilli),
-		cfg.EffectiveQuotaMem(n.instanceType, n.quotaMemMB),
+// observedNodeCapacity reports raw node quota and raw allocated usage, matching
+// the scheduler's post-overcommit-removal capacity semantics.
+func observedNodeCapacity(n nodeResourceStat) (int64, int64, int64, int64) {
+	return n.quotaCpuMilli,
+		n.quotaMemMB,
 		n.cpuUsageMilli,
 		n.memUsageMB
 }
@@ -505,7 +505,7 @@ func countActiveEmptyNodes(nodes []nodeResourceStat) (active, empty int) {
 
 // fragmentedCapacityRatio measures how much free capacity is stranded on
 // nodes that cannot fit the reference shape: per node, free = max(0,
-// overcommitted capacity - accounted allocation); a node whose free cpu OR
+// reported capacity - accounted allocation); a node whose free cpu OR
 // free mem is below the shape counts as unfit, and its free resources count
 // as fragmented. The result is the mean of the cpu and mem fragmented ratios,
 // in [0,1]; a resource whose cluster-wide free total is 0 contributes 0.
@@ -599,9 +599,7 @@ func collectClusterGauges() {
 			mvmNum:        n.MvmNum,
 		})
 	}
-	capFn := func(n nodeResourceStat) (int64, int64, int64, int64) {
-		return observedNodeCapacity(cfg.Scheduler, n)
-	}
+	capFn := observedNodeCapacity
 
 	quota := sumClusterQuota(stats, capFn)
 	clusterQuotaGauge.WithLabelValues(resourceLabelCPU, quotaTypeAllocated).Set(quota.cpuAllocated)

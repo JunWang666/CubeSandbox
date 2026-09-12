@@ -114,12 +114,11 @@ func TestTryReserveNodeLocalOnly(t *testing.T) {
 		t.Fatalf("registry amount=%+v", amount)
 	}
 
-	// CPU: effective quota is 64000*3=192000, 1000 already reserved, asking
-	// for 200000 must conflict.
+	// CPU: raw quota is 64000, so asking for 200000 must conflict.
 	if _, err := TryReserveNode(ctx, "node-r1", 200000, 1024); !errors.Is(err, ErrNodeReservationConflict) {
 		t.Fatalf("cpu over-commit err=%v, want ErrNodeReservationConflict", err)
 	}
-	// Memory: effective quota is 65536*2=131072.
+	// Memory: raw quota is 65536.
 	if _, err := TryReserveNode(ctx, "node-r1", 1000, 200000); !errors.Is(err, ErrNodeReservationConflict) {
 		t.Fatalf("mem over-commit err=%v, want ErrNodeReservationConflict", err)
 	}
@@ -136,9 +135,9 @@ func TestTryReserveNodeLocalOnly(t *testing.T) {
 	if got := cachedReservedNum(t, "node-r1"); got != 0 {
 		t.Fatalf("ReservedNum=%d want 0 after release", got)
 	}
-	if _, err := TryReserveNode(ctx, "node-r1", 191500, 1024); err != nil {
-		// 191500 only fits if the released 1000 milli-cores were actually
-		// returned (free is 192000, would be 191000 on a leak).
+	if _, err := TryReserveNode(ctx, "node-r1", 63500, 1024); err != nil {
+		// 63500 only fits if the released 1000 milli-cores were actually
+		// returned (free is 64000, would be 63000 on a leak).
 		t.Fatalf("reservation after release should succeed: %v", err)
 	}
 }

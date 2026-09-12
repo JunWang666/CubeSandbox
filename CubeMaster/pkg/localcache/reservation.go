@@ -196,12 +196,12 @@ func TryReserveNode(ctx context.Context, nodeID string, cpuMilli, memMB int64) (
 // The comparisons stay one request stricter than the filters (free must
 // exceed the request, matching cpufilter/memfilter).
 func checkReservationCapacity(sconf *config.SchedulerConf, n *node.Node, local *nodeReservationAmount, cpuMilli, memMB int64) error {
-	cpuFree := sconf.EffectiveQuotaCpu(n.InstanceType, n.QuotaCpu) -
+	cpuFree := n.QuotaCpu -
 		sconf.EffectiveAllocated(n.QuotaCpuUsage) - local.cpuMilli
 	if cpuFree <= cpuMilli {
 		return fmt.Errorf("%w: node %s cpu free %d, want > %d", ErrNodeReservationConflict, n.ID(), cpuFree, cpuMilli)
 	}
-	memFree := sconf.EffectiveQuotaMem(n.InstanceType, n.QuotaMem) -
+	memFree := n.QuotaMem -
 		sconf.EffectiveAllocated(n.QuotaMemUsage) - local.memMB
 	if memFree <= memMB {
 		return fmt.Errorf("%w: node %s mem free %d, want > %d", ErrNodeReservationConflict, n.ID(), memFree, memMB)
@@ -273,8 +273,8 @@ var reservationRedisConn = wrapredis.GetRedis
 // same Hash and the script rejects whatever would overshoot capacity.
 func redisAcquireReservation(ctx context.Context, n *node.Node, cpuMilli, memMB int64) (bool, error) {
 	sconf := &config.GetConfig().Scheduler.SchedulerConf
-	maxCpu := sconf.EffectiveQuotaCpu(n.InstanceType, n.QuotaCpu) - sconf.EffectiveAllocated(n.QuotaCpuUsage)
-	maxMem := sconf.EffectiveQuotaMem(n.InstanceType, n.QuotaMem) - sconf.EffectiveAllocated(n.QuotaMemUsage)
+	maxCpu := n.QuotaCpu - sconf.EffectiveAllocated(n.QuotaCpuUsage)
+	maxMem := n.QuotaMem - sconf.EffectiveAllocated(n.QuotaMemUsage)
 	maxMvm := RealMaxMvmLimit(n) - n.MvmNum
 	maxCreating := CreateConcurrentLimit(n) - n.RealTimeCreateNum
 	result, err := redis.Int(reservationRedisConn().Do("EVAL", reservationAcquireScript, 1,

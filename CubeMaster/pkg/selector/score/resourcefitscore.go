@@ -186,18 +186,12 @@ func (l *resourceFitScore) Select(
 			)
 		}
 
-		cpuCapacity := cfg.Scheduler.EffectiveQuotaCpu(
-			currentNode.InstanceType,
-			currentNode.QuotaCpu,
-		)
+		cpuCapacity := currentNode.QuotaCpu
 		cpuUsed := cfg.Scheduler.EffectiveAllocated(
 			currentNode.QuotaCpuUsage,
 		)
 
-		memCapacity := cfg.Scheduler.EffectiveQuotaMem(
-			currentNode.InstanceType,
-			currentNode.QuotaMem,
-		)
+		memCapacity := currentNode.QuotaMem
 		memUsed := cfg.Scheduler.EffectiveAllocated(
 			currentNode.QuotaMemUsage,
 		)

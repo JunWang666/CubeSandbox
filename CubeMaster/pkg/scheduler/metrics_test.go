@@ -263,19 +263,11 @@ func TestProfileNameOf(t *testing.T) {
 	}
 }
 
-func TestObservedNodeCapacityUsesRawAllocated(t *testing.T) {
-	ignore := true
-	cfg := &config.WrapperSchedulerConf{SchedulerConf: config.SchedulerConf{
-		IgnoreRedisAllocation: &ignore,
-		OvercommitRatio:       &config.OvercommitRatioConf{CPURatio: 3, MemRatio: 2},
-	}}
+func TestObservedNodeCapacityUsesRawQuotaAndAllocated(t *testing.T) {
 	n := nodeResourceStat{quotaCpuMilli: 1000, quotaMemMB: 2048, cpuUsageMilli: 400, memUsageMB: 512}
-	cpuCap, memCap, cpuAlloc, memAlloc := observedNodeCapacity(cfg, n)
-	// Capacity keeps the overcommit ratio; allocated must stay the raw
-	// accounted usage even when ignore_redis_allocation is on, otherwise the
-	// quota gauge, node load CV and fragmentation ratio all collapse to 0.
-	if cpuCap != 3000 || memCap != 4096 {
-		t.Fatalf("capacity = (%v, %v), want (3000, 4096)", cpuCap, memCap)
+	cpuCap, memCap, cpuAlloc, memAlloc := observedNodeCapacity(n)
+	if cpuCap != 1000 || memCap != 2048 {
+		t.Fatalf("capacity = (%v, %v), want raw (1000, 2048)", cpuCap, memCap)
 	}
 	if cpuAlloc != 400 || memAlloc != 512 {
 		t.Fatalf("allocated = (%v, %v), want raw (400, 512)", cpuAlloc, memAlloc)

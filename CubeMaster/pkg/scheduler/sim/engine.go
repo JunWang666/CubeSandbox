@@ -535,15 +535,8 @@ func (e *engine) snapshot() Snapshot {
 	var usedCPU, usedMem, quotaCPU, quotaMem float64
 	var active float64
 
-	// Fragmentation is computed against the same effective (overcommit-aware)
-	// free CPU the cpu filter admits on.
-	cpuRatio := 1.0
-	if sc := config.GetConfig().Scheduler; sc != nil {
-		cpuRatio = sc.GetEffectiveOvercommitRatio(e.p.InstanceType).CPURatio
-		if cpuRatio <= 0 {
-			cpuRatio = 1.0
-		}
-	}
+	// Fragmentation is computed against the same raw-quota free CPU that the
+	// cpu filter admits on.
 
 	for _, ns := range e.nodeOrder {
 		usedCPU += float64(ns.usedCPUMilli)
@@ -552,7 +545,7 @@ func (e *engine) snapshot() Snapshot {
 		quotaMem += float64(ns.quotaMemMiB)
 		cpuRates = append(cpuRates, float64(ns.usedCPUMilli)/float64(ns.quotaCPUMilli))
 		memRates = append(memRates, float64(ns.usedMemMiB)/float64(ns.quotaMemMiB))
-		free := float64(ns.quotaCPUMilli)*cpuRatio - float64(ns.usedCPUMilli)
+		free := float64(ns.quotaCPUMilli) - float64(ns.usedCPUMilli)
 		if free < 0 {
 			free = 0
 		}
