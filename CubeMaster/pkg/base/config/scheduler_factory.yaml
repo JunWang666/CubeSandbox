@@ -26,8 +26,8 @@
 # The legacy `score` subtree below is NOT a pipeline definition: with profiles
 # present, compileLegacy never runs. It only feeds the factor weights that the
 # built-in scorers read from the global config at runtime
-# (pkg/selector/score/realtimescore.go, imagescore.go), and its plugin_conf
-# entries must exist because the scorer constructors panic without them.
+# (pkg/selector/score/realtimescore.go, imagescore.go); without it those
+# scorers stay no-ops because their enable_weight_factors live only here.
 
 scheduler:
   # Request labels allowed to affect profile routing.
