@@ -69,7 +69,6 @@ func TestExternalPluginRPCMetrics(t *testing.T) {
 	t.Cleanup(func() { _ = selector.Close() })
 
 	durationBefore := histogramSampleCount(t, grpcRPCDuration, "fake", rpcMethodFilter)
-	syncDurationBefore := histogramSampleCount(t, grpcRPCDuration, "fake", rpcMethodSyncSnapshot)
 	requestBytesBefore := testutil.ToFloat64(grpcRPCBytes.WithLabelValues("fake", rpcMethodFilter, rpcDirectionRequest))
 	responseBytesBefore := testutil.ToFloat64(grpcRPCBytes.WithLabelValues("fake", rpcMethodFilter, rpcDirectionResponse))
 	errorsBefore := testutil.ToFloat64(grpcRPCErrors.WithLabelValues("fake", rpcMethodFilter, rpcReasonError))
@@ -80,9 +79,6 @@ func TestExternalPluginRPCMetrics(t *testing.T) {
 	if got := histogramSampleCount(t, grpcRPCDuration, "fake", rpcMethodFilter); got != durationBefore+1 {
 		t.Fatalf("filter rpc duration count delta = %v, want 1", got-durationBefore)
 	}
-	if got := histogramSampleCount(t, grpcRPCDuration, "fake", rpcMethodSyncSnapshot); got != syncDurationBefore+1 {
-		t.Fatalf("sync snapshot rpc duration count delta = %v, want 1", got-syncDurationBefore)
-	}
 	if got := testutil.ToFloat64(grpcRPCBytes.WithLabelValues("fake", rpcMethodFilter, rpcDirectionRequest)); got <= requestBytesBefore {
 		t.Fatalf("filter request bytes delta = %v, want > 0", got-requestBytesBefore)
 	}
@@ -90,8 +86,8 @@ func TestExternalPluginRPCMetrics(t *testing.T) {
 		t.Fatalf("filter response bytes delta = %v, want > 0", got-responseBytesBefore)
 	}
 
-	// A failing RPC lands in the classified error bucket; the circuit breaker
-	// counts it, and the snapshot is already synced so only Filter is called.
+	// A failing RPC lands in the classified error bucket and the circuit
+	// breaker counts it.
 	server.mu.Lock()
 	server.failFilter = true
 	server.mu.Unlock()

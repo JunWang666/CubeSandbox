@@ -5,6 +5,10 @@
 // scheduler-plugin is a minimal external Filter+Score plugin example. It keeps
 // nodes with fewer than eight in-flight creates and scores lower CPU usage
 // higher. Run with SOCKET=/run/cube-scheduler-example.sock.
+//
+// The server is stateless: every Filter/Score request carries the frozen
+// candidate snapshot for its snapshot_version, so concurrent scheduling
+// attempts never contend on shared server-side state.
 package main
 
 import (
@@ -14,7 +18,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 
 	schedulerplugin "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/schedulerplugin/v1"
@@ -23,17 +26,8 @@ import (
 
 const protocolVersion = "v1"
 
-// maxSnapshots bounds how many snapshot versions are kept. The CubeMaster
-// client assigns a fresh version per scheduling attempt, and concurrent
-// attempts interleave SyncSnapshot with Filter/Score, so snapshots must be
-// keyed by version — a single "latest" slot corrupts in-flight requests.
-const maxSnapshots = 8
-
 type server struct {
 	schedulerplugin.UnimplementedSchedulerPluginServer
-	mu        sync.RWMutex
-	snapshots map[string]map[string]*schedulerplugin.SnapshotNode
-	order     []string // FIFO of snapshot versions for eviction
 }
 
 func (s *server) Handshake(_ context.Context, request *schedulerplugin.HandshakeRequest) (*schedulerplugin.HandshakeResponse, error) {
@@ -47,40 +41,16 @@ func (s *server) Handshake(_ context.Context, request *schedulerplugin.Handshake
 	}, nil
 }
 
-func (s *server) SyncSnapshot(_ context.Context, request *schedulerplugin.SnapshotRequest) (*schedulerplugin.SnapshotResponse, error) {
-	nodes := make(map[string]*schedulerplugin.SnapshotNode, len(request.GetNodes()))
-	for _, candidate := range request.GetNodes() {
+func snapshotIndex(snapshot []*schedulerplugin.SnapshotNode) map[string]*schedulerplugin.SnapshotNode {
+	nodes := make(map[string]*schedulerplugin.SnapshotNode, len(snapshot))
+	for _, candidate := range snapshot {
 		nodes[candidate.GetId()] = candidate
 	}
-	version := request.GetSnapshotVersion()
-	s.mu.Lock()
-	if _, exists := s.snapshots[version]; !exists {
-		s.order = append(s.order, version)
-		for len(s.order) > maxSnapshots {
-			delete(s.snapshots, s.order[0])
-			s.order = s.order[1:]
-		}
-	}
-	s.snapshots[version] = nodes
-	s.mu.Unlock()
-	return &schedulerplugin.SnapshotResponse{SnapshotVersion: version}, nil
-}
-
-func (s *server) snapshot(version string) (map[string]*schedulerplugin.SnapshotNode, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	nodes, ok := s.snapshots[version]
-	if !ok {
-		return nil, fmt.Errorf("snapshot %q is not synchronized or has been evicted", version)
-	}
-	return nodes, nil
+	return nodes
 }
 
 func (s *server) Filter(_ context.Context, request *schedulerplugin.FilterRequest) (*schedulerplugin.FilterResponse, error) {
-	nodes, err := s.snapshot(request.GetSnapshotVersion())
-	if err != nil {
-		return nil, err
-	}
+	nodes := snapshotIndex(request.GetSnapshot())
 	response := &schedulerplugin.FilterResponse{SnapshotVersion: request.GetSnapshotVersion()}
 	for _, id := range request.GetCandidateIds() {
 		candidate := nodes[id]
@@ -92,10 +62,7 @@ func (s *server) Filter(_ context.Context, request *schedulerplugin.FilterReques
 }
 
 func (s *server) Score(_ context.Context, request *schedulerplugin.ScoreRequest) (*schedulerplugin.ScoreResponse, error) {
-	nodes, err := s.snapshot(request.GetSnapshotVersion())
-	if err != nil {
-		return nil, err
-	}
+	nodes := snapshotIndex(request.GetSnapshot())
 	response := &schedulerplugin.ScoreResponse{SnapshotVersion: request.GetSnapshotVersion()}
 	for _, id := range request.GetCandidateIds() {
 		candidate := nodes[id]
@@ -124,9 +91,7 @@ func main() {
 		log.Fatalf("listen on %s: %v", socket, err)
 	}
 	grpcServer := grpc.NewServer()
-	schedulerplugin.RegisterSchedulerPluginServer(grpcServer, &server{
-		snapshots: make(map[string]map[string]*schedulerplugin.SnapshotNode),
-	})
+	schedulerplugin.RegisterSchedulerPluginServer(grpcServer, &server{})
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

@@ -7,12 +7,12 @@ package cube.schedulerplugin.v1;
 
 option go_package = "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/schedulerplugin/v1;schedulerplugin";
 
-// SchedulerPlugin is a versioned, batch-oriented extension API. Snapshot data
-// is synchronized independently; per-request calls carry only the snapshot
-// version, request context and candidate IDs.
+// SchedulerPlugin is a versioned, batch-oriented extension API. Every
+// Filter/Score request carries the full frozen candidate snapshot, so plugins
+// are stateless and concurrent scheduling attempts never serialize on a
+// shared server-side snapshot slot.
 service SchedulerPlugin {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
-  rpc SyncSnapshot(SnapshotRequest) returns (SnapshotResponse);
   rpc Filter(FilterRequest) returns (FilterResponse);
   rpc Score(ScoreRequest) returns (ScoreResponse);
 }
@@ -64,19 +64,11 @@ message SnapshotNode {
   int64 reserved = 24; // in-flight scheduling reservations held by this CubeMaster replica
 }
 
-message SnapshotRequest {
-  string snapshot_version = 1;
-  repeated SnapshotNode nodes = 2;
-}
-
-message SnapshotResponse {
-  string snapshot_version = 1;
-}
-
 message FilterRequest {
   string snapshot_version = 1;
   RequestContext request = 2;
   repeated string candidate_ids = 3;
+  repeated SnapshotNode snapshot = 4; // frozen candidate set for snapshot_version
 }
 
 message FilterResponse {
@@ -88,6 +80,7 @@ message ScoreRequest {
   string snapshot_version = 1;
   RequestContext request = 2;
   repeated string candidate_ids = 3;
+  repeated SnapshotNode snapshot = 4; // frozen candidate set for snapshot_version
 }
 
 message NodeScore {

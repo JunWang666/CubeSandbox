@@ -25,37 +25,40 @@ import (
 
 type fakeSchedulerPlugin struct {
 	schedulerplugin.UnimplementedSchedulerPluginServer
-	mu               sync.Mutex
-	lastSnapshot     string
-	strictSingleSlot bool
-	invalidFilter    bool
-	invalidScore     bool
-	failFilter       bool
+	mu                sync.Mutex
+	lastFilterVersion string
+	lastSnapshotSize  int
+	invalidFilter     bool
+	invalidScore      bool
+	failFilter        bool
 }
 
 func (f *fakeSchedulerPlugin) Handshake(context.Context, *schedulerplugin.HandshakeRequest) (*schedulerplugin.HandshakeResponse, error) {
 	return &schedulerplugin.HandshakeResponse{ProtocolVersion: ProtocolVersion, PluginName: "fake", Capabilities: []string{"filter", "score"}}, nil
 }
 
-func (f *fakeSchedulerPlugin) SyncSnapshot(_ context.Context, request *schedulerplugin.SnapshotRequest) (*schedulerplugin.SnapshotResponse, error) {
-	f.mu.Lock()
-	f.lastSnapshot = request.GetSnapshotVersion()
-	f.mu.Unlock()
-	return &schedulerplugin.SnapshotResponse{SnapshotVersion: request.GetSnapshotVersion()}, nil
-}
-
+// Filter behaves like a strict stateless plugin: every candidate must be
+// backed by the snapshot embedded in the same request. Any client that still
+// relied on a shared server-side snapshot slot would fail here whenever
+// concurrent attempts interleave.
 func (f *fakeSchedulerPlugin) Filter(_ context.Context, request *schedulerplugin.FilterRequest) (*schedulerplugin.FilterResponse, error) {
 	f.mu.Lock()
 	invalid := f.invalidFilter
 	fail := f.failFilter
-	strict := f.strictSingleSlot
-	lastSnapshot := f.lastSnapshot
+	f.lastFilterVersion = request.GetSnapshotVersion()
+	f.lastSnapshotSize = len(request.GetSnapshot())
 	f.mu.Unlock()
 	if fail {
 		return nil, status.Error(codes.Unavailable, "filter unavailable")
 	}
-	if strict && request.GetSnapshotVersion() != lastSnapshot {
-		return nil, status.Errorf(codes.FailedPrecondition, "snapshot %q is not synchronized", request.GetSnapshotVersion())
+	snapshot := make(map[string]struct{}, len(request.GetSnapshot()))
+	for _, candidate := range request.GetSnapshot() {
+		snapshot[candidate.GetId()] = struct{}{}
+	}
+	for _, id := range request.GetCandidateIds() {
+		if _, ok := snapshot[id]; !ok {
+			return nil, status.Errorf(codes.FailedPrecondition, "candidate %q missing from request snapshot", id)
+		}
 	}
 	if invalid {
 		return &schedulerplugin.FilterResponse{SnapshotVersion: request.GetSnapshotVersion(), KeptIds: []string{"not-a-candidate"}}, nil
@@ -111,7 +114,7 @@ func grpcSelection() *selctx.SelectorCtx {
 	return selection
 }
 
-func TestExternalFilterSynchronizesAndValidatesSnapshot(t *testing.T) {
+func TestExternalFilterCarriesSnapshotAndValidatesResult(t *testing.T) {
 	connection, server := startPluginServer(t)
 	client, err := newClientFromConn(context.Background(), config.SchedulerProfilePluginConf{
 		Name: "fake", Timeout: time.Second,
@@ -130,11 +133,15 @@ func TestExternalFilterSynchronizesAndValidatesSnapshot(t *testing.T) {
 		t.Fatalf("kept = %v", kept)
 	}
 	server.mu.Lock()
-	lastSnapshot := server.lastSnapshot
+	lastVersion := server.lastFilterVersion
+	snapshotSize := server.lastSnapshotSize
 	server.invalidFilter = true
 	server.mu.Unlock()
-	if lastSnapshot != selection.SnapshotVersion {
-		t.Fatalf("synced version = %q, want %q", lastSnapshot, selection.SnapshotVersion)
+	if lastVersion != selection.SnapshotVersion {
+		t.Fatalf("request version = %q, want %q", lastVersion, selection.SnapshotVersion)
+	}
+	if snapshotSize != 2 {
+		t.Fatalf("request snapshot size = %d, want 2", snapshotSize)
 	}
 	selection.FreezeSnapshot()
 	if _, err := selector.Select(selection); err == nil {
@@ -167,11 +174,8 @@ func TestExternalScoreRejectsOutOfRangeValues(t *testing.T) {
 	}
 }
 
-func TestExternalFilterSyncAndCallAreAtomicUnderConcurrency(t *testing.T) {
-	connection, server := startPluginServer(t)
-	server.mu.Lock()
-	server.strictSingleSlot = true
-	server.mu.Unlock()
+func TestExternalFilterConcurrentSelectsStayIsolated(t *testing.T) {
+	connection, _ := startPluginServer(t)
 	client, err := newClientFromConn(context.Background(), config.SchedulerProfilePluginConf{
 		Name: "fake", Timeout: time.Second,
 	}, "filter", connection)
@@ -181,9 +185,9 @@ func TestExternalFilterSyncAndCallAreAtomicUnderConcurrency(t *testing.T) {
 	selector := &filterPlugin{client: client}
 	t.Cleanup(func() { _ = selector.Close() })
 
-	// Each Select pushes a fresh snapshot version. With a strict single-slot
-	// server, any interleaving of SyncSnapshot and Filter across concurrent
-	// requests would fail; the client must keep sync+call atomic.
+	// Each Select uses a fresh snapshot version, and the strict server above
+	// rejects candidates that are not backed by the request's own snapshot.
+	// Concurrent attempts must not interfere with each other.
 	var wg sync.WaitGroup
 	errs := make(chan error, 32)
 	for i := 0; i < 32; i++ {
@@ -202,7 +206,7 @@ func TestExternalFilterSyncAndCallAreAtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
-func TestExternalFilterCircuitBreakerCountsFailuresAcrossSnapshotSync(t *testing.T) {
+func TestExternalFilterCircuitBreakerOpensAfterFailures(t *testing.T) {
 	connection, server := startPluginServer(t)
 	client, err := newClientFromConn(context.Background(), config.SchedulerProfilePluginConf{
 		Name: "fake", Timeout: time.Second, CircuitBreakerFailures: 2, CircuitBreakerCooldown: time.Minute,
