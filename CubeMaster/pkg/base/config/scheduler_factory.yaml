@@ -3,8 +3,9 @@
 # This file is compiled into the binary via go:embed (see schedulerFactoryYAML
 # in config.go) and injected by preHandleScheduler ONLY when the user has
 # configured nothing scheduler-policy related: no scheduler.profiles and no
-# legacy scheduler.filter / scheduler.score block. Any explicit scheduler
-# policy configuration replaces this file entirely (all-or-nothing).
+# legacy scheduler.filter / scheduler.score / scheduler.postscore block. Any
+# explicit scheduler policy configuration replaces this file entirely
+# (all-or-nothing).
 #
 # IMPORTANT: with this file injected, scheduling follows the three factory
 # profiles below (mandatory guards + factory scorers + spread selection); that

@@ -1085,8 +1085,8 @@ func preHandOverhead(config *Config) error {
 var schedulerFactoryYAML []byte
 
 // injectFactorySchedulerProfiles 在用户完全没有配置调度策略时注入出厂策略：
-// 要求 scheduler.profiles 与 legacy 的 scheduler.filter / scheduler.score 全部为空，
-// 且未显式设置 scheduler.disable_factory_profiles。
+// 要求 scheduler.profiles 与 legacy 的 scheduler.filter / scheduler.score /
+// scheduler.postscore 全部为空，且未显式设置 scheduler.disable_factory_profiles。
 // 一旦用户显式配置了其中任意一项，出厂策略整体不注入（all-or-nothing），
 // 避免覆盖存量部署依赖的 legacy 编译路径（profile.Compile 有 profiles 时忽略 legacy）。
 //
@@ -1100,7 +1100,7 @@ func injectFactorySchedulerProfiles(config *Config) error {
 			"keeping the legacy empty-config scheduling behavior")
 		return nil
 	}
-	if len(sched.Profiles) != 0 || sched.Filter != nil || sched.Score != nil {
+	if len(sched.Profiles) != 0 || sched.Filter != nil || sched.Score != nil || sched.PostScore != nil {
 		return nil
 	}
 	var factory struct {
@@ -1127,7 +1127,7 @@ func injectFactorySchedulerProfiles(config *Config) error {
 	}
 	// 注入出厂策略会改变空配置部署的放置行为（此前是"无过滤、无评分、随机选"），
 	// 必须显式告知运维，避免升级后策略静默切换。
-	CubeLog.Warnf("no scheduler policy configured (scheduler.profiles/filter/score all empty); "+
+	CubeLog.Warnf("no scheduler policy configured (scheduler.profiles/filter/score/postscore all empty); "+
 		"injecting factory scheduler profiles %v: placement now follows mandatory guards + factory scorers + spread selection, "+
 		"which differs from the legacy empty-config behavior; set scheduler.disable_factory_profiles: true "+
 		"or configure any of those keys explicitly to keep legacy scheduling", names)

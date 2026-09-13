@@ -252,7 +252,12 @@ func (c *createSandboxContext) handleCubelet() {
 		// Reserve CPU / memory / MVM / create-concurrency slots on the
 		// selected node so concurrent creates stop piling onto the same
 		// node before Cubelet metrics catch up. A conflict marks the node
-		// bad and reselects, a bounded number of times.
+		// bad and reselects, a bounded number of times, with a short
+		// exponential backoff in between: the conflicting state is another
+		// in-flight create that typically clears within hundreds of
+		// milliseconds, so backing off lets a burst degrade into queueing
+		// instead of re-conflicting on the same stale view and burning the
+		// conflict budget within microseconds.
 		if err := c.reserveSelectedHost(); err != nil {
 			if c.directHost {
 				status, _ := ret.FromError(err)
@@ -272,6 +277,15 @@ func (c *createSandboxContext) handleCubelet() {
 			}
 			log.G(c.ctx).Warnf("selected host failed reservation, reschedule host=%s conflicts=%d err=%v",
 				c.selectHost.ID(), c.reserveConflicts, err)
+			backoff := reservationConflictBackoffBase << (c.reserveConflicts - 1)
+			if backoff > reservationConflictBackoffMax {
+				backoff = reservationConflictBackoffMax
+			}
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			continue
 		}
 
@@ -307,6 +321,15 @@ func (c *createSandboxContext) refreshAndAdmitHost() error {
 // maxReservationConflicts bounds how many times a reservation conflict may
 // drive a reselect within one create; the create deadline is the outer bound.
 const maxReservationConflicts = 4
+
+// reservationConflictBackoffBase/Max bound the exponential wait between a
+// reservation conflict and the next reselect (25ms, 50ms, 100ms, 200ms).
+// The create deadline (CreateTimeoutInsec) remains the outer bound, so the
+// backoff can only delay failure, never extend it past the deadline.
+const (
+	reservationConflictBackoffBase = 25 * time.Millisecond
+	reservationConflictBackoffMax  = 200 * time.Millisecond
+)
 
 // reserveSelectedHost charges the selected node with this request's CPU,
 // memory, one MVM slot, and one create-concurrency slot until the Cubelet

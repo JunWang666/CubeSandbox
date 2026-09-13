@@ -256,3 +256,26 @@ func TestTryReserveNodeRedisDegraded(t *testing.T) {
 		t.Fatalf("registry entry not cleaned: %+v", amount)
 	}
 }
+
+// TestReservedNumClampOnReplacedNode verifies the mirror never goes negative
+// when the cached node object is replaced (re-registration, TTL expiry) while
+// a reservation is held: the +1 landed on the old object, the -1 lands on the
+// fresh one and must clamp at zero.
+func TestReservedNumClampOnReplacedNode(t *testing.T) {
+	reservationTestEnv(t)
+	l.cache.SetDefault("node-r6", reservationTestNode("node-r6"))
+	ctx := context.Background()
+
+	rsv, err := TryReserveNode(ctx, "node-r6", 1000, 1024)
+	if err != nil {
+		t.Fatalf("TryReserveNode error: %v", err)
+	}
+	// The node re-registers while the reservation is held: the cache entry is
+	// replaced by a fresh object whose ReservedNum starts at 0.
+	l.cache.SetDefault("node-r6", reservationTestNode("node-r6"))
+
+	rsv.Release(ctx)
+	if got := cachedReservedNum(t, "node-r6"); got != 0 {
+		t.Fatalf("ReservedNum=%d want clamped 0 after release on a replaced node", got)
+	}
+}
