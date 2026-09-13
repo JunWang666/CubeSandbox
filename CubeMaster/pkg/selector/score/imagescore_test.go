@@ -51,7 +51,7 @@ func TestNewImageScore(t *testing.T) {
 		assert.False(t, score.Disable())
 	})
 
-	t.Run("配置为空时panic", func(t *testing.T) {
+	t.Run("配置为空时降级为空转scorer", func(t *testing.T) {
 
 		originalConfig := config.GetConfig().Scheduler.Score.ScorePluginConf.ImageScore
 		defer func() {
@@ -60,8 +60,10 @@ func TestNewImageScore(t *testing.T) {
 
 		config.GetConfig().Scheduler.Score.ScorePluginConf.ImageScore = nil
 
-		assert.Panics(t, func() {
-			NewImageScore()
+		assert.NotPanics(t, func() {
+			score := NewImageScore()
+			assert.Equal(t, 0.0, score.Weight())
+			assert.True(t, score.Disable())
 		})
 	})
 }

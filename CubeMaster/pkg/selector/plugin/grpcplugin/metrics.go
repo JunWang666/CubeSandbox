@@ -19,10 +19,9 @@ import (
 // RPC label value enums. Method and reason sets are closed; the plugin name
 // comes from the operator's config, a bounded set, so it is safe as a label.
 const (
-	rpcMethodHandshake    = "handshake"
-	rpcMethodSyncSnapshot = "sync_snapshot"
-	rpcMethodFilter       = "filter"
-	rpcMethodScore        = "score"
+	rpcMethodHandshake = "handshake"
+	rpcMethodFilter    = "filter"
+	rpcMethodScore     = "score"
 
 	rpcDirectionRequest  = "request"
 	rpcDirectionResponse = "response"

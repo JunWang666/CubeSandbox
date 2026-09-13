@@ -60,7 +60,7 @@ External plugin example:
           circuit_breaker_cooldown: 30s
 ```
 
-The versioned protocol is in `pkgs/proto/services/schedulerplugin/v1/plugin.proto`. CubeMaster calls `Handshake`, then `SyncSnapshot`, followed by batched `Filter` or `Score` requests. Each scheduling attempt gets a fresh snapshot version and concurrent attempts interleave, so plugin servers must key snapshots by `snapshot_version` (with a small eviction bound) rather than keeping a single latest slot. A Unix Domain Socket is recommended in production. A runnable server is available in `CubeMaster/examples/scheduler-plugin`:
+The versioned protocol is in `pkgs/proto/services/schedulerplugin/v1/plugin.proto`. CubeMaster calls `Handshake` once at startup, then batched `Filter` or `Score` requests. Every request carries the full frozen candidate snapshot for its `snapshot_version`, so plugin servers are stateless and concurrent scheduling attempts can share one connection without serializing. A Unix Domain Socket is recommended in production. A runnable server is available in `CubeMaster/examples/scheduler-plugin`:
 
 ```bash
 cd CubeMaster

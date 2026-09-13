@@ -1083,8 +1083,8 @@ var schedulerFactoryYAML []byte
 // 避免覆盖存量部署依赖的 legacy 编译路径（profile.Compile 有 profiles 时忽略 legacy）。
 //
 // 出厂 YAML 同时携带 legacy score 子树：profile 模式下它不参与流水线编译，
-// 但内置 scorer（real_time_weighted_average / image_score）的构造函数会读全局
-// 配置中的 plugin_conf，缺失时会 panic（见 pkg/selector/score/realtimescore.go）。
+// 但内置 scorer（real_time_weighted_average / image_score）的 enable_weight_factors
+// 只存在于该 legacy 子树中；缺失时这些 scorer 空转（见 pkg/selector/score/realtimescore.go）。
 func injectFactorySchedulerProfiles(config *Config) error {
 	sched := config.Scheduler
 	if len(sched.Profiles) != 0 || sched.Filter != nil || sched.Score != nil {
@@ -1108,6 +1108,15 @@ func injectFactorySchedulerProfiles(config *Config) error {
 	if len(sched.ProfileRouteLabelKeys) == 0 {
 		sched.ProfileRouteLabelKeys = factory.Scheduler.ProfileRouteLabelKeys
 	}
+	names := make([]string, 0, len(sched.Profiles))
+	for _, profileConf := range sched.Profiles {
+		names = append(names, profileConf.Name)
+	}
+	// 注入出厂策略会改变空配置部署的放置行为（此前是"无过滤、无评分、随机选"），
+	// 必须显式告知运维，避免升级后策略静默切换。
+	CubeLog.Warnf("no scheduler policy configured (scheduler.profiles/filter/score all empty); "+
+		"injecting factory scheduler profiles %v: placement now follows mandatory guards + factory scorers + spread selection, "+
+		"which differs from the legacy empty-config behavior; set any of those keys to keep legacy scheduling", names)
 	return nil
 }
 

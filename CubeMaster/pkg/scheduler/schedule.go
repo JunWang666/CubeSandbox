@@ -15,7 +15,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
@@ -109,51 +108,22 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 	return selected, nil
 }
 
+// currentPipeline returns nil when InitScheduler has not stored a compiled
+// profile set. Callers must treat that as a hard error: synthesizing a
+// fallback pipeline here would schedule without any of the safety guards
+// (node_safety/cpu/mem/disk/...) that only exist inside compiled profiles.
 func currentPipeline(selCtx *selctx.SelectorCtx) (*profile.Pipeline, func()) {
 	for profiles := scheduler.profiles.Load(); profiles != nil; profiles = scheduler.profiles.Load() {
 		if pipeline, release, acquired := profiles.Acquire(selCtx); acquired {
 			return pipeline, release
 		}
 	}
-	// Tests and legacy embedders may construct the package singleton directly.
-	// Keep that path functional without weakening production validation.
-	topN := 1
-	if current := config.GetConfig(); current != nil && current.Scheduler != nil {
-		topN = current.Scheduler.PrioritySelectNum
-	}
-	pipeline := &profile.Pipeline{
-		Name: "default", TopN: topN,
-		Selection: profile.SelectionRandom, NoCandidate: profile.NoCandidateBackoff,
-	}
-	for _, selector := range scheduler.filter {
-		pipeline.Filters = append(pipeline.Filters, profile.FilterPlugin{
-			Name: selector.ID(), Selector: selector, Failure: profile.FilterFailClosed,
-		})
-	}
-	for _, selector := range scheduler.score {
-		pipeline.Scores = append(pipeline.Scores, profile.ScorePlugin{
-			Name: selector.ID(), Selector: selector, Weight: selector.Weight(), Failure: profile.ScoreSkip,
-		})
-	}
-	return pipeline, nil
+	return nil, nil
 }
 
 func isNoCandidateError(err error) bool {
 	status, _ := ret.FromError(err)
 	return status != nil && status.Code() == errorcode.ErrorCode_SelectNodesNoRes
-}
-
-func shouldSkipBackoffForTemplate(selCtx *selctx.SelectorCtx) bool {
-	if selCtx == nil || selCtx.ReqRes == nil || selCtx.ReqRes.TemplateID == "" {
-		return false
-	}
-	templateLocalitySelectorID := constants.SelectorFilterID + "/" + "template_locality"
-	for _, selector := range scheduler.filter {
-		if selector != nil && selector.ID() == templateLocalitySelectorID {
-			return true
-		}
-	}
-	return false
 }
 
 func pipelineHasTemplateGuard(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) bool {

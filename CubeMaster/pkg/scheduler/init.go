@@ -31,14 +31,12 @@ var (
 
 var scheduler = struct {
 	sync.RWMutex
-	filter          []filter.Selector
-	score           []score.Selector
 	postScore       postscore.Selector
 	preSelector     filter.Selector
 	backoffSelector filter.Selector
 	registry        *plugin.Registry
 	profiles        atomic.Pointer[profile.Set]
-}{filter: make([]filter.Selector, 0)}
+}{}
 
 func InitScheduler(ctx context.Context) error {
 	scheduler.preSelector = prefilter.NewPreFilter()

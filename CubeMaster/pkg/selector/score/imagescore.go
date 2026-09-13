@@ -16,6 +16,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 const (
@@ -33,12 +34,26 @@ type imageScore struct {
 // getImageStateByNode 查询节点上镜像状态的函数（可替换，便于测试）
 var getImageStateByNode = localcache.GetImageStateByNode
 
+func imageScoreConf() *config.ImageScore {
+	sched := config.GetConfig().Scheduler
+	if sched == nil || sched.Score == nil {
+		return nil
+	}
+	return sched.Score.ScorePluginConf.ImageScore
+}
+
+// NewImageScore tolerates a missing legacy plugin_conf block: the scorer then
+// has no weight of its own (a profile entry must carry one) and Select stays
+// a no-op until the block is configured, because enable_weight_factors only
+// exists in the legacy config tree.
 func NewImageScore() *imageScore {
-	if config.GetConfig().Scheduler.Score.ScorePluginConf.ImageScore == nil {
-		panic("config.Scheduler.Score.ScorePluginConf.ImageScore is nil")
+	conf := imageScoreConf()
+	if conf == nil {
+		CubeLog.Warnf("scheduler.score.plugin_conf.image_score is not configured; image_score scores nothing until it is")
+		return &imageScore{}
 	}
 	return &imageScore{
-		weight: config.GetConfig().Scheduler.Score.ScorePluginConf.ImageScore.Weight,
+		weight: conf.Weight,
 	}
 }
 
@@ -55,7 +70,8 @@ func (l *imageScore) Weight() float64 {
 }
 
 func (l *imageScore) Disable() bool {
-	return config.GetConfig().Scheduler.Score.ScorePluginConf.ImageScore.Disable
+	conf := imageScoreConf()
+	return conf == nil || conf.Disable
 }
 
 // Select 按启用因子计算每个节点的镜像得分并归一化：

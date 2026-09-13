@@ -4,8 +4,10 @@
 
 // Package grpcplugin implements external scheduler plugins over gRPC. It uses
 // Unix Domain Sockets by default, performs a version/capability handshake,
-// synchronizes immutable snapshots on a separate RPC, validates all plugin
-// output, and bounds failures with timeouts and a small circuit breaker.
+// carries the frozen candidate snapshot inside every Filter/Score request so
+// plugins stay stateless and concurrent attempts never serialize on a shared
+// server-side snapshot slot, validates all plugin output, and bounds failures
+// with timeouts and a small circuit breaker.
 package grpcplugin
 
 import (
@@ -81,9 +83,7 @@ type client struct {
 	rpc        schedulerplugin.SchedulerPluginClient
 	breaker    breaker
 
-	syncMu        sync.Mutex
-	syncedVersion string
-	closeOnce     sync.Once
+	closeOnce sync.Once
 }
 
 func newClient(ctx context.Context, conf config.SchedulerProfilePluginConf, capability string) (*client, error) {
@@ -183,46 +183,22 @@ func (c *client) call(ctx context.Context, invoke func(context.Context) error) e
 
 // reject marks a syntactically successful RPC with an invalid response as a
 // plugin failure. Only a fully validated Filter or Score response resets the
-// breaker; otherwise a successful snapshot sync could mask repeated failures
-// in the actual scheduling RPC.
+// breaker.
 func (c *client) reject(err error) error {
 	c.breaker.failed()
 	return err
 }
 
-// syncSnapshotLocked pushes the frozen snapshot when its version changed. The
-// caller must hold c.syncMu, which filterPlugin.Select and scorePlugin.Select
-// keep held across the following Filter/Score RPC: SnapshotVersion is unique
-// per scheduling attempt, so without that atomicity a concurrent request can
-// overwrite a single-slot plugin's snapshot between this sync and the query.
-func (c *client) syncSnapshotLocked(selection *selctx.SelectorCtx) (err error) {
-	if selection.SnapshotVersion == "" {
-		return errors.New("scheduler snapshot version is empty")
+// snapshotNodes serializes the frozen candidate set. It travels inside every
+// Filter/Score request, so the plugin never keeps mutable per-version state
+// and concurrent scheduling attempts can share one connection freely.
+func snapshotNodes(selection *selctx.SelectorCtx) []*schedulerplugin.SnapshotNode {
+	snapshot := selection.SnapshotNodes()
+	nodes := make([]*schedulerplugin.SnapshotNode, 0, len(snapshot))
+	for _, candidate := range snapshot {
+		nodes = append(nodes, snapshotNode(selection, candidate))
 	}
-	if c.syncedVersion == selection.SnapshotVersion {
-		return nil
-	}
-	request := &schedulerplugin.SnapshotRequest{SnapshotVersion: selection.SnapshotVersion}
-	snapshotNodes := selection.SnapshotNodes()
-	request.Nodes = make([]*schedulerplugin.SnapshotNode, 0, len(snapshotNodes))
-	for _, candidate := range snapshotNodes {
-		request.Nodes = append(request.Nodes, snapshotNode(selection, candidate))
-	}
-	var response *schedulerplugin.SnapshotResponse
-	rpcStart := time.Now()
-	defer func() { c.observeRPC(rpcMethodSyncSnapshot, rpcStart, request, response, err) }()
-	if err = c.call(selection.Ctx, func(ctx context.Context) error {
-		var rpcErr error
-		response, rpcErr = c.rpc.SyncSnapshot(ctx, request)
-		return rpcErr
-	}); err != nil {
-		return fmt.Errorf("external scheduler plugin %q sync snapshot: %w", c.name, err)
-	}
-	if response.GetSnapshotVersion() != selection.SnapshotVersion {
-		return c.reject(fmt.Errorf("%w: plugin %q returned %q, want %q", ErrVersionMismatch, c.name, response.GetSnapshotVersion(), selection.SnapshotVersion))
-	}
-	c.syncedVersion = selection.SnapshotVersion
-	return nil
+	return nodes
 }
 
 func snapshotNode(selection *selctx.SelectorCtx, candidate *node.Node) *schedulerplugin.SnapshotNode {
@@ -301,10 +277,8 @@ func (p *filterPlugin) ID() string   { return "filter/grpc/" + p.client.name }
 func (p *filterPlugin) Close() error { return p.client.Close() }
 
 func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (result node.NodeList, err error) {
-	p.client.syncMu.Lock()
-	defer p.client.syncMu.Unlock()
-	if err := p.client.syncSnapshotLocked(selection); err != nil {
-		return nil, err
+	if selection.SnapshotVersion == "" {
+		return nil, errors.New("scheduler snapshot version is empty")
 	}
 	candidates := selection.Nodes()
 	byID, ids, err := candidateIndex(candidates)
@@ -315,6 +289,7 @@ func (p *filterPlugin) Select(selection *selctx.SelectorCtx) (result node.NodeLi
 		SnapshotVersion: selection.SnapshotVersion,
 		Request:         requestContext(selection),
 		CandidateIds:    ids,
+		Snapshot:        snapshotNodes(selection),
 	}
 	var response *schedulerplugin.FilterResponse
 	rpcStart := time.Now()
@@ -372,10 +347,8 @@ func (p *scorePlugin) Disable() bool   { return false }
 func (p *scorePlugin) Close() error    { return p.client.Close() }
 
 func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (result node.NodeScoreList, err error) {
-	p.client.syncMu.Lock()
-	defer p.client.syncMu.Unlock()
-	if err := p.client.syncSnapshotLocked(selection); err != nil {
-		return nil, err
+	if selection.SnapshotVersion == "" {
+		return nil, errors.New("scheduler snapshot version is empty")
 	}
 	candidates := selection.Nodes()
 	byID, ids, err := candidateIndex(candidates)
@@ -386,6 +359,7 @@ func (p *scorePlugin) Select(selection *selctx.SelectorCtx) (result node.NodeSco
 		SnapshotVersion: selection.SnapshotVersion,
 		Request:         requestContext(selection),
 		CandidateIds:    ids,
+		Snapshot:        snapshotNodes(selection),
 	}
 	var response *schedulerplugin.ScoreResponse
 	rpcStart := time.Now()

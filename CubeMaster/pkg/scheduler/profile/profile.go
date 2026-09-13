@@ -304,7 +304,7 @@ func compileProfile(ctx context.Context, conf config.SchedulerProfileConf, regis
 			weight = selector.Weight()
 		}
 		if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
-			return nil, fmt.Errorf("score plugin %q has invalid weight %v", name, weight)
+			return nil, fmt.Errorf("score plugin %q has invalid weight %v: set a positive weight on the profile entry (legacy built-in scorers can also fall back to scheduler.score.plugin_conf.<name>.weight)", name, weight)
 		}
 		if pluginConf.DefaultScore < 0 || pluginConf.DefaultScore > 100 || math.IsNaN(pluginConf.DefaultScore) || math.IsInf(pluginConf.DefaultScore, 0) {
 			return nil, fmt.Errorf("score plugin %q has invalid default_score %v", name, pluginConf.DefaultScore)
