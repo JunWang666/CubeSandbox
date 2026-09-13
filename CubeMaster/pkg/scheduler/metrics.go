@@ -548,30 +548,35 @@ var clusterGaugesDisabled atomic.Bool
 func DisableClusterGauges() { clusterGaugesDisabled.Store(true) }
 
 // startClusterGaugeCollector launches the periodic gauge collection exactly
-// once, even if InitScheduler is called repeatedly (e.g. in-process restarts).
-func startClusterGaugeCollector(ctx context.Context) {
+// once per process, even if InitScheduler is called repeatedly (e.g.
+// in-process restarts). The loop deliberately runs on a process-lifetime
+// context rather than the caller's: the Once would otherwise capture the
+// first InitScheduler's context, and that context being cancelled (in-process
+// restart, test teardown) would stop the collector forever while the Once
+// blocks any restart. DisableClusterGauges remains the stop switch and is
+// checked inside the loop, so it also halts an already-running collector.
+func startClusterGaugeCollector() {
 	if clusterGaugesDisabled.Load() {
 		return
 	}
 	clusterGaugeOnce.Do(func() {
 		recov.GoWithRecover(func() {
-			collectClusterGaugesLoop(ctx)
+			collectClusterGaugesLoop()
 		})
 	})
 }
 
-func collectClusterGaugesLoop(ctx context.Context) {
+func collectClusterGaugesLoop() {
 	ticker := time.NewTicker(clusterGaugeCollectInterval)
 	defer ticker.Stop()
 	for {
-		recov.WithRecover(collectClusterGauges, func(panicError interface{}) {
-			log.G(ctx).Errorf("collectClusterGauges panic:%v", panicError)
-		})
-		select {
-		case <-ctx.Done():
+		if clusterGaugesDisabled.Load() {
 			return
-		case <-ticker.C:
 		}
+		recov.WithRecover(collectClusterGauges, func(panicError interface{}) {
+			log.G(context.Background()).Errorf("collectClusterGauges panic:%v", panicError)
+		})
+		<-ticker.C
 	}
 }
 

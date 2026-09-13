@@ -72,7 +72,7 @@ func InitScheduler(ctx context.Context) error {
 	score.StartAsyncScore(ctx)
 
 	initTask(ctx)
-	startClusterGaugeCollector(ctx)
+	startClusterGaugeCollector()
 	return nil
 }
 
