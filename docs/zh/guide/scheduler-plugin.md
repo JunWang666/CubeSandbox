@@ -58,9 +58,15 @@ CEL 提供基于版本化 protobuf 的强类型只读对象 `node` 与 `request`
           timeout: 100ms
           circuit_breaker_failures: 3
           circuit_breaker_cooldown: 30s
+          # snapshot_mode: request  # 默认值；"sync" 启用按内容寻址的快照同步
 ```
 
-协议位于 `pkgs/proto/services/schedulerplugin/v1/plugin.proto`。启动时调用一次 `Handshake`，之后批量调用 `Filter` 或 `Score`。每个请求都携带其 `snapshot_version` 对应的完整冻结候选快照，因此插件服务端是无状态的，并发调度请求可以共享同一条连接而无需串行化。生产环境建议使用 Unix Domain Socket。可运行示例位于 `CubeMaster/examples/scheduler-plugin`：
+协议位于 `pkgs/proto/services/schedulerplugin/v1/plugin.proto`。启动时调用一次 `Handshake`，之后批量调用 `Filter` 或 `Score`。每个插件可通过 `snapshot_mode` 选择两种快照投递模式：
+
+- `request`（默认）：每个请求携带其 `snapshot_version` 对应的完整冻结候选快照，插件服务端是无状态的。
+- `sync`：客户端通过 `SyncSnapshot` 以内容寻址版本（快照内容的哈希）推送快照，查询只携带版本号，快照未变化时不重复传输。插件必须在握手时声明 `snapshot_sync` 能力，按版本号把快照保存在一个有界 map 中，对未知版本返回 `FAILED_PRECONDITION`；客户端收到后会重新同步并重试一次。快照 miss 不计入熔断器。
+
+两种模式都不会在 RPC 期间持有锁，并发调度请求可以共享同一条连接而无需串行化。生产环境建议使用 Unix Domain Socket。可运行示例（同时支持两种模式）位于 `CubeMaster/examples/scheduler-plugin`：
 
 ```bash
 cd CubeMaster

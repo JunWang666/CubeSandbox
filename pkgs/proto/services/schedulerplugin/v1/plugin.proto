@@ -7,12 +7,23 @@ package cube.schedulerplugin.v1;
 
 option go_package = "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/schedulerplugin/v1;schedulerplugin";
 
-// SchedulerPlugin is a versioned, batch-oriented extension API. Every
-// Filter/Score request carries the full frozen candidate snapshot, so plugins
-// are stateless and concurrent scheduling attempts never serialize on a
-// shared server-side snapshot slot.
+// SchedulerPlugin is a versioned, batch-oriented extension API. It supports
+// two snapshot delivery modes, selected per plugin via the CubeMaster config:
+//
+//   - request (default): every Filter/Score request embeds the full frozen
+//     candidate snapshot, so plugins are stateless and concurrent scheduling
+//     attempts never serialize on shared server-side state.
+//   - sync: the client pushes the snapshot via SyncSnapshot under a
+//     content-addressed snapshot_version (a hash of the snapshot), then sends
+//     Filter/Score with only that version. Identical snapshots deduplicate to
+//     a single push. Servers keep snapshots keyed by version (a small bounded
+//     map, not a single slot) and answer queries for any version they hold;
+//     a query for an unknown version fails with FAILED_PRECONDITION and the
+//     client re-syncs and retries. Pushes are idempotent, so concurrent
+//     attempts never need client-side serialization.
 service SchedulerPlugin {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc SyncSnapshot(SnapshotRequest) returns (SnapshotResponse);
   rpc Filter(FilterRequest) returns (FilterResponse);
   rpc Score(ScoreRequest) returns (ScoreResponse);
 }
@@ -25,7 +36,9 @@ message HandshakeRequest {
 message HandshakeResponse {
   string protocol_version = 1;
   string plugin_name = 2;
-  repeated string capabilities = 3; // "filter" and/or "score"
+  // "filter" and/or "score"; plus "snapshot_sync" when the server implements
+  // SyncSnapshot (required by clients configured with snapshot_mode: sync).
+  repeated string capabilities = 3;
 }
 
 message RequestContext {
@@ -64,11 +77,23 @@ message SnapshotNode {
   int64 reserved = 24; // in-flight scheduling reservations held by this CubeMaster replica
 }
 
+message SnapshotRequest {
+  string snapshot_version = 1;
+  repeated SnapshotNode nodes = 2;
+}
+
+message SnapshotResponse {
+  string snapshot_version = 1;
+}
+
 message FilterRequest {
   string snapshot_version = 1;
   RequestContext request = 2;
   repeated string candidate_ids = 3;
-  repeated SnapshotNode snapshot = 4; // frozen candidate set for snapshot_version
+  // snapshot_mode=request: the frozen candidate set for snapshot_version.
+  // snapshot_mode=sync: empty; the server resolves snapshot_version against
+  // the snapshots it received via SyncSnapshot.
+  repeated SnapshotNode snapshot = 4;
 }
 
 message FilterResponse {
@@ -80,7 +105,8 @@ message ScoreRequest {
   string snapshot_version = 1;
   RequestContext request = 2;
   repeated string candidate_ids = 3;
-  repeated SnapshotNode snapshot = 4; // frozen candidate set for snapshot_version
+  // Same semantics as FilterRequest.snapshot.
+  repeated SnapshotNode snapshot = 4;
 }
 
 message NodeScore {

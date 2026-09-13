@@ -529,7 +529,11 @@ type SchedulerProfilePluginConf struct {
 	Timeout                time.Duration  `yaml:"timeout"`
 	CircuitBreakerFailures int            `yaml:"circuit_breaker_failures"`
 	CircuitBreakerCooldown time.Duration  `yaml:"circuit_breaker_cooldown"`
-	Args                   map[string]any `yaml:"args"`
+	// SnapshotMode selects how external gRPC plugins receive the candidate
+	// snapshot: "request" (default, embedded in every Filter/Score call) or
+	// "sync" (content-addressed SyncSnapshot pushes with miss-retry).
+	SnapshotMode string         `yaml:"snapshot_mode"`
+	Args         map[string]any `yaml:"args"`
 }
 
 type SchedulerSelectionConf struct {

@@ -80,9 +80,11 @@ type HandshakeResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ProtocolVersion string                 `protobuf:"bytes,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
 	PluginName      string                 `protobuf:"bytes,2,opt,name=plugin_name,json=pluginName,proto3" json:"plugin_name,omitempty"`
-	Capabilities    []string               `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"` // "filter" and/or "score"
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// "filter" and/or "score"; plus "snapshot_sync" when the server implements
+	// SyncSnapshot (required by clients configured with snapshot_mode: sync).
+	Capabilities  []string `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HandshakeResponse) Reset() {
@@ -448,19 +450,118 @@ func (x *SnapshotNode) GetReserved() int64 {
 	return 0
 }
 
+type SnapshotRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotVersion string                 `protobuf:"bytes,1,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`
+	Nodes           []*SnapshotNode        `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *SnapshotRequest) Reset() {
+	*x = SnapshotRequest{}
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotRequest) ProtoMessage() {}
+
+func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
+func (*SnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *SnapshotRequest) GetSnapshotVersion() string {
+	if x != nil {
+		return x.SnapshotVersion
+	}
+	return ""
+}
+
+func (x *SnapshotRequest) GetNodes() []*SnapshotNode {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+type SnapshotResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotVersion string                 `protobuf:"bytes,1,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *SnapshotResponse) Reset() {
+	*x = SnapshotResponse{}
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotResponse) ProtoMessage() {}
+
+func (x *SnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotResponse.ProtoReflect.Descriptor instead.
+func (*SnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SnapshotResponse) GetSnapshotVersion() string {
+	if x != nil {
+		return x.SnapshotVersion
+	}
+	return ""
+}
+
 type FilterRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	SnapshotVersion string                 `protobuf:"bytes,1,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`
 	Request         *RequestContext        `protobuf:"bytes,2,opt,name=request,proto3" json:"request,omitempty"`
 	CandidateIds    []string               `protobuf:"bytes,3,rep,name=candidate_ids,json=candidateIds,proto3" json:"candidate_ids,omitempty"`
-	Snapshot        []*SnapshotNode        `protobuf:"bytes,4,rep,name=snapshot,proto3" json:"snapshot,omitempty"` // frozen candidate set for snapshot_version
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// snapshot_mode=request: the frozen candidate set for snapshot_version.
+	// snapshot_mode=sync: empty; the server resolves snapshot_version against
+	// the snapshots it received via SyncSnapshot.
+	Snapshot      []*SnapshotNode `protobuf:"bytes,4,rep,name=snapshot,proto3" json:"snapshot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *FilterRequest) Reset() {
 	*x = FilterRequest{}
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[4]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -472,7 +573,7 @@ func (x *FilterRequest) String() string {
 func (*FilterRequest) ProtoMessage() {}
 
 func (x *FilterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[4]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -485,7 +586,7 @@ func (x *FilterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FilterRequest.ProtoReflect.Descriptor instead.
 func (*FilterRequest) Descriptor() ([]byte, []int) {
-	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{4}
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *FilterRequest) GetSnapshotVersion() string {
@@ -526,7 +627,7 @@ type FilterResponse struct {
 
 func (x *FilterResponse) Reset() {
 	*x = FilterResponse{}
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[5]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -538,7 +639,7 @@ func (x *FilterResponse) String() string {
 func (*FilterResponse) ProtoMessage() {}
 
 func (x *FilterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[5]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -551,7 +652,7 @@ func (x *FilterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FilterResponse.ProtoReflect.Descriptor instead.
 func (*FilterResponse) Descriptor() ([]byte, []int) {
-	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{5}
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *FilterResponse) GetSnapshotVersion() string {
@@ -573,14 +674,15 @@ type ScoreRequest struct {
 	SnapshotVersion string                 `protobuf:"bytes,1,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`
 	Request         *RequestContext        `protobuf:"bytes,2,opt,name=request,proto3" json:"request,omitempty"`
 	CandidateIds    []string               `protobuf:"bytes,3,rep,name=candidate_ids,json=candidateIds,proto3" json:"candidate_ids,omitempty"`
-	Snapshot        []*SnapshotNode        `protobuf:"bytes,4,rep,name=snapshot,proto3" json:"snapshot,omitempty"` // frozen candidate set for snapshot_version
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Same semantics as FilterRequest.snapshot.
+	Snapshot      []*SnapshotNode `protobuf:"bytes,4,rep,name=snapshot,proto3" json:"snapshot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ScoreRequest) Reset() {
 	*x = ScoreRequest{}
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[6]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -592,7 +694,7 @@ func (x *ScoreRequest) String() string {
 func (*ScoreRequest) ProtoMessage() {}
 
 func (x *ScoreRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[6]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -605,7 +707,7 @@ func (x *ScoreRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScoreRequest.ProtoReflect.Descriptor instead.
 func (*ScoreRequest) Descriptor() ([]byte, []int) {
-	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{6}
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ScoreRequest) GetSnapshotVersion() string {
@@ -646,7 +748,7 @@ type NodeScore struct {
 
 func (x *NodeScore) Reset() {
 	*x = NodeScore{}
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[7]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -658,7 +760,7 @@ func (x *NodeScore) String() string {
 func (*NodeScore) ProtoMessage() {}
 
 func (x *NodeScore) ProtoReflect() protoreflect.Message {
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[7]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -671,7 +773,7 @@ func (x *NodeScore) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeScore.ProtoReflect.Descriptor instead.
 func (*NodeScore) Descriptor() ([]byte, []int) {
-	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{7}
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *NodeScore) GetNodeId() string {
@@ -698,7 +800,7 @@ type ScoreResponse struct {
 
 func (x *ScoreResponse) Reset() {
 	*x = ScoreResponse{}
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[8]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -710,7 +812,7 @@ func (x *ScoreResponse) String() string {
 func (*ScoreResponse) ProtoMessage() {}
 
 func (x *ScoreResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[8]
+	mi := &file_services_schedulerplugin_v1_plugin_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -723,7 +825,7 @@ func (x *ScoreResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScoreResponse.ProtoReflect.Descriptor instead.
 func (*ScoreResponse) Descriptor() ([]byte, []int) {
-	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{8}
+	return file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ScoreResponse) GetSnapshotVersion() string {
@@ -797,7 +899,12 @@ const file_services_schedulerplugin_v1_plugin_proto_rawDesc = "" +
 	"\breserved\x18\x18 \x01(\x03R\breserved\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe5\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"y\n" +
+	"\x0fSnapshotRequest\x12)\n" +
+	"\x10snapshot_version\x18\x01 \x01(\tR\x0fsnapshotVersion\x12;\n" +
+	"\x05nodes\x18\x02 \x03(\v2%.cube.schedulerplugin.v1.SnapshotNodeR\x05nodes\"=\n" +
+	"\x10SnapshotResponse\x12)\n" +
+	"\x10snapshot_version\x18\x01 \x01(\tR\x0fsnapshotVersion\"\xe5\x01\n" +
 	"\rFilterRequest\x12)\n" +
 	"\x10snapshot_version\x18\x01 \x01(\tR\x0fsnapshotVersion\x12A\n" +
 	"\arequest\x18\x02 \x01(\v2'.cube.schedulerplugin.v1.RequestContextR\arequest\x12#\n" +
@@ -816,9 +923,10 @@ const file_services_schedulerplugin_v1_plugin_proto_rawDesc = "" +
 	"\x05score\x18\x02 \x01(\x01R\x05score\"v\n" +
 	"\rScoreResponse\x12)\n" +
 	"\x10snapshot_version\x18\x01 \x01(\tR\x0fsnapshotVersion\x12:\n" +
-	"\x06scores\x18\x02 \x03(\v2\".cube.schedulerplugin.v1.NodeScoreR\x06scores2\xa8\x02\n" +
+	"\x06scores\x18\x02 \x03(\v2\".cube.schedulerplugin.v1.NodeScoreR\x06scores2\x8d\x03\n" +
 	"\x0fSchedulerPlugin\x12b\n" +
-	"\tHandshake\x12).cube.schedulerplugin.v1.HandshakeRequest\x1a*.cube.schedulerplugin.v1.HandshakeResponse\x12Y\n" +
+	"\tHandshake\x12).cube.schedulerplugin.v1.HandshakeRequest\x1a*.cube.schedulerplugin.v1.HandshakeResponse\x12c\n" +
+	"\fSyncSnapshot\x12(.cube.schedulerplugin.v1.SnapshotRequest\x1a).cube.schedulerplugin.v1.SnapshotResponse\x12Y\n" +
 	"\x06Filter\x12&.cube.schedulerplugin.v1.FilterRequest\x1a'.cube.schedulerplugin.v1.FilterResponse\x12V\n" +
 	"\x05Score\x12%.cube.schedulerplugin.v1.ScoreRequest\x1a&.cube.schedulerplugin.v1.ScoreResponseB\\ZZgithub.com/tencentcloud/CubeSandbox/pkgs/proto/services/schedulerplugin/v1;schedulerpluginb\x06proto3"
 
@@ -834,39 +942,44 @@ func file_services_schedulerplugin_v1_plugin_proto_rawDescGZIP() []byte {
 	return file_services_schedulerplugin_v1_plugin_proto_rawDescData
 }
 
-var file_services_schedulerplugin_v1_plugin_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_services_schedulerplugin_v1_plugin_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_services_schedulerplugin_v1_plugin_proto_goTypes = []any{
 	(*HandshakeRequest)(nil),  // 0: cube.schedulerplugin.v1.HandshakeRequest
 	(*HandshakeResponse)(nil), // 1: cube.schedulerplugin.v1.HandshakeResponse
 	(*RequestContext)(nil),    // 2: cube.schedulerplugin.v1.RequestContext
 	(*SnapshotNode)(nil),      // 3: cube.schedulerplugin.v1.SnapshotNode
-	(*FilterRequest)(nil),     // 4: cube.schedulerplugin.v1.FilterRequest
-	(*FilterResponse)(nil),    // 5: cube.schedulerplugin.v1.FilterResponse
-	(*ScoreRequest)(nil),      // 6: cube.schedulerplugin.v1.ScoreRequest
-	(*NodeScore)(nil),         // 7: cube.schedulerplugin.v1.NodeScore
-	(*ScoreResponse)(nil),     // 8: cube.schedulerplugin.v1.ScoreResponse
-	nil,                       // 9: cube.schedulerplugin.v1.RequestContext.LabelsEntry
-	nil,                       // 10: cube.schedulerplugin.v1.SnapshotNode.LabelsEntry
+	(*SnapshotRequest)(nil),   // 4: cube.schedulerplugin.v1.SnapshotRequest
+	(*SnapshotResponse)(nil),  // 5: cube.schedulerplugin.v1.SnapshotResponse
+	(*FilterRequest)(nil),     // 6: cube.schedulerplugin.v1.FilterRequest
+	(*FilterResponse)(nil),    // 7: cube.schedulerplugin.v1.FilterResponse
+	(*ScoreRequest)(nil),      // 8: cube.schedulerplugin.v1.ScoreRequest
+	(*NodeScore)(nil),         // 9: cube.schedulerplugin.v1.NodeScore
+	(*ScoreResponse)(nil),     // 10: cube.schedulerplugin.v1.ScoreResponse
+	nil,                       // 11: cube.schedulerplugin.v1.RequestContext.LabelsEntry
+	nil,                       // 12: cube.schedulerplugin.v1.SnapshotNode.LabelsEntry
 }
 var file_services_schedulerplugin_v1_plugin_proto_depIdxs = []int32{
-	9,  // 0: cube.schedulerplugin.v1.RequestContext.labels:type_name -> cube.schedulerplugin.v1.RequestContext.LabelsEntry
-	10, // 1: cube.schedulerplugin.v1.SnapshotNode.labels:type_name -> cube.schedulerplugin.v1.SnapshotNode.LabelsEntry
-	2,  // 2: cube.schedulerplugin.v1.FilterRequest.request:type_name -> cube.schedulerplugin.v1.RequestContext
-	3,  // 3: cube.schedulerplugin.v1.FilterRequest.snapshot:type_name -> cube.schedulerplugin.v1.SnapshotNode
-	2,  // 4: cube.schedulerplugin.v1.ScoreRequest.request:type_name -> cube.schedulerplugin.v1.RequestContext
-	3,  // 5: cube.schedulerplugin.v1.ScoreRequest.snapshot:type_name -> cube.schedulerplugin.v1.SnapshotNode
-	7,  // 6: cube.schedulerplugin.v1.ScoreResponse.scores:type_name -> cube.schedulerplugin.v1.NodeScore
-	0,  // 7: cube.schedulerplugin.v1.SchedulerPlugin.Handshake:input_type -> cube.schedulerplugin.v1.HandshakeRequest
-	4,  // 8: cube.schedulerplugin.v1.SchedulerPlugin.Filter:input_type -> cube.schedulerplugin.v1.FilterRequest
-	6,  // 9: cube.schedulerplugin.v1.SchedulerPlugin.Score:input_type -> cube.schedulerplugin.v1.ScoreRequest
-	1,  // 10: cube.schedulerplugin.v1.SchedulerPlugin.Handshake:output_type -> cube.schedulerplugin.v1.HandshakeResponse
-	5,  // 11: cube.schedulerplugin.v1.SchedulerPlugin.Filter:output_type -> cube.schedulerplugin.v1.FilterResponse
-	8,  // 12: cube.schedulerplugin.v1.SchedulerPlugin.Score:output_type -> cube.schedulerplugin.v1.ScoreResponse
-	10, // [10:13] is the sub-list for method output_type
-	7,  // [7:10] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	11, // 0: cube.schedulerplugin.v1.RequestContext.labels:type_name -> cube.schedulerplugin.v1.RequestContext.LabelsEntry
+	12, // 1: cube.schedulerplugin.v1.SnapshotNode.labels:type_name -> cube.schedulerplugin.v1.SnapshotNode.LabelsEntry
+	3,  // 2: cube.schedulerplugin.v1.SnapshotRequest.nodes:type_name -> cube.schedulerplugin.v1.SnapshotNode
+	2,  // 3: cube.schedulerplugin.v1.FilterRequest.request:type_name -> cube.schedulerplugin.v1.RequestContext
+	3,  // 4: cube.schedulerplugin.v1.FilterRequest.snapshot:type_name -> cube.schedulerplugin.v1.SnapshotNode
+	2,  // 5: cube.schedulerplugin.v1.ScoreRequest.request:type_name -> cube.schedulerplugin.v1.RequestContext
+	3,  // 6: cube.schedulerplugin.v1.ScoreRequest.snapshot:type_name -> cube.schedulerplugin.v1.SnapshotNode
+	9,  // 7: cube.schedulerplugin.v1.ScoreResponse.scores:type_name -> cube.schedulerplugin.v1.NodeScore
+	0,  // 8: cube.schedulerplugin.v1.SchedulerPlugin.Handshake:input_type -> cube.schedulerplugin.v1.HandshakeRequest
+	4,  // 9: cube.schedulerplugin.v1.SchedulerPlugin.SyncSnapshot:input_type -> cube.schedulerplugin.v1.SnapshotRequest
+	6,  // 10: cube.schedulerplugin.v1.SchedulerPlugin.Filter:input_type -> cube.schedulerplugin.v1.FilterRequest
+	8,  // 11: cube.schedulerplugin.v1.SchedulerPlugin.Score:input_type -> cube.schedulerplugin.v1.ScoreRequest
+	1,  // 12: cube.schedulerplugin.v1.SchedulerPlugin.Handshake:output_type -> cube.schedulerplugin.v1.HandshakeResponse
+	5,  // 13: cube.schedulerplugin.v1.SchedulerPlugin.SyncSnapshot:output_type -> cube.schedulerplugin.v1.SnapshotResponse
+	7,  // 14: cube.schedulerplugin.v1.SchedulerPlugin.Filter:output_type -> cube.schedulerplugin.v1.FilterResponse
+	10, // 15: cube.schedulerplugin.v1.SchedulerPlugin.Score:output_type -> cube.schedulerplugin.v1.ScoreResponse
+	12, // [12:16] is the sub-list for method output_type
+	8,  // [8:12] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_services_schedulerplugin_v1_plugin_proto_init() }
@@ -880,7 +993,7 @@ func file_services_schedulerplugin_v1_plugin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_services_schedulerplugin_v1_plugin_proto_rawDesc), len(file_services_schedulerplugin_v1_plugin_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

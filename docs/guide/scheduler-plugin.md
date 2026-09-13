@@ -58,9 +58,15 @@ External plugin example:
           timeout: 100ms
           circuit_breaker_failures: 3
           circuit_breaker_cooldown: 30s
+          # snapshot_mode: request  # default; "sync" enables content-addressed snapshot pushes
 ```
 
-The versioned protocol is in `pkgs/proto/services/schedulerplugin/v1/plugin.proto`. CubeMaster calls `Handshake` once at startup, then batched `Filter` or `Score` requests. Every request carries the full frozen candidate snapshot for its `snapshot_version`, so plugin servers are stateless and concurrent scheduling attempts can share one connection without serializing. A Unix Domain Socket is recommended in production. A runnable server is available in `CubeMaster/examples/scheduler-plugin`:
+The versioned protocol is in `pkgs/proto/services/schedulerplugin/v1/plugin.proto`. CubeMaster calls `Handshake` once at startup, then batched `Filter` or `Score` requests. Two snapshot delivery modes are available per plugin via `snapshot_mode`:
+
+- `request` (default): every request carries the full frozen candidate snapshot for its `snapshot_version`, so plugin servers are stateless.
+- `sync`: the client pushes the snapshot via `SyncSnapshot` under a content-addressed version (a hash of the snapshot) and queries carry only that version, so unchanged snapshots are never re-transferred. The plugin must advertise the `snapshot_sync` capability, keep snapshots keyed by version in a small bounded map, and answer unknown versions with `FAILED_PRECONDITION`; the client then re-syncs and retries once. Snapshot misses do not count against the circuit breaker.
+
+Neither mode holds a lock across RPCs, so concurrent scheduling attempts share one connection without serializing. A Unix Domain Socket is recommended in production. A runnable server supporting both modes is available in `CubeMaster/examples/scheduler-plugin`:
 
 ```bash
 cd CubeMaster

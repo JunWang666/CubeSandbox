@@ -22,21 +22,33 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SchedulerPlugin_Handshake_FullMethodName = "/cube.schedulerplugin.v1.SchedulerPlugin/Handshake"
-	SchedulerPlugin_Filter_FullMethodName    = "/cube.schedulerplugin.v1.SchedulerPlugin/Filter"
-	SchedulerPlugin_Score_FullMethodName     = "/cube.schedulerplugin.v1.SchedulerPlugin/Score"
+	SchedulerPlugin_Handshake_FullMethodName    = "/cube.schedulerplugin.v1.SchedulerPlugin/Handshake"
+	SchedulerPlugin_SyncSnapshot_FullMethodName = "/cube.schedulerplugin.v1.SchedulerPlugin/SyncSnapshot"
+	SchedulerPlugin_Filter_FullMethodName       = "/cube.schedulerplugin.v1.SchedulerPlugin/Filter"
+	SchedulerPlugin_Score_FullMethodName        = "/cube.schedulerplugin.v1.SchedulerPlugin/Score"
 )
 
 // SchedulerPluginClient is the client API for SchedulerPlugin service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// SchedulerPlugin is a versioned, batch-oriented extension API. Every
-// Filter/Score request carries the full frozen candidate snapshot, so plugins
-// are stateless and concurrent scheduling attempts never serialize on a
-// shared server-side snapshot slot.
+// SchedulerPlugin is a versioned, batch-oriented extension API. It supports
+// two snapshot delivery modes, selected per plugin via the CubeMaster config:
+//
+//   - request (default): every Filter/Score request embeds the full frozen
+//     candidate snapshot, so plugins are stateless and concurrent scheduling
+//     attempts never serialize on shared server-side state.
+//   - sync: the client pushes the snapshot via SyncSnapshot under a
+//     content-addressed snapshot_version (a hash of the snapshot), then sends
+//     Filter/Score with only that version. Identical snapshots deduplicate to
+//     a single push. Servers keep snapshots keyed by version (a small bounded
+//     map, not a single slot) and answer queries for any version they hold;
+//     a query for an unknown version fails with FAILED_PRECONDITION and the
+//     client re-syncs and retries. Pushes are idempotent, so concurrent
+//     attempts never need client-side serialization.
 type SchedulerPluginClient interface {
 	Handshake(ctx context.Context, in *HandshakeRequest, opts ...grpc.CallOption) (*HandshakeResponse, error)
+	SyncSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error)
 	Filter(ctx context.Context, in *FilterRequest, opts ...grpc.CallOption) (*FilterResponse, error)
 	Score(ctx context.Context, in *ScoreRequest, opts ...grpc.CallOption) (*ScoreResponse, error)
 }
@@ -53,6 +65,16 @@ func (c *schedulerPluginClient) Handshake(ctx context.Context, in *HandshakeRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HandshakeResponse)
 	err := c.cc.Invoke(ctx, SchedulerPlugin_Handshake_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerPluginClient) SyncSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SnapshotResponse)
+	err := c.cc.Invoke(ctx, SchedulerPlugin_SyncSnapshot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -83,12 +105,23 @@ func (c *schedulerPluginClient) Score(ctx context.Context, in *ScoreRequest, opt
 // All implementations must embed UnimplementedSchedulerPluginServer
 // for forward compatibility.
 //
-// SchedulerPlugin is a versioned, batch-oriented extension API. Every
-// Filter/Score request carries the full frozen candidate snapshot, so plugins
-// are stateless and concurrent scheduling attempts never serialize on a
-// shared server-side snapshot slot.
+// SchedulerPlugin is a versioned, batch-oriented extension API. It supports
+// two snapshot delivery modes, selected per plugin via the CubeMaster config:
+//
+//   - request (default): every Filter/Score request embeds the full frozen
+//     candidate snapshot, so plugins are stateless and concurrent scheduling
+//     attempts never serialize on shared server-side state.
+//   - sync: the client pushes the snapshot via SyncSnapshot under a
+//     content-addressed snapshot_version (a hash of the snapshot), then sends
+//     Filter/Score with only that version. Identical snapshots deduplicate to
+//     a single push. Servers keep snapshots keyed by version (a small bounded
+//     map, not a single slot) and answer queries for any version they hold;
+//     a query for an unknown version fails with FAILED_PRECONDITION and the
+//     client re-syncs and retries. Pushes are idempotent, so concurrent
+//     attempts never need client-side serialization.
 type SchedulerPluginServer interface {
 	Handshake(context.Context, *HandshakeRequest) (*HandshakeResponse, error)
+	SyncSnapshot(context.Context, *SnapshotRequest) (*SnapshotResponse, error)
 	Filter(context.Context, *FilterRequest) (*FilterResponse, error)
 	Score(context.Context, *ScoreRequest) (*ScoreResponse, error)
 	mustEmbedUnimplementedSchedulerPluginServer()
@@ -103,6 +136,9 @@ type UnimplementedSchedulerPluginServer struct{}
 
 func (UnimplementedSchedulerPluginServer) Handshake(context.Context, *HandshakeRequest) (*HandshakeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Handshake not implemented")
+}
+func (UnimplementedSchedulerPluginServer) SyncSnapshot(context.Context, *SnapshotRequest) (*SnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SyncSnapshot not implemented")
 }
 func (UnimplementedSchedulerPluginServer) Filter(context.Context, *FilterRequest) (*FilterResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Filter not implemented")
@@ -145,6 +181,24 @@ func _SchedulerPlugin_Handshake_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SchedulerPluginServer).Handshake(ctx, req.(*HandshakeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SchedulerPlugin_SyncSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerPluginServer).SyncSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerPlugin_SyncSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerPluginServer).SyncSnapshot(ctx, req.(*SnapshotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -195,6 +249,10 @@ var SchedulerPlugin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Handshake",
 			Handler:    _SchedulerPlugin_Handshake_Handler,
+		},
+		{
+			MethodName: "SyncSnapshot",
+			Handler:    _SchedulerPlugin_SyncSnapshot_Handler,
 		},
 		{
 			MethodName: "Filter",
