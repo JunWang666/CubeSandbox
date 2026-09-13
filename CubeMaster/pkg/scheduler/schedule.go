@@ -113,18 +113,24 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 // profile set. Callers must treat that as a hard error: synthesizing a
 // fallback pipeline here would schedule without any of the safety guards
 // (node_safety/cpu/mem/disk/...) that only exist inside compiled profiles.
-// A single Load+Acquire attempt is deliberate: Acquire only fails on a
-// retired set, and re-loading the same retired pointer cannot succeed, so a
-// retry loop here would spin forever if a retired set were ever left in
-// scheduler.profiles. Retired sets are replaced before Close (see the config
-// watcher), making this a latent rather than live concern.
+// Two attempts, not one and not unbounded: the config watcher installs the
+// replacement with Swap *before* retiring the old set with Close, so a Load
+// that raced a reload can Acquire a set that retired in between — the retry
+// then observes the replacement and succeeds. More attempts are useless:
+// Acquire only fails on a retired set, and a set left installed past
+// retirement can never start succeeding, so the loop must terminate and fall
+// through to the nil error path.
 func currentPipeline(selCtx *selctx.SelectorCtx) (*profile.Pipeline, func()) {
-	profiles := scheduler.profiles.Load()
-	if profiles == nil {
-		return nil, nil
-	}
-	if pipeline, release, acquired := profiles.Acquire(selCtx); acquired {
-		return pipeline, release
+	for attempt := 0; attempt < 2; attempt++ {
+		profiles := scheduler.profiles.Load()
+		if profiles == nil {
+			return nil, nil
+		}
+		if pipeline, release, acquired := profiles.Acquire(selCtx); acquired {
+			return pipeline, release
+		}
+		// Retired between Load and Acquire: the reload installed its
+		// replacement before retiring, so the next Load observes it.
 	}
 	return nil, nil
 }
