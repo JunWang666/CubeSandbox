@@ -99,6 +99,10 @@ func TestInjectFactorySchedulerProfilesRespectsUserConfig(t *testing.T) {
 			name:  "factory injection disabled",
 			sched: SchedulerConf{DisableFactoryProfiles: true},
 		},
+		{
+			name:  "user postscore",
+			sched: SchedulerConf{PostScore: &PostScoreConf{}},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

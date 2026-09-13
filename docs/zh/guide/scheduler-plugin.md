@@ -2,13 +2,13 @@
 
 CubeMaster 支持按请求场景选择调度 Profile。每个 Profile 由不可关闭的安全 Guards、可选 Filter、带权 Score、选点方式和失败策略组成。
 
-二进制内置三条出厂 Profile（`CubeMaster/pkg/base/config/scheduler_factory.yaml`）：`burst_balance`、`template_reuse` 通过请求 label `workload=burst_balance` / `workload=template_reuse` 选中，其余请求落入默认的 `mixed_binpack`。当配置中既没有 `scheduler.profiles` 也没有 legacy 的 `scheduler.filter` / `scheduler.score` 时，系统自动注入这套出厂策略，零配置部署也能按真实策略调度。一旦显式配置了 `scheduler.profiles` 或 legacy filter/score 中的任意一项，出厂策略整体不生效；仅配置 legacy 项时，系统仍把 `filter`、`score`、`postscore` 和 `priority_select_num` 编译为兼容的 `default` Profile，保持原有行为。
+二进制内置三条出厂 Profile（`CubeMaster/pkg/base/config/scheduler_factory.yaml`）：`burst_balance`、`template_reuse` 通过请求 label `workload=burst_balance` / `workload=template_reuse` 选中，其余请求落入默认的 `mixed_binpack`。当配置中既没有 `scheduler.profiles` 也没有 legacy 的 `scheduler.filter` / `scheduler.score` / `scheduler.postscore` 时，系统自动注入这套出厂策略，零配置部署也能按真实策略调度。一旦显式配置了 `scheduler.profiles` 或 legacy filter/score/postscore 中的任意一项，出厂策略整体不生效；仅配置 legacy 项时，系统仍把 `filter`、`score`、`postscore` 和 `priority_select_num` 编译为兼容的 `default` Profile，保持原有行为。
 
 ## 升级行为变化
 
 不修改调度配置直接升级的集群需要注意两处行为变化：
 
-- **空调度配置现在会激活出厂 Profile。** 此前，既没有 `scheduler.profiles` 也没有 legacy `scheduler.filter` / `scheduler.score` 的部署不做任何过滤和评分，从预过滤候选中随机选点。注入出厂策略后，所有请求都会经过强制 Guards（`node_safety`、`cpu`、`mem`、`disk`、`template_locality`、`realtime_create_num`），并由出厂 Score 按 `spread` / `top_n` 选点，放置决策与旧的随机选点不同。注入发生时 CubeMaster 会输出告警日志。如需保持旧行为，可显式设置 `scheduler.disable_factory_profiles: true`（显式关闭注入），或显式配置 legacy `scheduler.filter` / `scheduler.score`（会编译为兼容的 `default` Profile）或 `scheduler.profiles`。
+- **空调度配置现在会激活出厂 Profile。** 此前，既没有 `scheduler.profiles` 也没有 legacy `scheduler.filter` / `scheduler.score` / `scheduler.postscore` 的部署不做任何过滤和评分，从预过滤候选中随机选点。注入出厂策略后，所有请求都会经过强制 Guards（`node_safety`、`cpu`、`mem`、`disk`、`template_locality`、`realtime_create_num`），并由出厂 Score 按 `spread` / `top_n` 选点，放置决策与旧的随机选点不同。注入发生时 CubeMaster 会输出告警日志。如需保持旧行为，可显式设置 `scheduler.disable_factory_profiles: true`（显式关闭注入），或显式配置 legacy `scheduler.filter` / `scheduler.score`（会编译为兼容的 `default` Profile）或 `scheduler.profiles`。
 - **模板亲和评分改为布尔因子。** legacy `template_id` 镜像评分此前按节点上已有的模板大小线性加分，现在改为精确匹配的 100/0 因子（节点要么本地已有模板，要么没有），与暴露给 CEL 和 gRPC 插件的 `template_local` 事实语义一致。使用 legacy 配置的集群在模板请求上的落点可能发生变化；实际差异通常较小，因为摊平/装箱类 Score 在加权总和中占主导。
 
 ## Profile 配置
@@ -39,7 +39,7 @@ scheduler:
         no_candidate: fail
 ```
 
-`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
+`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数与在途预留数之和最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
 
 自定义 Profile 固定执行 `node_safety`、`cpu`、`mem`、`disk`、`template_locality` 和 `realtime_create_num` Guards，配置不能关闭或重复声明这些安全约束。其中 `node_safety` 会在正常路径和 backoff 路径检查健康度、指标新鲜度、MVM 上限及 CPU load 合法性。
 

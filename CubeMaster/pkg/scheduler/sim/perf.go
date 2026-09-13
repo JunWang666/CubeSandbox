@@ -703,7 +703,8 @@ func pickNode(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) *node.Node
 }
 
 // spreadPick replicates spreadSelect: among the top-N scored candidates pick
-// the node running the fewest sandboxes, keeping score order on ties.
+// the node with the fewest running sandboxes plus in-flight reservations,
+// keeping score order on ties.
 func spreadPick(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 	var candidates node.NodeList
 	if scored := selCtx.LeastScoreNodes(topN); scored.Len() > 0 {
@@ -719,7 +720,8 @@ func spreadPick(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 		if candidates[i] == nil {
 			continue
 		}
-		if best == nil || candidates[i].MvmNum < best.MvmNum {
+		if best == nil ||
+			candidates[i].MvmNum+candidates[i].ReservedNumValue() < best.MvmNum+best.ReservedNumValue() {
 			best = candidates[i]
 		}
 	}

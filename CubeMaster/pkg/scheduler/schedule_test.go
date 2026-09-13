@@ -53,6 +53,21 @@ func TestSelectNodeSpread(t *testing.T) {
 		}
 	})
 
+	t.Run("in-flight reservations count towards occupancy", func(t *testing.T) {
+		nodes := newNodes(2, 2)
+		nodes[0].ReservedNumIncrBy(2) // n1: 2 running + 2 reserved
+		selCtx := selctx.New("")
+		selCtx.SetNodes(nodes)
+		selCtx.SetNodeScoreList(node.NodeScoreList{
+			{InsID: "n1", OrigNode: nodes[0], MvmNum: 2, Score: 90},
+			{InsID: "n2", OrigNode: nodes[1], MvmNum: 2, Score: 80},
+		})
+		pipeline := &profile.Pipeline{Selection: profile.SelectionSpread, TopN: 2}
+		if got := selectNode(selCtx, pipeline); got == nil || got.ID() != "n2" {
+			t.Fatalf("spread should pick n2 (n1 carries 2 in-flight reservations), got %v", got)
+		}
+	})
+
 	t.Run("top_n -1 spreads across all candidates", func(t *testing.T) {
 		nodes := newNodes(5, 2, 9, 1)
 		selCtx := selctx.New("")

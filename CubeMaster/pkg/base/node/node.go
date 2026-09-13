@@ -288,7 +288,28 @@ func (n *Node) LocalCreateNumIncrBy(i int64) int64 {
 }
 
 func (n *Node) ReservedNumIncrBy(i int64) int64 {
-	return atomic.AddInt64(&n.ReservedNum, i)
+	// Clamp at zero: the mirror is best-effort, and the cached node object
+	// may be replaced (re-registration, TTL expiry) while a reservation is
+	// still held, in which case the matching decrement would otherwise land
+	// on a fresh object and drive its count negative.
+	for {
+		current := atomic.LoadInt64(&n.ReservedNum)
+		next := current + i
+		if next < 0 {
+			next = 0
+		}
+		if atomic.CompareAndSwapInt64(&n.ReservedNum, current, next) {
+			return next
+		}
+	}
+}
+
+// ReservedNumValue reads the in-flight reservation mirror atomically.
+func (n *Node) ReservedNumValue() int64 {
+	if n == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&n.ReservedNum)
 }
 
 func (n *Node) Labels() map[string]string {

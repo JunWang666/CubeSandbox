@@ -113,11 +113,18 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 // profile set. Callers must treat that as a hard error: synthesizing a
 // fallback pipeline here would schedule without any of the safety guards
 // (node_safety/cpu/mem/disk/...) that only exist inside compiled profiles.
+// A single Load+Acquire attempt is deliberate: Acquire only fails on a
+// retired set, and re-loading the same retired pointer cannot succeed, so a
+// retry loop here would spin forever if a retired set were ever left in
+// scheduler.profiles. Retired sets are replaced before Close (see the config
+// watcher), making this a latent rather than live concern.
 func currentPipeline(selCtx *selctx.SelectorCtx) (*profile.Pipeline, func()) {
-	for profiles := scheduler.profiles.Load(); profiles != nil; profiles = scheduler.profiles.Load() {
-		if pipeline, release, acquired := profiles.Acquire(selCtx); acquired {
-			return pipeline, release
-		}
+	profiles := scheduler.profiles.Load()
+	if profiles == nil {
+		return nil, nil
+	}
+	if pipeline, release, acquired := profiles.Acquire(selCtx); acquired {
+		return pipeline, release
 	}
 	return nil, nil
 }
@@ -155,8 +162,11 @@ func selectNode(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) *node.No
 }
 
 // spreadSelect 实现摊平语义：在评分最高的前 topN 个候选中确定性选取当前运行
-// 沙箱数最少的节点，占用相同时保持评分顺序。与 random（top_n 内按分数加权随机）
-// 不同，spread 保证打分聚拢时放置仍然向空闲节点摊开。
+// 沙箱数 + 在途预留数最少的节点，占用相同时保持评分顺序。与 random（top_n 内按
+// 分数加权随机）不同，spread 保证打分聚拢时放置仍然向空闲节点摊开。计入
+// ReservedNum 是因为 MvmNum 是 Cubelet 上次上报值，突发并发创建看到完全相同的
+// MvmNum 时会挤向同一节点；加上预留镜像后选点与 TryReserveNode 的记账一致，
+// 摊平由排序完成而不是靠预留冲突后的拒绝重选。
 func spreadSelect(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 	var candidates node.NodeList
 	if scored := selCtx.LeastScoreNodes(topN); scored.Len() > 0 {
@@ -172,7 +182,8 @@ func spreadSelect(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 		if candidates[i] == nil {
 			continue
 		}
-		if best == nil || candidates[i].MvmNum < best.MvmNum {
+		if best == nil ||
+			candidates[i].MvmNum+candidates[i].ReservedNumValue() < best.MvmNum+best.ReservedNumValue() {
 			best = candidates[i]
 		}
 	}
