@@ -118,6 +118,21 @@ var snapshotSequence atomic.Uint64
 // ownership explicit and protects callers that inject nodes in tests or
 // benchmark simulations.
 func (s *SelectorCtx) FreezeSnapshot() {
+	s.freeze(true)
+}
+
+// FreezeMetadata is FreezeSnapshot without the per-node deep clone: it freezes
+// the request data, snapshot facts and version, and pins the candidate list
+// (shallow slice copy, still stable while result is narrowed by filters), but
+// the snapshot shares the node objects with result. Use it when no consumer
+// reads SnapshotNodes — today only gRPC external plugins serialize the frozen
+// node set, and the local cache already hands out clones, so without them the
+// O(len(candidates)) deep clone has no consumer.
+func (s *SelectorCtx) FreezeMetadata() {
+	s.freeze(false)
+}
+
+func (s *SelectorCtx) freeze(cloneNodes bool) {
 	if s == nil {
 		return
 	}
@@ -125,12 +140,14 @@ func (s *SelectorCtx) FreezeSnapshot() {
 		s.Ctx = context.Background()
 	}
 	if s.result != nil {
-		frozen := make(node.NodeList, 0, len(s.result))
-		for _, candidate := range s.result {
-			frozen = append(frozen, candidate.Clone())
+		if cloneNodes {
+			frozen := make(node.NodeList, 0, len(s.result))
+			for _, candidate := range s.result {
+				frozen = append(frozen, candidate.Clone())
+			}
+			s.result = frozen
 		}
-		s.result = frozen
-		s.snapshot = append(node.NodeList(nil), frozen...)
+		s.snapshot = append(node.NodeList(nil), s.result...)
 	}
 	if s.ReqRes != nil {
 		request := *s.ReqRes

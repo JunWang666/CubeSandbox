@@ -91,21 +91,6 @@ func runCompareMode(compareList string, opts compareOptions) error {
 	for _, v := range variants {
 		name, cfgPath := v[0], v[1]
 		jsonPath := filepath.Join(outDir, name+".json")
-		// args := []string{
-		// 	"--trace", opts.TracePath,
-		// 	"--config", cfgPath,
-		// 	"--nodes", fmt.Sprint(opts.Nodes),
-		// 	"--node-cpu-millis", fmt.Sprint(opts.NodeCPUMilli),
-		// 	"--node-mem-mib", fmt.Sprint(opts.NodeMemMiB),
-		// 	"--instance-type", opts.InstanceType,
-		// 	// "--template-preload", fmt.Sprint(opts.Preload),
-		// 	"--template-preload", fmt.Sprint(opts.Preload),
-		// 	fmt.Sprintf("--allow-non-local-template=%t", opts.AllowNonLocalTemplate),
-		// 	"--template-size-bytes", fmt.Sprint(opts.TemplateSizeBytes),
-		// 	"--seed", fmt.Sprint(opts.Seed),
-		// 	"--rounds", fmt.Sprint(opts.Rounds),
-		// 	"-o", jsonPath,
-		// }
 		args := []string{
 			"--trace", opts.TracePath,
 			"--config", cfgPath,

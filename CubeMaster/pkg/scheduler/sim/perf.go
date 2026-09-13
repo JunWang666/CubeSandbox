@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -335,7 +336,7 @@ func (d *perfDriver) selectStaged(selCtx *selctx.SelectorCtx) (selected *node.No
 		}
 	}
 	t = time.Now()
-	freezeSnapshotFacts(selCtx)
+	freezeSnapshotFacts(selCtx, pipeline)
 	st.prefilter += msSince(t)
 
 	// Stage: guards (mandatory safety/capacity filters).
@@ -412,7 +413,7 @@ func (d *perfDriver) backoffWithPipeline(selCtx *selctx.SelectorCtx, pipeline *p
 	st.prefilter += msSince(t)
 
 	t = time.Now()
-	freezeSnapshotFacts(selCtx)
+	freezeSnapshotFacts(selCtx, pipeline)
 	st.prefilter += msSince(t) // freeze folds into prefilter
 
 	t = time.Now()
@@ -728,7 +729,7 @@ func spreadPick(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 // freezeSnapshotFacts replicates freezeSnapshot (schedule.go) minus the
 // snapshot-storage branch, which sim requests never enable
 // (RequestResource.EnforceSnapshotStorage stays false).
-func freezeSnapshotFacts(selCtx *selctx.SelectorCtx) {
+func freezeSnapshotFacts(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) {
 	facts := make(map[string]selctx.SnapshotNodeFacts, len(selCtx.Nodes()))
 	request := selCtx.GetReqRes()
 	for _, candidate := range selCtx.Nodes() {
@@ -743,5 +744,29 @@ func freezeSnapshotFacts(selCtx *selctx.SelectorCtx) {
 		facts[candidate.ID()] = value
 	}
 	selCtx.SetSnapshotFacts(facts)
-	selCtx.FreezeSnapshot()
+	if pipelineReadsSnapshot(pipeline) {
+		selCtx.FreezeSnapshot()
+	} else {
+		selCtx.FreezeMetadata()
+	}
+}
+
+// pipelineReadsSnapshot replicates the schedule.go predicate: only gRPC
+// external plugins consume the frozen node set, so without one the sim takes
+// the same metadata-only freeze the scheduler would.
+func pipelineReadsSnapshot(pipeline *profile.Pipeline) bool {
+	if pipeline == nil {
+		return false
+	}
+	for _, binding := range append(append([]profile.FilterPlugin(nil), pipeline.Guards...), pipeline.Filters...) {
+		if binding.Selector != nil && strings.HasPrefix(binding.Selector.ID(), "filter/grpc/") {
+			return true
+		}
+	}
+	for _, binding := range pipeline.Scores {
+		if binding.Selector != nil && strings.HasPrefix(binding.Selector.ID(), "score/grpc/") {
+			return true
+		}
+	}
+	return false
 }

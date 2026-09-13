@@ -276,6 +276,13 @@ type SchedulerConf struct {
 	ProfileRouteLabelKeys []string               `yaml:"profile_route_label_keys"`
 	Profiles              []SchedulerProfileConf `yaml:"profiles"`
 
+	// DisableFactoryProfiles opts out of the factory scheduler profile
+	// injection: when true and no scheduler policy is configured (profiles,
+	// filter and score all empty), the scheduler keeps the legacy empty-config
+	// behavior instead of injecting the built-in profiles. It is an explicit
+	// escape hatch for upgrades; new deployments should leave it off.
+	DisableFactoryProfiles bool `yaml:"disable_factory_profiles"`
+
 	// IgnoreRedisAllocation, when true, makes the scheduler ignore the
 	// per-node allocated CPU/Mem usage recorded in Redis (treat allocated as
 	// 0). A pointer is used so an unset value can default to false while still
@@ -1078,7 +1085,8 @@ func preHandOverhead(config *Config) error {
 var schedulerFactoryYAML []byte
 
 // injectFactorySchedulerProfiles 在用户完全没有配置调度策略时注入出厂策略：
-// 要求 scheduler.profiles 与 legacy 的 scheduler.filter / scheduler.score 全部为空。
+// 要求 scheduler.profiles 与 legacy 的 scheduler.filter / scheduler.score 全部为空，
+// 且未显式设置 scheduler.disable_factory_profiles。
 // 一旦用户显式配置了其中任意一项，出厂策略整体不注入（all-or-nothing），
 // 避免覆盖存量部署依赖的 legacy 编译路径（profile.Compile 有 profiles 时忽略 legacy）。
 //
@@ -1087,6 +1095,11 @@ var schedulerFactoryYAML []byte
 // 只存在于该 legacy 子树中；缺失时这些 scorer 空转（见 pkg/selector/score/realtimescore.go）。
 func injectFactorySchedulerProfiles(config *Config) error {
 	sched := config.Scheduler
+	if sched.DisableFactoryProfiles {
+		CubeLog.Infof("scheduler.disable_factory_profiles is true; skipping factory scheduler profile injection, " +
+			"keeping the legacy empty-config scheduling behavior")
+		return nil
+	}
 	if len(sched.Profiles) != 0 || sched.Filter != nil || sched.Score != nil {
 		return nil
 	}
@@ -1116,7 +1129,8 @@ func injectFactorySchedulerProfiles(config *Config) error {
 	// 必须显式告知运维，避免升级后策略静默切换。
 	CubeLog.Warnf("no scheduler policy configured (scheduler.profiles/filter/score all empty); "+
 		"injecting factory scheduler profiles %v: placement now follows mandatory guards + factory scorers + spread selection, "+
-		"which differs from the legacy empty-config behavior; set any of those keys to keep legacy scheduling", names)
+		"which differs from the legacy empty-config behavior; set scheduler.disable_factory_profiles: true "+
+		"or configure any of those keys explicitly to keep legacy scheduling", names)
 	return nil
 }
 
