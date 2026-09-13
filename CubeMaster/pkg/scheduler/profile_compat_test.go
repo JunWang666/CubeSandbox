@@ -121,7 +121,7 @@ func runCompatPipeline(t *testing.T, pipeline *profile.Pipeline) (*selctx.Select
 	}
 	selCtx.SetProfileName(pipeline.Name)
 	selCtx.SetNodes(compatNodes())
-	freezeSnapshot(selCtx)
+	freezeSnapshot(selCtx, pipeline)
 	if err := runProfileFilters(selCtx, pluginKindGuard, pipeline.Guards); err != nil {
 		t.Fatalf("profile %q guards: %v", pipeline.Name, err)
 	}

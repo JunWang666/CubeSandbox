@@ -9,8 +9,9 @@
 # IMPORTANT: with this file injected, scheduling follows the three factory
 # profiles below (mandatory guards + factory scorers + spread selection); that
 # is NOT identical to the pre-profile legacy static registration. To keep the
-# legacy behavior on an existing deployment, configure at least one legacy key
-# (scheduler.filter.enable_filters and/or scheduler.score.enable_scorers):
+# legacy behavior on an existing deployment, set
+# scheduler.disable_factory_profiles: true, or configure at least one legacy
+# key (scheduler.filter.enable_filters and/or scheduler.score.enable_scorers):
 # injection is then skipped entirely and profile.Compile rebuilds the pipeline
 # from the legacy config (compileLegacy), preserving the old tolerance
 # semantics (unknown plugin names and zero-weight scorers are skipped).

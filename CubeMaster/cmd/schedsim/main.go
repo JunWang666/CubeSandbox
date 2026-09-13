@@ -94,7 +94,6 @@ func main() {
 		return
 	}
 
-	// runSingle(*tracePath, *configPath, *nodes, *nodeCPUMilli, *nodeMemMiB, *instanceType, *preload, *seed, *rounds, *out)
 	runSingle(
 		*tracePath,
 		*configPath,

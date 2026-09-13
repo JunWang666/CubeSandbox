@@ -4,6 +4,13 @@ CubeMaster can route each request to a scheduling Profile composed of mandatory 
 
 Three built-in Profiles ship inside the binary (`CubeMaster/pkg/base/config/scheduler_factory.yaml`): `burst_balance` and `template_reuse`, selected by the request label `workload=burst_balance` / `workload=template_reuse`, plus `mixed_binpack` as the default for everything else. When the configuration contains neither `scheduler.profiles` nor the legacy `scheduler.filter` / `scheduler.score` blocks, this built-in set is injected automatically, so a zero-config deployment still schedules with real strategies. Any explicit `scheduler.profiles` or legacy filter/score configuration replaces the built-in set entirely; with only legacy filter/score present, it is compiled into a compatible `default` Profile as before.
 
+## Behavior changes when upgrading
+
+Clusters that upgrade without touching their scheduler configuration should be aware of two behavior changes:
+
+- **An empty scheduler configuration now activates the factory Profiles.** Previously, a deployment with neither `scheduler.profiles` nor legacy `scheduler.filter` / `scheduler.score` ran without any filtering or scoring and picked a random pre-filter candidate. With the factory set injected, every request passes the mandatory guards (`node_safety`, `cpu`, `mem`, `disk`, `template_locality`, `realtime_create_num`) and is scored by the factory scorers with `spread` / `top_n` selection, so placement decisions differ from the old random pick. CubeMaster logs a warning when it injects the factory set. To keep the previous behavior, set `scheduler.disable_factory_profiles: true` (an explicit opt-out), or configure the legacy `scheduler.filter` / `scheduler.score` blocks (they are compiled into a compatible `default` Profile) or an explicit `scheduler.profiles` section.
+- **Template locality scoring is a boolean factor.** The legacy `template_id` image score used to scale linearly with the template size present on the node; it is now an exact-match 100/0 factor (a node either has the template locally or it does not), matching the `template_local` fact exposed to CEL and gRPC plugins. Legacy-configured clusters may see different placement for template requests; in practice the difference is small because the spread/binpack scorers dominate the weighted aggregate.
+
 ## Profile configuration
 
 Only request labels listed in `profile_route_label_keys` may affect routing or be sent to an external plugin. A non-default Profile must have an instance-type or label condition. Routes are evaluated in configuration order and the first match wins.

@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -72,7 +73,7 @@ func Select(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {
 			return backoffSelectWithPipeline(selCtx, pipeline)
 		}
 	}
-	freezeSnapshot(selCtx)
+	freezeSnapshot(selCtx, pipeline)
 
 	// 主过滤：并行执行所有过滤插件，节点必须通过全部过滤
 	if err := runProfileFilters(selCtx, pluginKindGuard, pipeline.Guards); err != nil {
@@ -182,7 +183,7 @@ func backoffSelectWithPipeline(selCtx *selctx.SelectorCtx, pipeline *profile.Pip
 	if err := runBackoffFilter(selCtx); err != nil {
 		return nil, err
 	}
-	freezeSnapshot(selCtx)
+	freezeSnapshot(selCtx, pipeline)
 	if err := runProfileFilters(selCtx, pluginKindGuard, pipeline.Guards); err != nil {
 		return nil, err
 	}
@@ -199,7 +200,7 @@ func backoffSelectWithPipeline(selCtx *selctx.SelectorCtx, pipeline *profile.Pip
 	return selected, nil
 }
 
-func freezeSnapshot(selCtx *selctx.SelectorCtx) {
+func freezeSnapshot(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) {
 	facts := make(map[string]selctx.SnapshotNodeFacts, len(selCtx.Nodes()))
 	request := selCtx.GetReqRes()
 	for _, candidate := range selCtx.Nodes() {
@@ -219,7 +220,33 @@ func freezeSnapshot(selCtx *selctx.SelectorCtx) {
 		facts[candidate.ID()] = value
 	}
 	selCtx.SetSnapshotFacts(facts)
-	selCtx.FreezeSnapshot()
+	// Only gRPC external plugins consume SnapshotNodes; skip the per-attempt
+	// O(len(candidates)) node deep clone when the pipeline has none.
+	if pipelineReadsSnapshot(pipeline) {
+		selCtx.FreezeSnapshot()
+	} else {
+		selCtx.FreezeMetadata()
+	}
+}
+
+// pipelineReadsSnapshot reports whether any bound plugin serializes the frozen
+// node set, i.e. is a gRPC external plugin (IDs are "filter/grpc/<name>" and
+// "score/grpc/<name>", see pkg/selector/plugin/grpcplugin).
+func pipelineReadsSnapshot(pipeline *profile.Pipeline) bool {
+	if pipeline == nil {
+		return false
+	}
+	for _, binding := range append(append([]profile.FilterPlugin(nil), pipeline.Guards...), pipeline.Filters...) {
+		if binding.Selector != nil && strings.HasPrefix(binding.Selector.ID(), "filter/grpc/") {
+			return true
+		}
+	}
+	for _, binding := range pipeline.Scores {
+		if binding.Selector != nil && strings.HasPrefix(binding.Selector.ID(), "score/grpc/") {
+			return true
+		}
+	}
+	return false
 }
 
 func BackoffSelect(selCtx *selctx.SelectorCtx) (nodes *node.Node, err error) {

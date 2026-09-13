@@ -95,6 +95,10 @@ func TestInjectFactorySchedulerProfilesRespectsUserConfig(t *testing.T) {
 				ResourceWeights: map[string]float64{"quota_cpu_usage": 1},
 			}},
 		},
+		{
+			name:  "factory injection disabled",
+			sched: SchedulerConf{DisableFactoryProfiles: true},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
