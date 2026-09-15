@@ -7,6 +7,7 @@ package profile
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
@@ -175,4 +176,39 @@ func TestProfileSetDefersCloseUntilLeaseRelease(t *testing.T) {
 	if !closer.closed {
 		t.Fatal("last lease release must close plugin connection")
 	}
+}
+
+// TestProfileCompileRequiresLegacyConfForCoupledScorers pins the compile-time
+// validation for built-in scorers that still read their factor switches from
+// the legacy scheduler.score tree: a profile referencing them without the
+// legacy block must fail to compile instead of silently scoring nothing.
+func TestProfileCompileRequiresLegacyConfForCoupledScorers(t *testing.T) {
+	profileConf := config.SchedulerProfileConf{
+		Name:    "reuse",
+		Default: true,
+		Scores: []config.SchedulerProfilePluginConf{
+			{Name: "image_score", Type: "go", Weight: 1},
+		},
+	}
+
+	// Without the legacy plugin_conf block: compile must fail.
+	cfg := &config.Config{Scheduler: &config.WrapperSchedulerConf{SchedulerConf: config.SchedulerConf{
+		Profiles: []config.SchedulerProfileConf{profileConf},
+	}}}
+	if _, err := Compile(context.Background(), cfg, profileRegistry(t)); err == nil {
+		t.Fatal("profile referencing image_score without scheduler.score.plugin_conf.image_score must be rejected")
+	} else if !strings.Contains(err.Error(), "plugin_conf.image_score") {
+		t.Fatalf("error must point at the missing legacy block, got: %v", err)
+	}
+
+	// With the legacy block present: compile succeeds.
+	cfg.Scheduler.Score = &config.SchedulerScoreConf{
+		ResourceWeights: map[string]float64{"template_id": 1},
+		ScorePluginConf: config.ScorePluginConf{ImageScore: &config.ImageScore{Weight: 1}},
+	}
+	set, err := Compile(context.Background(), cfg, profileRegistry(t))
+	if err != nil {
+		t.Fatalf("compile with the legacy block present: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
 }

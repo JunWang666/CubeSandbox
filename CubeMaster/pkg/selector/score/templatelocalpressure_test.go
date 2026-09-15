@@ -6,6 +6,7 @@ package score
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -147,8 +148,8 @@ func TestTemplateLocalPressureScoreSkipsWithoutTemplate(t *testing.T) {
 		selCtx.SetNodes(node.NodeList{{InsID: "node-1", CreateConcurrentNum: 100}})
 
 		scores, err := scorer.Select(selCtx)
-		if err != nil {
-			t.Fatalf("Select returned an unexpected error: %v", err)
+		if !errors.Is(err, ErrNotApplicable) {
+			t.Fatalf("Select err=%v, want ErrNotApplicable", err)
 		}
 		if scores != nil {
 			t.Fatalf("scorer should skip when template id is missing, got %v", scores)

@@ -162,15 +162,37 @@ with single-variable A/B runs.
 
 ## Metric definitions and sources
 
-The simulator (schedsim, `--workload burst|template_storm|mixed_spec`) and real
-clusters (cube-bench + real Kubelets) share one set of metric definitions; only
-the data source differs. The simulator aggregates them offline in
-`pkg/scheduler/sim/metrics.go` (see the metrics table in
-`cmd/schedsim/README.md`); production emits them via the Prometheus metrics in
-`CubeMaster/pkg/scheduler/metrics.go`
+The simulator (schedsim) consumes a cube-bench trace file — `schedsim
+--trace trace.json --config conf.yaml`, where the trace is produced by
+`cube-bench --workload burst|template_storm|mixed_spec --dump-trace` (the
+`--workload` flag belongs to cube-bench, not schedsim) — and aggregates the
+quality metrics offline in `pkg/scheduler/sim/metrics.go` (see the metrics
+table in `cmd/schedsim/README.md`). Production emits the corresponding
+signals via the Prometheus metrics in `CubeMaster/pkg/scheduler/metrics.go`
 (`scheduler_decisions_total{profile,template_hit}`,
 `sandbox_create_duration_seconds{profile,result}`, etc.), labelled by profile
-name, so benchmark conclusions extrapolate to production.
+name.
+
+The two sides share metric names and intent so benchmark conclusions
+extrapolate to production, but several definitions differ in detail — do not
+treat schedsim and Prometheus numbers as directly interchangeable:
+
+- **Jain index of an empty set**: schedsim defines an empty input as
+  perfectly balanced (1); the production gauge (`jainOfRatios`) reports 0 for
+  an empty cluster. Both return 1 for an all-zero (fully idle) set.
+- **Fragmentation**: schedsim's `fragmentation_ratio` is CPU-only and uses
+  the largest request shape in the trace as the reference shape (a node is
+  unfit when `free <= shape`, mirroring the filter's strict admission check);
+  production's `fragmented_capacity_ratio` uses the cluster-wide MaxMvm
+  shape, marks a node unfit when free CPU *or* free memory falls below it,
+  and averages the CPU and memory ratios.
+- **Herding window**: schedsim's `herding_top1_share` is the most-picked
+  node's share of all successful placements in a run; production's
+  `scheduler_herding_top1_share` is a rolling window over the last 100
+  successful decisions.
+- **Reservations**: production scheduling and metrics account for in-flight
+  reservations (`node.reserved`); the simulator does not model the
+  reservation window between selection and Cubelet create.
 
 For the controlled-experiment method (same input, same environment, different
 strategy) and the three modes (real-cluster primary, simulator secondary,

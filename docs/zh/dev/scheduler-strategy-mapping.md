@@ -133,14 +133,31 @@ Guards 决定"能不能跑"，策略只决定可行节点之间的优先级。
 
 ## 指标口径与出处
 
-仿真（schedsim，`--workload burst|template_storm|mixed_spec`）与真机
-（cube-bench + 真实集群）使用同一套指标定义，只是数据来源不同：
-仿真侧由 `pkg/scheduler/sim/metrics.go` 离线汇总（定义见
-`cmd/schedsim/README.md` 的指标表），生产侧由
-`CubeMaster/pkg/scheduler/metrics.go` 的 Prometheus 指标输出
+仿真（schedsim）消费 cube-bench 的 trace 文件——`schedsim --trace
+trace.json --config conf.yaml`，trace 由 `cube-bench --workload
+burst|template_storm|mixed_spec --dump-trace` 生成（`--workload` 是
+cube-bench 的参数，不是 schedsim 的）——并由
+`pkg/scheduler/sim/metrics.go` 离线汇总质量指标（定义见
+`cmd/schedsim/README.md` 的指标表）。生产侧由
+`CubeMaster/pkg/scheduler/metrics.go` 的 Prometheus 指标输出对应信号
 （`scheduler_decisions_total{profile,template_hit}`、
-`sandbox_create_duration_seconds{profile,result}` 等），标签固定用策略名，
-保证评测结论可外推到生产。
+`sandbox_create_duration_seconds{profile,result}` 等），标签固定用策略名。
+
+两侧指标的名称与意图一致，评测结论因此可外推到生产，但若干定义在细节上
+并不相同——不要把 schedsim 与 Prometheus 的数值当作可直接互换：
+
+- **空集的 Jain 指数**：schedsim 将空输入定义为完全均衡（1）；生产侧
+  gauge（`jainOfRatios`）对空集群上报 0。全零（全空闲）集合两侧都返回 1。
+- **碎片率**：schedsim 的 `fragmentation_ratio` 只看 CPU，参照形状取 trace
+  中最大请求规格（`free <= shape` 即视为装不下，与 Filter 的严格准入判断
+  一致）；生产侧 `fragmented_capacity_ratio` 参照形状取集群级 MaxMvm 规格，
+  空闲 CPU *或*内存任一低于形状即视为装不下，并取 CPU 与内存两个比例的
+  平均。
+- **羊群度窗口**：schedsim 的 `herding_top1_share` 是整轮运行中命中最多
+  节点的占比；生产侧 `scheduler_herding_top1_share` 是最近 100 次成功调度
+  决策的滚动窗口。
+- **预留**：生产侧的调度与指标会算入在途预留（`node.reserved`）；仿真器
+  不建模"选定节点到 Cubelet 创建返回"之间的预留窗口。
 
 对照实验方法（同一输入、同一环境、不同策略）与三模式（真机实测为主、
 仿真为辅、真机 A/B）见《Cube 最终方案》模块三；量化对比结果见

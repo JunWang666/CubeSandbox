@@ -136,7 +136,7 @@ func Compile(ctx context.Context, cfg *config.Config, registry *plugin.Registry)
 			return nil, fmt.Errorf("duplicate scheduler profile name %q", name)
 		}
 		seenNames[nameKey] = struct{}{}
-		pipeline, compileErr := compileProfile(ctx, profileConf, registry, set)
+		pipeline, compileErr := compileProfile(ctx, cfg.Scheduler, profileConf, registry, set)
 		if compileErr != nil {
 			return nil, fmt.Errorf("compile scheduler profile %q: %w", name, compileErr)
 		}
@@ -227,7 +227,7 @@ func compileLegacy(ctx context.Context, scheduler *config.WrapperSchedulerConf, 
 	return pipeline, nil
 }
 
-func compileProfile(ctx context.Context, conf config.SchedulerProfileConf, registry *plugin.Registry, set *Set) (*Pipeline, error) {
+func compileProfile(ctx context.Context, sched *config.WrapperSchedulerConf, conf config.SchedulerProfileConf, registry *plugin.Registry, set *Set) (*Pipeline, error) {
 	filterFailure, scoreFailure, noCandidate, err := failurePolicies(conf.Failure)
 	if err != nil {
 		return nil, err
@@ -295,6 +295,9 @@ func compileProfile(ctx context.Context, conf config.SchedulerProfileConf, regis
 			return nil, fmt.Errorf("duplicate score plugin %q", key)
 		}
 		seenScores[key] = struct{}{}
+		if err := validateLegacyCoupledScoreConf(sched, name, pluginConf); err != nil {
+			return nil, err
+		}
 		selector, buildErr := registry.BuildScore(ctx, pluginConf)
 		if buildErr != nil {
 			return nil, buildErr
@@ -344,6 +347,45 @@ func failurePolicies(conf config.SchedulerFailureConf) (FilterFailurePolicy, Sco
 }
 
 func enabled(value *bool) bool { return value == nil || *value }
+
+// validateLegacyCoupledScoreConf rejects profile entries that reference the
+// built-in scorers still reading their factor switches from the legacy global
+// scheduler.score tree when that tree is missing the required block. Without
+// this check such a scorer silently contributes nothing: its Select returns
+// an empty result and (pre-ErrNotApplicable semantics) the pipeline treated
+// that as "nothing to add". Factory-injected profiles carry the legacy score
+// subtree (scheduler_factory.yaml), so they always pass; the error only fires
+// for hand-written profiles that forgot the coupling.
+func validateLegacyCoupledScoreConf(sched *config.WrapperSchedulerConf, name string, conf config.SchedulerProfilePluginConf) error {
+	kind := strings.ToLower(strings.TrimSpace(conf.Type))
+	if kind == "" || kind == "builtin" {
+		kind = plugin.TypeGo
+	}
+	if kind != plugin.TypeGo {
+		return nil
+	}
+	missing := func(block string) error {
+		return fmt.Errorf("score plugin %q requires the legacy %s block: this built-in scorer reads its factor switches from the legacy scheduler.score tree (copy it from scheduler_factory.yaml or set scheduler.score accordingly); without it the scorer would silently score nothing", name, block)
+	}
+	switch name {
+	case "real_time_weighted_average":
+		if sched == nil || sched.Score == nil || sched.Score.ScorePluginConf.RealTimeWeightedAverage == nil {
+			return missing("scheduler.score.plugin_conf.real_time_weighted_average")
+		}
+		if sched.Score.ResourceWeights == nil {
+			return missing("scheduler.score.resource_weights")
+		}
+	case "image_score":
+		if sched == nil || sched.Score == nil || sched.Score.ScorePluginConf.ImageScore == nil {
+			return missing("scheduler.score.plugin_conf.image_score")
+		}
+	case "multi_factor_weighted_average":
+		if sched == nil || sched.Score == nil || sched.Score.ScorePluginConf.MultiFactorWeightedAverage == nil {
+			return missing("scheduler.score.plugin_conf.multi_factor_weighted_average")
+		}
+	}
+	return nil
+}
 
 func profilePluginKey(conf config.SchedulerProfilePluginConf) string {
 	kind := strings.ToLower(strings.TrimSpace(conf.Type))

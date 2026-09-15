@@ -72,8 +72,9 @@ func (l *templateLocalPressureScore) Disable() bool {
 }
 
 // Select 为每个候选节点计算同模板创建压力分数。
-// 请求不带模板 ID 时没有同模板压力维度可评估，返回空列表跳过本插件
-// （Profile 流水线会忽略空结果，不参与加权聚合）。
+// 请求不带模板 ID 时没有同模板压力维度可评估，返回 ErrNotApplicable 显式
+// 跳过本插件（Profile 流水线对 ErrNotApplicable 不做失败处理：不打默认分、
+// 不贡献权重，即使插件被 ForceEnabled）。
 func (l *templateLocalPressureScore) Select(
 	selCtx *selctx.SelectorCtx,
 ) (node.NodeScoreList, error) {
@@ -92,7 +93,7 @@ func (l *templateLocalPressureScore) Select(
 	}
 
 	if selCtx.ReqRes == nil || selCtx.ReqRes.TemplateID == "" {
-		return nil, nil
+		return nil, fmt.Errorf("%w: request has no template id", ErrNotApplicable)
 	}
 	templateID := selCtx.ReqRes.TemplateID
 

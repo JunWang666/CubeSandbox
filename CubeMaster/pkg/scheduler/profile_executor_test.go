@@ -7,11 +7,13 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/profile"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/selector/score"
 )
 
 type executorFilter struct {
@@ -168,5 +170,33 @@ func TestRunProfileScoresIncompleteOutputUsesDefault(t *testing.T) {
 	got := selection.LeastScoreNodes(-1)
 	if len(got) != 2 || got[0].Score != 25 || got[1].Score != 25 {
 		t.Fatalf("scores = %+v", got)
+	}
+}
+
+type notApplicableScore struct{}
+
+func (notApplicableScore) ID() string      { return "not-applicable-score" }
+func (notApplicableScore) Weight() float64 { return 1 }
+func (notApplicableScore) Disable() bool   { return false }
+func (notApplicableScore) Select(*selctx.SelectorCtx) (node.NodeScoreList, error) {
+	return nil, fmt.Errorf("%w: test dimension does not apply", score.ErrNotApplicable)
+}
+
+// TestRunProfileScoresNotApplicableSkipsCleanly pins the plugin contract: an
+// explicit ErrNotApplicable skips the plugin without failure handling — no
+// default-score substitution and no weight contribution — even for a
+// ForceEnabled plugin under the default-score policy.
+func TestRunProfileScoresNotApplicableSkipsCleanly(t *testing.T) {
+	selection := executorContext()
+	err := runProfileScores(selection, []profile.ScorePlugin{
+		{Name: "na", Selector: notApplicableScore{}, Weight: 5, Failure: profile.ScoreDefaultScore, DefaultScore: 50, ForceEnabled: true},
+		{Name: "values", Selector: executorScore{id: "values", values: map[string]float64{"n1": 100, "n2": 0}}, Weight: 1, Failure: profile.ScoreFailClosed, ForceEnabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := selection.LeastScoreNodes(-1)
+	if len(got) != 2 || got[0].InsID != "n1" || got[0].Score != 100 || got[1].Score != 0 {
+		t.Fatalf("not-applicable plugin must not contribute default scores or weight: %+v", got)
 	}
 }

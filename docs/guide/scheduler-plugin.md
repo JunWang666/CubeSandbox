@@ -9,7 +9,7 @@ Three built-in Profiles ship inside the binary (`CubeMaster/pkg/base/config/sche
 Clusters that upgrade without touching their scheduler configuration should be aware of two behavior changes:
 
 - **An empty scheduler configuration now activates the factory Profiles.** Previously, a deployment with neither `scheduler.profiles` nor legacy `scheduler.filter` / `scheduler.score` / `scheduler.postscore` ran without any filtering or scoring and picked a random pre-filter candidate. With the factory set injected, every request passes the mandatory guards (`node_safety`, `cpu`, `mem`, `disk`, `template_locality`, `realtime_create_num`) and is scored by the factory scorers with `spread` / `top_n` selection, so placement decisions differ from the old random pick. CubeMaster logs a warning when it injects the factory set. To keep the previous behavior, set `scheduler.disable_factory_profiles: true` (an explicit opt-out), or configure the legacy `scheduler.filter` / `scheduler.score` blocks (they are compiled into a compatible `default` Profile) or an explicit `scheduler.profiles` section.
-- **Template locality scoring is a boolean factor.** The legacy `template_id` image score used to scale linearly with the template size present on the node; it is now an exact-match 100/0 factor (a node either has the template locally or it does not), matching the `template_local` fact exposed to CEL and gRPC plugins. Legacy-configured clusters may see different placement for template requests; in practice the difference is small because the spread/binpack scorers dominate the weighted aggregate.
+- **Template locality scoring is now a boolean 100/0 factor — this is a real behavior change.** Before, the `template_id` factor of `image_score` graded nodes linearly by the total size of the node's local replicas of the template, mapped through a `[23MB, 80GB]` window onto `[0, 100]`; now every node holding the template gets exactly 100 and every other node gets 0, matching the `template_local` fact exposed to CEL and gRPC plugins. (The old linear value was numerically crushed by the resource factors at GiB scale, so the locality preference was already weak in practice — but it was not zero.) How much placement actually shifts depends on which scorers and weights a deployment runs: for the factory `template_reuse` Profile, `image_score` is the dominant 0.7-weight factor, and a legacy cluster that enables only `image_score` (`score.enable_scorers: [image_score]`) can see a material placement change for template requests without touching its configuration.
 
 ## Profile configuration
 
@@ -43,7 +43,14 @@ scheduler:
 
 Custom Profiles always run the `node_safety`, `cpu`, `mem`, `disk`, `template_locality`, and `realtime_create_num` guards. They cannot be disabled or repeated as optional filters. `node_safety` checks health, metric freshness, the MVM limit, and CPU-load validity on both the normal and backoff paths.
 
-After a node is selected, CubeMaster re-reads it and atomically reserves the request's CPU and memory quota, one MVM slot, and one create-concurrency slot, so concurrent creates stop piling onto a node whose metrics have not caught up yet. A conflict reselects another node (bounded retries); the reservation is released as soon as the Cubelet create returns, on failure as well as success, where the next Cubelet metric report takes the accounting over. Multiple CubeMaster replicas coordinate these reservations through per-node Redis counters and degrade to local-only reservations when Redis is unavailable. The count of a replica's in-flight reservations is exposed to plugins as `node.reserved`.
+After a node is selected, CubeMaster re-reads it and atomically reserves the request's CPU and memory quota, one MVM slot, and one create-concurrency slot, so concurrent creates stop piling onto a node whose metrics have not caught up yet. A conflict reselects another node (bounded retries, with a short exponential backoff in between); the reservation is released as soon as the Cubelet create returns, on failure as well as success, where the next Cubelet metric report takes the accounting over. The count of a replica's in-flight reservations is exposed to plugins as `node.reserved`.
+
+Multiple CubeMaster replicas coordinate these reservations through per-node Redis counters. Each reservation carries a unique token recorded in a per-node token set, and the acquire/release Lua scripts are idempotent on that token, so a transport-level retry after a client-side timeout can neither double-charge an acquire nor double-subtract a release. Whatever a crashed replica leaves behind is reaped by a safety TTL (the create timeout plus one minute).
+
+What happens when the Redis write itself fails is an explicit policy knob, `scheduler.reservation_redis_error_policy`:
+
+- `fail_open` (default): keep the local in-process reservation and rely on the `realtime_create_num` guard as backstop, matching the pre-reservation behavior. Note for multi-replica deployments: while a replica runs degraded, its in-flight pressure is invisible to the other replicas, so cross-replica over-commit protection is partially lost.
+- `fail_closed`: roll the local reservation back and fail the scheduling attempt. Recommended for multi-replica deployments that prefer failing creates over silently losing cross-replica accounting during a Redis outage.
 
 ## Plugin types
 
@@ -82,3 +89,15 @@ SOCKET=/tmp/cube-scheduler-example.sock go run ./examples/scheduler-plugin
 - `no_candidate` supports `fail` and `backoff`. A custom Profile using backoff still reruns its guards, filters, and scores.
 
 Configuration is compiled as one unit at startup or during a hot reload. If a plugin name, route, expression, weight, selection method, or failure policy is invalid, the new Profile set is not activated and the scheduler continues using the previous complete pipeline.
+
+## Built-in scorers and the legacy score tree
+
+Three built-in scorers still read their factor switches from the legacy global `scheduler.score` tree rather than from Profile `args`:
+
+- `real_time_weighted_average` requires `scheduler.score.plugin_conf.real_time_weighted_average` and `scheduler.score.resource_weights`;
+- `image_score` requires `scheduler.score.plugin_conf.image_score`;
+- `multi_factor_weighted_average` requires `scheduler.score.plugin_conf.multi_factor_weighted_average` (its background refresh loop also runs off that block).
+
+A Profile that references one of these scorers without the required legacy block is **rejected at compile time** (startup or hot reload), so a silently no-op scorer is not possible. The factory Profiles injected on a zero-config deployment carry a matching legacy `scheduler.score` subtree inside `scheduler_factory.yaml` for exactly this reason — when you customize a factory Profile, edit the weights on the Profile entry, but keep (or adjust) that legacy subtree for the factor switches.
+
+A score plugin whose dimension does not apply to a request can return `score.ErrNotApplicable` to be skipped explicitly: it then contributes no scores and no weight and is not treated as a failure, even under `fail-closed` / `default-score` policies. `template_local_pressure` uses this for requests without a `template_id`. Returning an empty score list with a nil error is instead a contract violation for profile-mode scorers and triggers the configured failure policy.

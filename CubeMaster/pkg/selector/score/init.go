@@ -7,6 +7,7 @@ package score
 
 import (
 	"context"
+	"errors"
 	"reflect"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
@@ -24,6 +25,16 @@ type Selector interface {
 
 	Disable() bool
 }
+
+// ErrNotApplicable is returned (possibly wrapped) by a score plugin whose
+// dimension genuinely does not apply to the current request — e.g.
+// template_local_pressure on a request without a TemplateID. The profile
+// pipeline treats it as an explicit skip: the plugin contributes no scores
+// and no weight, and it is not treated as a failure even for a ForceEnabled
+// plugin under the fail-closed or default-score policies. This is distinct
+// from returning an empty list with a nil error, which a ForceEnabled plugin
+// is not allowed to do (every candidate must be scored).
+var ErrNotApplicable = errors.New("score plugin not applicable to this request")
 
 func NewSelector(ctx context.Context) []Selector {
 	conf := config.GetConfig().Scheduler
