@@ -530,6 +530,15 @@ func runProfileScores(selCtx *selctx.SelectorCtx, scores []profile.ScorePlugin) 
 		if result.skip {
 			continue
 		}
+		if errors.Is(result.err, score.ErrNotApplicable) {
+			// The plugin's scoring dimension explicitly does not apply to
+			// this request (e.g. template_local_pressure without a
+			// TemplateID): skip it — no scores, no weight, and no failure
+			// handling, even for a ForceEnabled plugin. This is the
+			// contract-sanctioned alternative to an empty result, which a
+			// ForceEnabled plugin must not return.
+			continue
+		}
 		if result.err == nil {
 			seen := make(map[string]struct{}, len(result.nodes))
 			for _, scored := range result.nodes {

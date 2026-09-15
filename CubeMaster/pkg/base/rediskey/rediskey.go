@@ -50,6 +50,14 @@ func NodeReservation(nodeID string) string {
 	return join(Prefix, Version, ScopeMaster, "node", "reservation", nodeID)
 }
 
+// NodeReservationTokens is the per-node Set of in-flight reservation tokens.
+// The reservation Lua scripts use it for idempotency: a transport-retried
+// acquire finds its token already present and skips the delta application, a
+// retried release finds its token already removed and does nothing.
+func NodeReservationTokens(nodeID string) string {
+	return join(Prefix, Version, ScopeMaster, "node", "reservation", "tokens", nodeID)
+}
+
 // SandboxProxy is the sandbox proxy routing Hash key, shared with CubeProxy.
 func SandboxProxy(sandboxID string) string {
 	return join(Prefix, Version, ScopeShared, "sandbox", "proxy", sandboxID)

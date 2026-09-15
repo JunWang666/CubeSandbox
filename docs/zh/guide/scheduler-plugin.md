@@ -9,7 +9,7 @@ CubeMaster 支持按请求场景选择调度 Profile。每个 Profile 由不可�
 不修改调度配置直接升级的集群需要注意两处行为变化：
 
 - **空调度配置现在会激活出厂 Profile。** 此前，既没有 `scheduler.profiles` 也没有 legacy `scheduler.filter` / `scheduler.score` / `scheduler.postscore` 的部署不做任何过滤和评分，从预过滤候选中随机选点。注入出厂策略后，所有请求都会经过强制 Guards（`node_safety`、`cpu`、`mem`、`disk`、`template_locality`、`realtime_create_num`），并由出厂 Score 按 `spread` / `top_n` 选点，放置决策与旧的随机选点不同。注入发生时 CubeMaster 会输出告警日志。如需保持旧行为，可显式设置 `scheduler.disable_factory_profiles: true`（显式关闭注入），或显式配置 legacy `scheduler.filter` / `scheduler.score`（会编译为兼容的 `default` Profile）或 `scheduler.profiles`。
-- **模板亲和评分改为布尔因子。** legacy `template_id` 镜像评分此前按节点上已有的模板大小线性加分，现在改为精确匹配的 100/0 因子（节点要么本地已有模板，要么没有），与暴露给 CEL 和 gRPC 插件的 `template_local` 事实语义一致。使用 legacy 配置的集群在模板请求上的落点可能发生变化；实际差异通常较小，因为摊平/装箱类 Score 在加权总和中占主导。
+- **模板亲和评分改为布尔 100/0 因子——这是一个真实的行为变化。** 此前 `image_score` 的 `template_id` 因子按节点上该模板本地副本的总大小线性打分，经 `[23MB, 80GB]` 窗口映射到 `[0, 100]`；现在持有该模板的节点一律得 100，其余节点得 0，与暴露给 CEL 和 gRPC 插件的 `template_local` 事实语义一致。（旧的线性分值在 GiB 级模板下会被资源因子在数值上碾压，模板亲和偏好实际上已经很弱——但并非完全没有影响。）落点实际变化多大取决于部署启用了哪些 Score 及权重：出厂 `template_reuse` Profile 中 `image_score` 是占 0.7 权重的主导因子；只启用 `image_score`（`score.enable_scorers: [image_score]`）的 legacy 集群也可能在不改配置的情况下看到模板请求落点的明显变化。
 
 ## Profile 配置
 
@@ -43,7 +43,14 @@ scheduler:
 
 自定义 Profile 固定执行 `node_safety`、`cpu`、`mem`、`disk`、`template_locality` 和 `realtime_create_num` Guards，配置不能关闭或重复声明这些安全约束。其中 `node_safety` 会在正常路径和 backoff 路径检查健康度、指标新鲜度、MVM 上限及 CPU load 合法性。
 
-选定节点后，CubeMaster 会重读该节点并原子预留本次请求的 CPU、内存配额、一个 MVM 槽位和一个创建并发槽位，避免并发创建在节点指标更新前反复落到同一节点。预留冲突会换节点有限重选；Cubelet 创建调用返回后（无论成功或失败）即释放预留，成功场景由下一次节点指标上报接管记账。多 CubeMaster 副本通过按节点的 Redis 计数协调预留，Redis 不可用时退化为本地预留。本副本持有的在途预留数以 `node.reserved` 暴露给插件。
+选定节点后，CubeMaster 会重读该节点并原子预留本次请求的 CPU、内存配额、一个 MVM 槽位和一个创建并发槽位，避免并发创建在节点指标更新前反复落到同一节点。预留冲突会换节点有限重选（重试间有短暂指数退避）；Cubelet 创建调用返回后（无论成功或失败）即释放预留，成功场景由下一次节点指标上报接管记账。本副本持有的在途预留数以 `node.reserved` 暴露给插件。
+
+多 CubeMaster 副本通过按节点的 Redis 计数协调预留。每个预留携带唯一 token 并记录在按节点的 token 集合中，acquire/release 两个 Lua 脚本基于该 token 幂等：客户端超时后的传输层重试既不会重复记账，也不会重复扣减。副本崩溃残留的预留由安全 TTL（创建超时加一分钟）回收。
+
+Redis 写入本身失败时的行为由显式策略开关 `scheduler.reservation_redis_error_policy` 决定：
+
+- `fail_open`（默认）：保留进程内本地预留，以 `realtime_create_num`  guard 兜底，与引入预留机制前的行为一致。多副本部署注意：副本降级期间，其在途压力对其他副本不可见，跨副本的超卖保护会部分失效。
+- `fail_closed`：回滚本地预留并使本次调度失败。推荐多副本部署使用——宁愿在 Redis 故障期间拒绝创建，也不静默丢失跨副本记账。
 
 ## 插件类型
 
@@ -82,3 +89,15 @@ SOCKET=/tmp/cube-scheduler-example.sock go run ./examples/scheduler-plugin
 - `no_candidate` 支持 `fail` 和 `backoff`。自定义 Profile 使用 backoff 时仍会重新执行 Guards、Filter 和 Score。
 
 配置在启动或热更新时整体编译；插件名、路由、表达式、权重、选点方式或失败策略无效时，新 Profile 集不会生效，调度器继续使用上一份完整管线。
+
+## 内置 Score 与 legacy score 配置树
+
+有三个内置 Score 的因子开关仍从 legacy 全局 `scheduler.score` 配置树读取，而不是 Profile 的 `args`：
+
+- `real_time_weighted_average` 依赖 `scheduler.score.plugin_conf.real_time_weighted_average` 与 `scheduler.score.resource_weights`；
+- `image_score` 依赖 `scheduler.score.plugin_conf.image_score`；
+- `multi_factor_weighted_average` 依赖 `scheduler.score.plugin_conf.multi_factor_weighted_average`（其后台刷新协程也由该配置块驱动）。
+
+Profile 引用了上述 Score 但缺少对应 legacy 配置块时，会在**编译期被拒绝**（启动或热更新时报错），不存在静默空转的 Score。零配置注入的出厂 Profile 在 `scheduler_factory.yaml` 中自带配套的 legacy `scheduler.score` 子树，原因正在于此——自定义出厂 Profile 时，权重改在 Profile 条目上，但因子开关仍需保留（或调整）该 legacy 子树。
+
+当某个 Score 插件的评分维度对当前请求不适用时，可返回 `score.ErrNotApplicable` 显式跳过：不贡献分数与权重，也不按失败处理（即使在 `fail-closed` / `default-score` 策略下）。`template_local_pressure` 对不带 `template_id` 的请求即如此。相反，Profile 模式下返回空评分列表加 nil 错误属于违反插件契约，会触发配置的失败策略。

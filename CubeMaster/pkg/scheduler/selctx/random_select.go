@@ -27,8 +27,12 @@ func (r *randomSelect) All() map[interface{}]int {
 	return nil
 }
 
-// RemoveAll 随机选择器无需清空权重表，空实现
-func (r *randomSelect) RemoveAll() {}
+// RemoveAll 清空已累积的元素。SelectorCtx 在 reservation 冲突后会被复用并
+// 重新调用 LeastRandomSelect，若不清空，上一轮累积的（可能已被标记为 bad 的）
+// 节点仍可能被 Next 选中。
+func (r *randomSelect) RemoveAll() {
+	r.items = nil
+}
 
-// Reset 随机选择器无需重置状态，空实现
+// Reset 随机选择器无均衡状态需要重置，空实现
 func (r *randomSelect) Reset() {}
