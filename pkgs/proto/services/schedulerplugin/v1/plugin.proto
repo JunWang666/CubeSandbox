@@ -61,6 +61,8 @@ message SnapshotNode {
   repeated string local_templates = 21;
   bool template_local = 22;
   bool snapshot_storage_writable = 23;
+
+  reserved 24; // removed: in-flight reservation count (reservation subsystem deleted)
 }
 
 message FilterRequest {

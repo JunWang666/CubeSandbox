@@ -62,7 +62,7 @@ func TestSorted(t *testing.T) {
 	assert.Equal(t, 1, tmpNode.Index)
 }
 
-// TestLeastRandomSelectClearsStaleItems locks in the reservation-conflict
+// TestLeastRandomSelectClearsStaleItems locks in the admission-failure
 // reselect behavior: the reused SelectorCtx must not return a node that was
 // marked last-bad after the first pick, even though the selector accumulated
 // it during that pick.
@@ -76,7 +76,7 @@ func TestLeastRandomSelectClearsStaleItems(t *testing.T) {
 		t.Fatalf("first pick = %v, want the only candidate (bad)", got)
 	}
 
-	// Reservation conflict on the selected node: mark it bad and reselect
+	// Admission failure on the selected node: mark it bad and reselect
 	// from the remaining candidates with the same SelectorCtx.
 	slctx.AddLastBadNode(bad)
 	slctx.SetNodes(node.NodeList{good})
