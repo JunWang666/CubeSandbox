@@ -178,7 +178,7 @@ scheduler:
 
 ## 本地预留与 Redis
 
-创建派发前的资源预留仅在当前 CubeMaster 进程内完成，不再执行同步 Redis reservation EVAL。本地容量复查、冲突重选和幂等释放仍然保留。旧配置中的 `scheduler.reservation_redis_error_policy` 应删除；该策略不再生效。
+CubeMaster 不再维护资源预留账本，也不再在派发前执行同步 Redis reservation 检查。每个副本根据本地节点快照执行准入，指标独立传播；在上报窗口内，多副本可能针对同一可见容量重复准入，因此不提供跨副本原子配额协调。旧配置中的 `scheduler.reservation_redis_error_policy` 已废弃，应删除。
 
 多个 CubeMaster 仍通过节点指标及创建并发估算获得压力信息，但本地预留对其他 Master 不可见，不能保证跨副本原子容量接收。节点指标更新前仍可能出现超额派发。Cubelet 现有的创建并发限流和单沙箱资源限制不等同于节点总配额的原子检查；补齐后者属于后续工作。
 

@@ -58,7 +58,7 @@ CubeMaster decides its scheduling strategy from the configuration as follows:
 Two cross-cutting details operators should know:
 
 - **Where scorer factor switches live**: the built-in scorers `real_time_weighted_average`, `image_score`, and `multi_factor_weighted_average` read their `enable_weight_factors` / factor weights from the legacy `scheduler.score.plugin_conf` and `scheduler.score.resource_weights` blocks even when they are referenced from a Profile. A Profile that references them without the required legacy block fails to compile at startup or hot reload. The factory Profiles embed a matching legacy score subtree, so zero-config deployments are covered.
-- **Reservation behavior**: after selection, capacity is checked and CPU/memory, MVM and create-concurrency slots are reserved under a process-local lock until Cubelet returns. Reservations do not access Redis or atomically coordinate capacity across Masters. The old `scheduler.reservation_redis_error_policy` setting has been removed. See [scheduler plugins](./scheduler-plugin.md) for semantics and limitations.
+- **Reservation behavior**: the reservation ledger and synchronous Redis reservation check have been removed from the create path. CubeMaster performs local admission checks and dispatches to Cubelet; metrics update independently, so cross-replica admission can over-admit during the reporting window. Delete the obsolete `scheduler.reservation_redis_error_policy` setting. See [scheduler plugins](./scheduler-plugin.md) for details.
 
 ## Key scheduler fields
 

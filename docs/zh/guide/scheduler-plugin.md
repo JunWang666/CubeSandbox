@@ -39,13 +39,13 @@ scheduler:
         no_candidate: fail
 ```
 
-`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数与在途预留数之和最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
+`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
 
 自定义 Profile 固定执行 `node_safety`、`cpu`、`mem`、`disk`、`template_locality` 和 `realtime_create_num` Guards，配置不能关闭或重复声明这些安全约束。其中 `node_safety` 会在正常路径和 backoff 路径检查健康度、指标新鲜度、MVM 上限及 CPU load 合法性。
 
 选定节点后，CubeMaster 在进程内锁下重读节点，并检查、预留 CPU、内存、MVM 和创建并发槽位。冲突触发有限次数重选及短暂指数退避。Cubelet 返回后释放本地预留；节点指标独立更新，释放与下一次指标更新之间仍可能存在可见性空窗。本副本的在途预留数通过 `node.reserved` 暴露给插件。
 
-预留仅在当前 CubeMaster 进程内记账，获取和释放都不访问 Redis。同步跨副本 Redis 预留及 `scheduler.reservation_redis_error_policy` 已移除，请删除旧配置中的该字段。Redis 仍用于节点指标及创建成功后的代理元数据等功能。
+创建路径不再维护预留账本，也不再执行同步 Redis reservation。CubeMaster 使用本地节点快照执行准入并派发到 Cubelet；指标独立更新，上报窗口内多副本可能重复准入。旧配置中的 `scheduler.reservation_redis_error_policy` 已废弃，应删除。Redis 仍用于节点指标及创建成功后的代理元数据等功能。
 
 多 Master 继续依赖上报指标和 `realtime_create_num` 的本地并发数乘 Master 数估算，但不再提供跨副本原子容量预留。指标传播期间可能出现并发超额接收。Cubelet 已有创建并发限流和单沙箱 cgroup 限额；节点总配额的原子接收控制属于后续工作，本次未实现。不能假定所有超额 CPU/内存请求都会被 Cubelet 拒绝。
 

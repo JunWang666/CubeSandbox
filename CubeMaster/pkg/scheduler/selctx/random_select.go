@@ -27,9 +27,7 @@ func (r *randomSelect) All() map[interface{}]int {
 	return nil
 }
 
-// RemoveAll 清空已累积的元素。SelectorCtx 在 reservation 冲突后会被复用并
-// 重新调用 LeastRandomSelect，若不清空，上一轮累积的（可能已被标记为 bad 的）
-// 节点仍可能被 Next 选中。
+// RemoveAll 清空已累积的元素，避免复用选择器时使用过期候选。
 func (r *randomSelect) RemoveAll() {
 	r.items = nil
 }

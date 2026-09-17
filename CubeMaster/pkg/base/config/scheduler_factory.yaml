@@ -62,12 +62,6 @@ scheduler:
         - name: real_time_weighted_average
           type: go
           weight: 1.0
-        # 创建并发软偏好：在途创建越少的节点分越高，把突发创建压力打散。
-        # 该维度与配额水位正交：高并发下同规格请求资源水位相近，
-        # 仅靠 real_time_weighted_average 无法在选点前感知创建排队
-        - name: create_concurrency_score
-          type: go
-          weight: 1.0
       # Spread burst requests among the three highest-ranked candidates.
       selection:
         method: spread
@@ -88,11 +82,6 @@ scheduler:
         - name: image_score
           type: go
           weight: 0.7
-        # 同模板创建压力分散：同模板在该节点上的在途创建越少分越高，
-        # 避免同模板突发创建在单个副本节点上排队（羊群）
-        - name: template_local_pressure
-          type: go
-          weight: 0.2
         # Secondary objective: keep overloaded cache nodes from taking all.
         - name: real_time_weighted_average
           type: go

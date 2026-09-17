@@ -27,8 +27,7 @@ type Selector interface {
 }
 
 // ErrNotApplicable is returned (possibly wrapped) by a score plugin whose
-// dimension genuinely does not apply to the current request — e.g.
-// template_local_pressure on a request without a TemplateID. The profile
+// dimension genuinely does not apply to the current request. The profile
 // pipeline treats it as an explicit skip: the plugin contributes no scores
 // and no weight, and it is not treated as a failure even for a ForceEnabled
 // plugin under the fail-closed or default-score policies. This is distinct

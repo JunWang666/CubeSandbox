@@ -168,11 +168,8 @@ func selectNode(selCtx *selctx.SelectorCtx, pipeline *profile.Pipeline) *node.No
 }
 
 // spreadSelect 实现摊平语义：在评分最高的前 topN 个候选中确定性选取当前运行
-// 沙箱数 + 在途预留数最少的节点，占用相同时保持评分顺序。与 random（top_n 内按
-// 分数加权随机）不同，spread 保证打分聚拢时放置仍然向空闲节点摊开。计入
-// ReservedNum 是因为 MvmNum 是 Cubelet 上次上报值，突发并发创建看到完全相同的
-// MvmNum 时会挤向同一节点；加上预留镜像后选点与 TryReserveNode 的记账一致，
-// 摊平由排序完成而不是靠预留冲突后的拒绝重选。
+// 沙箱数最少的节点，占用相同时保持评分顺序。与 random（top_n 内按分数加权随机）
+// 不同，spread 保证打分聚拢时放置仍然向空闲节点摊开。
 func spreadSelect(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 	var candidates node.NodeList
 	if scored := selCtx.LeastScoreNodes(topN); scored.Len() > 0 {
@@ -188,8 +185,7 @@ func spreadSelect(selCtx *selctx.SelectorCtx, topN int) *node.Node {
 		if candidates[i] == nil {
 			continue
 		}
-		if best == nil ||
-			candidates[i].MvmNum+candidates[i].ReservedNumValue() < best.MvmNum+best.ReservedNumValue() {
+		if best == nil || candidates[i].MvmNum < best.MvmNum {
 			best = candidates[i]
 		}
 	}
@@ -532,7 +528,7 @@ func runProfileScores(selCtx *selctx.SelectorCtx, scores []profile.ScorePlugin) 
 		}
 		if errors.Is(result.err, score.ErrNotApplicable) {
 			// The plugin's scoring dimension explicitly does not apply to
-			// this request (e.g. template_local_pressure without a
+			// this request:
 			// TemplateID): skip it — no scores, no weight, and no failure
 			// handling, even for a ForceEnabled plugin. This is the
 			// contract-sanctioned alternative to an empty result, which a

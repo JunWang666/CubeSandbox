@@ -111,14 +111,6 @@ type Node struct {
 
 	LocalCreateNum int64 `json:"LocalCreateNum,omitempty"`
 
-	// ReservedNum counts this CubeMaster's in-flight scheduling reservations
-	// on the node (a node was selected but the create has not finished or
-	// failed yet). It is master-local, never persisted to Redis, and only
-	// best-effort: localcache's reservation registry is the authoritative
-	// accounting. Exposed so snapshots (CEL / gRPC plugins) can see pending
-	// placement pressure as SnapshotNode.reserved.
-	ReservedNum int64 `json:"ReservedNum,omitempty"`
-
 	NicQueues int64 `json:"nic_queues,omitempty"`
 
 	NodeLabels     map[string]string `json:"NodeLabels,omitempty"`
@@ -215,11 +207,10 @@ func (n *Node) Clone() *Node {
 		return nil
 	}
 	// Clone provides a best-effort read-side snapshot. Mutable counters such
-	// as LocalCreateNum / ReservedNum and schedulingDisabled are read
+	// such as LocalCreateNum and schedulingDisabled are read
 	// atomically. Fields are copied explicitly so the atomic noCopy marker is
 	// never copied by value.
 	localCreateNum := atomic.LoadInt64(&n.LocalCreateNum)
-	reservedNum := atomic.LoadInt64(&n.ReservedNum)
 	schedulingDisabled := n.SchedulingDisabled()
 	cloned := &Node{
 		Index: n.Index, InsID: n.InsID, UUID: n.UUID, IP: n.IP,
@@ -237,7 +228,7 @@ func (n *Node) Clone() *Node {
 		DataDiskUsagePer: n.DataDiskUsagePer, StorageDiskUsagePer: n.StorageDiskUsagePer,
 		SysDiskUsagePer: n.SysDiskUsagePer, MvmNum: n.MvmNum, MetricUpdate: n.MetricUpdate,
 		MetricLocalUpdateAt: n.MetricLocalUpdateAt, RealTimeCreateNum: n.RealTimeCreateNum,
-		LocalCreateNum: localCreateNum, ReservedNum: reservedNum, NicQueues: n.NicQueues,
+		LocalCreateNum: localCreateNum, NicQueues: n.NicQueues,
 	}
 	cloned.SetSchedulingDisabled(schedulingDisabled)
 	if n.VirtualNodeQuotaArray != nil {
@@ -285,31 +276,6 @@ func (n *Node) HostIP() string { return n.IP }
 
 func (n *Node) LocalCreateNumIncrBy(i int64) int64 {
 	return atomic.AddInt64(&n.LocalCreateNum, i)
-}
-
-func (n *Node) ReservedNumIncrBy(i int64) int64 {
-	// Clamp at zero: the mirror is best-effort, and the cached node object
-	// may be replaced (re-registration, TTL expiry) while a reservation is
-	// still held, in which case the matching decrement would otherwise land
-	// on a fresh object and drive its count negative.
-	for {
-		current := atomic.LoadInt64(&n.ReservedNum)
-		next := current + i
-		if next < 0 {
-			next = 0
-		}
-		if atomic.CompareAndSwapInt64(&n.ReservedNum, current, next) {
-			return next
-		}
-	}
-}
-
-// ReservedNumValue reads the in-flight reservation mirror atomically.
-func (n *Node) ReservedNumValue() int64 {
-	if n == nil {
-		return 0
-	}
-	return atomic.LoadInt64(&n.ReservedNum)
 }
 
 func (n *Node) Labels() map[string]string {

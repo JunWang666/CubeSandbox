@@ -66,8 +66,8 @@ func TestFactoryProfilesCompile(t *testing.T) {
 	// 锁定出厂策略的打分组成为设计口径：burst_balance 带创建并发软偏好，
 	// template_reuse 带同模板创建压力分散维度
 	wantScores := map[string][]string{
-		"burst_balance":  {"real_time_weighted_average", "create_concurrency_score"},
-		"template_reuse": {"image_score", "template_local_pressure", "real_time_weighted_average"},
+		"burst_balance":  {"real_time_weighted_average"},
+		"template_reuse": {"image_score", "real_time_weighted_average"},
 		"mixed_binpack":  {"resource_fit_score", "real_time_weighted_average"},
 	}
 	for name, want := range wantScores {
