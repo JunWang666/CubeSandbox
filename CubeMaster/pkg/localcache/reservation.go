@@ -4,47 +4,25 @@
 
 // Reservation management for the scheduler.
 //
-// Between "the scheduler picked a node" and "the Cubelet actually created
-// the sandbox and its metrics flowed back", the node cache still shows the
-// old allocation, so concurrent creates keep landing on the same node
-// (herding). This file closes that window: after selection, CubeMaster
-// re-reads the node under a lock, re-checks the resource predicates with
-// already-reserved amounts added, and records a reservation covering CPU
-// quota, memory quota, one MVM slot, and one create-concurrency slot. The
-// caller is expected to re-schedule (bounded) on ErrNodeReservationConflict
-// and to Release the reservation once the Cubelet create returns — on
-// success the next Cubelet metric report takes the accounting over.
+// After selection, CubeMaster re-checks capacity under a process-local lock
+// and reserves CPU, memory, one MVM slot and one create-concurrency slot.
+// A conflict triggers bounded re-selection. Release runs when Cubelet returns;
+// the next metric report may arrive later, leaving a visibility window.
 //
-// Single-CubeMaster deployments are fully covered by the in-process
-// registry. With multiple CubeMaster replicas the reservation is also
-// accumulated in a per-node Redis Hash (atomic check-and-increment via
-// Lua), so replicas see each other's in-flight pressure. The Redis scripts
-// are idempotent on a per-reservation token, so wrapredis transport retries
-// can neither double-charge an acquire nor double-subtract a release. When
-// Redis is not configured the code uses local-only reservations (single-
-// replica deployments never coordinate through Redis); when Redis errors,
-// scheduler.reservation_redis_error_policy decides between fail_open
-// (default: keep the local reservation, realtime_create_num guard as
-// backstop, matching the pre-reservation behavior) and fail_closed (roll
-// back and fail the scheduling attempt).
+// Reservations are local to one CubeMaster. They do not access Redis or
+// atomically coordinate capacity across replicas. Existing reported metrics
+// and create-concurrency estimates remain the cross-replica pressure signals.
 package localcache
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/gomodule/redigo/redis"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 )
 
 // ErrNodeReservationConflict means the selected node cannot take the request
@@ -60,24 +38,7 @@ type NodeReservation struct {
 	CpuMilli int64
 	MemMB    int64
 
-	// token uniquely identifies this reservation in Redis so a transport-level
-	// retry of the acquire or release Lua script is a no-op instead of
-	// applying the deltas twice (see the scripts below).
-	token       string
-	redisBacked bool
-	released    atomic.Bool
-}
-
-// newReservationToken returns a random per-reservation token. Uniqueness is
-// what makes the Redis acquire/release scripts idempotent under wrapredis
-// transport retries: a replayed script sees the token already recorded and
-// skips the delta application.
-func newReservationToken() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generate reservation token: %w", err)
-	}
-	return hex.EncodeToString(b[:]), nil
+	released atomic.Bool
 }
 
 // nodeReservationAmount is the per-node aggregate of what one CubeMaster
@@ -100,93 +61,11 @@ var reservationRegistry = struct {
 	nodes map[string]*nodeReservationAmount
 }{nodes: make(map[string]*nodeReservationAmount)}
 
-const (
-	// reservationAcquireScript atomically adds the request to the per-node
-	// reservation Hash and rolls back if any dimension exceeds the headroom
-	// computed by the caller from its freshest node view.
-	//
-	// The script is idempotent so that wrapredis transport retries are safe:
-	// if the first EVAL committed but the reply was lost, the retried EVAL
-	// finds the reservation token already recorded and returns success
-	// without applying the deltas a second time.
-	//
-	//	KEYS[1] = reservation hash key
-	//	KEYS[2] = reservation token set key
-	//	ARGV[1] = safety TTL (seconds)
-	//	ARGV[2] = reservation token
-	//	ARGV[3..6] = deltas: cpu_milli, mem_mb, mvm, creating
-	//	ARGV[7..10] = maxima: cpu_milli, mem_mb, mvm, creating
-	//
-	// Returns 1 on success, 0 on conflict.
-	reservationAcquireScript = `
-if redis.call('SISMEMBER', KEYS[2], ARGV[2]) == 1 then
-  return 1
-end
-local cpu = redis.call('HINCRBY', KEYS[1], 'cpu_milli', ARGV[3])
-local mem = redis.call('HINCRBY', KEYS[1], 'mem_mb', ARGV[4])
-local mvm = redis.call('HINCRBY', KEYS[1], 'mvm', ARGV[5])
-local creating = redis.call('HINCRBY', KEYS[1], 'creating', ARGV[6])
-redis.call('EXPIRE', KEYS[1], ARGV[1])
-if cpu > tonumber(ARGV[7]) or mem > tonumber(ARGV[8]) or mvm > tonumber(ARGV[9]) or creating > tonumber(ARGV[10]) then
-  redis.call('HINCRBY', KEYS[1], 'cpu_milli', -1 * tonumber(ARGV[3]))
-  redis.call('HINCRBY', KEYS[1], 'mem_mb', -1 * tonumber(ARGV[4]))
-  redis.call('HINCRBY', KEYS[1], 'mvm', -1 * tonumber(ARGV[5]))
-  redis.call('HINCRBY', KEYS[1], 'creating', -1 * tonumber(ARGV[6]))
-  return 0
-end
-redis.call('SADD', KEYS[2], ARGV[2])
-redis.call('EXPIRE', KEYS[2], ARGV[1])
-return 1
-`
-	// reservationReleaseScript subtracts the reservation again, clamping each
-	// field at zero so a release after a TTL expiry cannot drive the Hash
-	// negative.
-	//
-	// Like the acquire script it is idempotent via the reservation token: a
-	// retried release (first EVAL committed, reply lost) finds the token
-	// already removed and does nothing, so it can neither double-subtract nor
-	// erase another replica's reservation through the clamp.
-	//
-	//	KEYS[1] = reservation hash key
-	//	KEYS[2] = reservation token set key
-	//	ARGV[1] = safety TTL (seconds)
-	//	ARGV[2] = reservation token
-	//	ARGV[3..6] = deltas: cpu_milli, mem_mb, mvm, creating
-	reservationReleaseScript = `
-if redis.call('SISMEMBER', KEYS[2], ARGV[2]) == 0 then
-  return 1
-end
-redis.call('SREM', KEYS[2], ARGV[2])
-local fields = {'cpu_milli', 'mem_mb', 'mvm', 'creating'}
-for i, field in ipairs(fields) do
-  local v = redis.call('HINCRBY', KEYS[1], field, -1 * tonumber(ARGV[i + 2]))
-  if v < 0 then
-    redis.call('HSET', KEYS[1], field, 0)
-  end
-end
-redis.call('EXPIRE', KEYS[1], ARGV[1])
-redis.call('EXPIRE', KEYS[2], ARGV[1])
-return 1
-`
-)
-
-// reservationTTLSec bounds how long a reservation can leak in Redis if the
-// holding CubeMaster crashes: the create timeout plus one minute of slack.
-func reservationTTLSec() int64 {
-	ttl := int64(config.GetConfig().CubeletConf.CreateTimeoutInsec) + 60
-	if ttl <= 0 {
-		ttl = 660
-	}
-	return ttl
-}
-
 // TryReserveNode re-reads the node from the cache and, under the registry
 // lock, re-checks the CPU / memory quota, MVM limit, and create-concurrency
 // predicates with this replica's outstanding reservations already charged.
-// On success the reservation is recorded locally and then pushed to Redis
-// for cross-replica visibility; a Redis conflict rolls the local record back
-// and returns ErrNodeReservationConflict, while a Redis error degrades to a
-// local-only reservation (warn-logged) instead of failing the create.
+// On success the local record remains charged until Release is called.
+// Redis configuration and availability do not affect this operation.
 func TryReserveNode(ctx context.Context, nodeID string, cpuMilli, memMB int64) (*NodeReservation, error) {
 	if nodeID == "" {
 		return nil, fmt.Errorf("%w: empty node id", ErrNodeReservationConflict)
@@ -218,39 +97,7 @@ func TryReserveNode(ctx context.Context, nodeID string, cpuMilli, memMB int64) (
 	bumpReservedNum(nodeID, 1)
 	reservationRegistry.Unlock()
 
-	reservation := &NodeReservation{NodeID: nodeID, CpuMilli: cpuMilli, MemMB: memMB}
-	if config.GetConfig().RedisConf == nil {
-		// No Redis configured: local-only by design (single-replica
-		// deployments never coordinate through Redis).
-		return reservation, nil
-	}
-	token, err := newReservationToken()
-	if err != nil {
-		reservation.rollbackLocal()
-		return nil, err
-	}
-	reservation.token = token
-	acquired, err := redisAcquireReservation(ctx, current, token, cpuMilli, memMB)
-	switch {
-	case err != nil:
-		if strings.EqualFold(sconf.ReservationRedisErrorPolicy, config.ReservationRedisErrorFailClosed) {
-			// fail_closed: the operator explicitly rejects local-only
-			// accounting (intended for multi-replica deployments, where a
-			// degraded replica would otherwise under-count in-flight
-			// pressure the other replicas cannot see).
-			reservation.rollbackLocal()
-			return nil, fmt.Errorf("reservation redis acquire failed and reservation_redis_error_policy=fail_closed, node=%s: %w", nodeID, err)
-		}
-		// fail_open (default): keep the local reservation and let the
-		// realtime_create_num guard be the backstop, as before.
-		log.G(ctx).Warnf("reservation redis acquire degraded to local-only, node=%s err=%v", nodeID, err)
-	case !acquired:
-		reservation.rollbackLocal()
-		return nil, fmt.Errorf("%w: node %s over committed across masters", ErrNodeReservationConflict, nodeID)
-	default:
-		reservation.redisBacked = true
-	}
-	return reservation, nil
+	return &NodeReservation{NodeID: nodeID, CpuMilli: cpuMilli, MemMB: memMB}, nil
 }
 
 // checkReservationCapacity mirrors the mandatory guard predicates, charging
@@ -279,20 +126,13 @@ func checkReservationCapacity(sconf *config.SchedulerConf, n *node.Node, local *
 	return nil
 }
 
-// Release returns the reservation. On success paths this is where the
-// accounting hands over to the next Cubelet metric report; on failure or
-// cancel paths it simply frees the slots.
+// Release returns the local reservation, including after request cancellation.
+// Metric updates arrive independently; release does not wait for an updated report.
 func (r *NodeReservation) Release(ctx context.Context) {
 	if r == nil || !r.released.CompareAndSwap(false, true) {
 		return
 	}
 	r.rollbackLocal()
-	if r.redisBacked {
-		if err := redisReleaseReservation(ctx, r.NodeID, r.token, r.CpuMilli, r.MemMB); err != nil {
-			// The safety TTL reaps whatever is left behind.
-			log.G(ctx).Warnf("reservation redis release failed, node=%s err=%v", r.NodeID, err)
-		}
-	}
 }
 
 // rollbackLocal undoes the local record. Caller must not hold the registry
@@ -323,40 +163,4 @@ func bumpReservedNum(nodeID string, delta int64) {
 			cached.ReservedNumIncrBy(delta)
 		}
 	}
-}
-
-// reservationRedisConn is indirected so unit tests can point reservations at
-// a miniredis instance without touching the process-wide pool cache.
-var reservationRedisConn = wrapredis.GetRedis
-
-// redisAcquireReservation pushes the reservation into the per-node Redis
-// Hash. The headroom maxima are computed from the caller's fresh node view so
-// the Lua check is atomic across replicas: every replica charges into the
-// same Hash and the script rejects whatever would overshoot capacity.
-//
-// The script is idempotent on the reservation token, so wrapredis transport
-// retries of this EVAL cannot double-charge.
-func redisAcquireReservation(ctx context.Context, n *node.Node, token string, cpuMilli, memMB int64) (bool, error) {
-	sconf := &config.GetConfig().Scheduler.SchedulerConf
-	maxCpu := n.QuotaCpu - sconf.EffectiveAllocated(n.QuotaCpuUsage)
-	maxMem := n.QuotaMem - sconf.EffectiveAllocated(n.QuotaMemUsage)
-	maxMvm := RealMaxMvmLimit(n) - n.MvmNum
-	maxCreating := CreateConcurrentLimit(n) - n.RealTimeCreateNum
-	result, err := redis.Int(reservationRedisConn().Do("EVAL", reservationAcquireScript, 2,
-		rediskey.NodeReservation(n.ID()), rediskey.NodeReservationTokens(n.ID()), reservationTTLSec(), token,
-		cpuMilli, memMB, 1, 1, maxCpu, maxMem, maxMvm, maxCreating))
-	if err != nil {
-		return false, err
-	}
-	return result == 1, nil
-}
-
-func redisReleaseReservation(ctx context.Context, nodeID, token string, cpuMilli, memMB int64) error {
-	if config.GetConfig().RedisConf == nil {
-		return nil
-	}
-	_, err := reservationRedisConn().Do("EVAL", reservationReleaseScript, 2,
-		rediskey.NodeReservation(nodeID), rediskey.NodeReservationTokens(nodeID), reservationTTLSec(), token,
-		cpuMilli, memMB, 1, 1)
-	return err
 }

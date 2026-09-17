@@ -7,16 +7,14 @@ package localcache
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/gomodule/redigo/redis"
 	"github.com/patrickmn/go-cache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 )
 
 // reservationTestEnv installs a fresh node cache and scheduler config and
@@ -66,18 +64,6 @@ func reservationTestNode(id string) *node.Node {
 	}
 }
 
-// reservationRawConn dials the test Redis directly (bypassing the wrapredis
-// pool cache) so the test can inspect reservation Hashes.
-func reservationRawConn(t *testing.T, addr string) redis.Conn {
-	t.Helper()
-	conn, err := redis.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial miniredis: %v", err)
-	}
-	t.Cleanup(func() { conn.Close() })
-	return conn
-}
-
 func registryAmount(t *testing.T, nodeID string) *nodeReservationAmount {
 	t.Helper()
 	reservationRegistry.Lock()
@@ -102,9 +88,6 @@ func TestTryReserveNodeLocalOnly(t *testing.T) {
 	rsv, err := TryReserveNode(ctx, "node-r1", 1000, 1024)
 	if err != nil {
 		t.Fatalf("TryReserveNode error: %v", err)
-	}
-	if rsv.redisBacked {
-		t.Fatal("reservation must be local-only when Redis is not configured")
 	}
 	if got := cachedReservedNum(t, "node-r1"); got != 1 {
 		t.Fatalf("ReservedNum=%d want 1", got)
@@ -170,99 +153,6 @@ func TestTryReserveNodeMvmAndCreatingLimits(t *testing.T) {
 	}
 }
 
-func TestTryReserveNodeRedisBacked(t *testing.T) {
-	reservationTestEnv(t)
-	server := miniredis.RunT(t)
-	cfg := config.GetConfig()
-	cfg.RedisConf = &config.RedisConf{Nodes: server.Addr(), MaxActive: 4, MaxIdle: 1, MaxRetry: 1}
-
-	origConn := reservationRedisConn
-	reservationRedisConn = func() *wrapredis.RedisWrap {
-		return wrapredis.GetRedisConnPoolWrap("reservation-test", cfg.RedisConf)
-	}
-	t.Cleanup(func() { reservationRedisConn = origConn })
-
-	l.cache.SetDefault("node-r4", reservationTestNode("node-r4"))
-	ctx := context.Background()
-
-	rsv, err := TryReserveNode(ctx, "node-r4", 1000, 1024)
-	if err != nil {
-		t.Fatalf("TryReserveNode error: %v", err)
-	}
-	if !rsv.redisBacked {
-		t.Fatal("reservation should be redis-backed")
-	}
-	conn := reservationRawConn(t, server.Addr())
-	fields, err := redis.StringMap(conn.Do("HGETALL", rediskey.NodeReservation("node-r4")))
-	if err != nil {
-		t.Fatalf("HGETALL error: %v", err)
-	}
-	if fields["cpu_milli"] != "1000" || fields["mem_mb"] != "1024" || fields["mvm"] != "1" || fields["creating"] != "1" {
-		t.Fatalf("redis hash=%v", fields)
-	}
-	if ttl := server.TTL(rediskey.NodeReservation("node-r4")); ttl <= 0 {
-		t.Fatalf("reservation hash has no safety TTL: %v", ttl)
-	}
-
-	// Cross-master style conflict: prefill the Redis reservation hash close
-	// to the node quota (as another CubeMaster replica would), then request
-	// an amount that passes the local check (free 64000 - local 1000 > 5000)
-	// but exceeds the Redis-side headroom (63500 + 5000 > 64000). The Lua
-	// script must reject it atomically and roll its own delta back.
-	if _, err := conn.Do("HINCRBY", rediskey.NodeReservation("node-r4"), "cpu_milli", 62500); err != nil {
-		t.Fatalf("prefill redis hash: %v", err)
-	}
-	if _, err := TryReserveNode(ctx, "node-r4", 5000, 1024); !errors.Is(err, ErrNodeReservationConflict) {
-		t.Fatalf("redis conflict err=%v, want ErrNodeReservationConflict", err)
-	}
-	fields, _ = redis.StringMap(conn.Do("HGETALL", rediskey.NodeReservation("node-r4")))
-	if fields["cpu_milli"] != "63500" {
-		t.Fatalf("redis hash not rolled back: %v", fields)
-	}
-	if amount := registryAmount(t, "node-r4"); amount.cpuMilli != 1000 {
-		t.Fatalf("local registry not rolled back: %+v", amount)
-	}
-	if got := cachedReservedNum(t, "node-r4"); got != 1 {
-		t.Fatalf("ReservedNum=%d want 1 after rollback", got)
-	}
-
-	rsv.Release(ctx)
-	fields, _ = redis.StringMap(conn.Do("HGETALL", rediskey.NodeReservation("node-r4")))
-	if fields["cpu_milli"] != "62500" || fields["creating"] != "0" {
-		t.Fatalf("redis hash not released: %v", fields)
-	}
-}
-
-func TestTryReserveNodeRedisDegraded(t *testing.T) {
-	reservationTestEnv(t)
-	server := miniredis.RunT(t)
-	addr := server.Addr()
-	server.Close() // simulate Redis going away
-	cfg := config.GetConfig()
-	cfg.RedisConf = &config.RedisConf{Nodes: addr, MaxActive: 1, MaxIdle: 1, MaxRetry: 1, IdleTimeout: 1}
-
-	origConn := reservationRedisConn
-	reservationRedisConn = func() *wrapredis.RedisWrap {
-		return wrapredis.GetRedisConnPoolWrap("reservation-degraded-test", cfg.RedisConf)
-	}
-	t.Cleanup(func() { reservationRedisConn = origConn })
-
-	l.cache.SetDefault("node-r5", reservationTestNode("node-r5"))
-	ctx := context.Background()
-
-	rsv, err := TryReserveNode(ctx, "node-r5", 1000, 1024)
-	if err != nil {
-		t.Fatalf("Redis outage must degrade to local-only, got: %v", err)
-	}
-	if rsv.redisBacked {
-		t.Fatal("reservation must not be redis-backed when Redis errors")
-	}
-	rsv.Release(ctx)
-	if amount := registryAmount(t, "node-r5"); amount != nil {
-		t.Fatalf("registry entry not cleaned: %+v", amount)
-	}
-}
-
 // TestReservedNumClampOnReplacedNode verifies the mirror never goes negative
 // when the cached node object is replaced (re-registration, TTL expiry) while
 // a reservation is held: the +1 landed on the old object, the -1 lands on the
@@ -286,127 +176,96 @@ func TestReservedNumClampOnReplacedNode(t *testing.T) {
 	}
 }
 
-// setupReservationRedisTest points reservations at a fresh miniredis instance
-// and returns it. Mirrors TestTryReserveNodeRedisBacked's setup.
-func setupReservationRedisTest(t *testing.T, name string) *miniredis.Miniredis {
-	t.Helper()
-	server := miniredis.RunT(t)
-	cfg := config.GetConfig()
-	cfg.RedisConf = &config.RedisConf{Nodes: server.Addr(), MaxActive: 4, MaxIdle: 1, MaxRetry: 1}
-	origConn := reservationRedisConn
-	reservationRedisConn = func() *wrapredis.RedisWrap {
-		return wrapredis.GetRedisConnPoolWrap(name, cfg.RedisConf)
-	}
-	t.Cleanup(func() { reservationRedisConn = origConn })
-	return server
-}
-
-// TestReservationRedisAcquireRetryIdempotent simulates the wrapredis
-// transport-retry failure mode: the first acquire EVAL commits on the server
-// but the client times out before reading the reply, so wrapredis re-executes
-// the identical EVAL. The retried execution must not charge the deltas a
-// second time.
-func TestReservationRedisAcquireRetryIdempotent(t *testing.T) {
-	reservationTestEnv(t)
-	server := setupReservationRedisTest(t, "reservation-retry-test")
-	n := reservationTestNode("node-r7")
-	l.cache.SetDefault("node-r7", n)
-	ctx := context.Background()
-	token := "token-acquire-retry"
-
-	acquired, err := redisAcquireReservation(ctx, n, token, 1000, 1024)
-	if err != nil || !acquired {
-		t.Fatalf("first acquire: acquired=%v err=%v", acquired, err)
-	}
-	// Retry of the same EVAL after a client-side timeout.
-	acquired, err = redisAcquireReservation(ctx, n, token, 1000, 1024)
-	if err != nil || !acquired {
-		t.Fatalf("retried acquire: acquired=%v err=%v", acquired, err)
-	}
-
-	conn := reservationRawConn(t, server.Addr())
-	fields, err := redis.StringMap(conn.Do("HGETALL", rediskey.NodeReservation("node-r7")))
-	if err != nil {
-		t.Fatalf("HGETALL error: %v", err)
-	}
-	if fields["cpu_milli"] != "1000" || fields["mem_mb"] != "1024" || fields["mvm"] != "1" || fields["creating"] != "1" {
-		t.Fatalf("retried acquire double-charged the hash: %v", fields)
-	}
-	tokens, err := redis.Strings(conn.Do("SMEMBERS", rediskey.NodeReservationTokens("node-r7")))
-	if err != nil || len(tokens) != 1 {
-		t.Fatalf("token set=%v err=%v, want exactly one token", tokens, err)
+// Configuring Redis must not reintroduce any reservation command, even when
+// the shared Redis instance is unavailable.
+func TestReservationsDoNotAccessRedis(t *testing.T) {
+	for _, offline := range []bool{false, true} {
+		name := "online"
+		if offline {
+			name = "offline"
+		}
+		t.Run(name, func(t *testing.T) {
+			reservationTestEnv(t)
+			server := miniredis.RunT(t)
+			addr := server.Addr()
+			if offline {
+				server.Close()
+			}
+			config.GetConfig().RedisConf = &config.RedisConf{
+				Nodes: addr, MaxActive: 1, MaxIdle: 1, MaxRetry: 1,
+			}
+			l.cache.SetDefault("local-redis", reservationTestNode("local-redis"))
+			ctx := context.Background()
+			r, err := TryReserveNode(ctx, "local-redis", 1000, 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cachedReservedNum(t, "local-redis"); got != 1 {
+				t.Fatalf("local mirror = %d, want 1", got)
+			}
+			r.Release(ctx)
+			r.Release(ctx)
+			if registryAmount(t, "local-redis") != nil {
+				t.Fatal("reservation was not released")
+			}
+			if !offline && server.CommandCount() != 0 {
+				t.Fatalf("reservation issued %d Redis commands", server.CommandCount())
+			}
+		})
 	}
 }
 
-// TestReservationRedisReleaseRetryIdempotent covers the other direction: a
-// release EVAL that committed but whose reply was lost must not subtract the
-// deltas again when retried — in particular it must not erase another
-// replica's reservation through the clamp-to-zero path.
-func TestReservationRedisReleaseRetryIdempotent(t *testing.T) {
+func TestConcurrentLocalReservationsAndRelease(t *testing.T) {
 	reservationTestEnv(t)
-	server := setupReservationRedisTest(t, "reservation-release-retry-test")
-	n := reservationTestNode("node-r8")
-	l.cache.SetDefault("node-r8", n)
-	ctx := context.Background()
-
-	// Two replicas (or two requests) hold one reservation each.
-	for _, token := range []string{"token-a", "token-b"} {
-		acquired, err := redisAcquireReservation(ctx, n, token, 1000, 1024)
-		if err != nil || !acquired {
-			t.Fatalf("acquire %s: acquired=%v err=%v", token, acquired, err)
+	n := reservationTestNode("local-concurrent")
+	n.QuotaCpu = 10500 // exactly ten 1000m reservations fit the strict CPU guard
+	n.CreateConcurrentNum = 100
+	l.cache.SetDefault(n.ID(), n)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reservations := make(chan *NodeReservation, 100)
+	errs := make(chan error, 100)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r, err := TryReserveNode(ctx, n.ID(), 1000, 1024)
+			if err != nil {
+				errs <- err
+				return
+			}
+			reservations <- r
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(reservations)
+	close(errs)
+	if len(reservations) != 10 {
+		t.Fatalf("admitted %d requests, want 10", len(reservations))
+	}
+	for err := range errs {
+		if !errors.Is(err, ErrNodeReservationConflict) {
+			t.Fatalf("unexpected admission error: %v", err)
 		}
 	}
-	conn := reservationRawConn(t, server.Addr())
-
-	if err := redisReleaseReservation(ctx, "node-r8", "token-a", 1000, 1024); err != nil {
-		t.Fatalf("release token-a: %v", err)
+	cancel()
+	for r := range reservations {
+		// Concurrent duplicate releases must only subtract once, and cleanup
+		// must still work when the request has been canceled.
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(r *NodeReservation) {
+				defer wg.Done()
+				r.Release(ctx)
+			}(r)
+		}
 	}
-	// Retry of the same release after a client-side timeout.
-	if err := redisReleaseReservation(ctx, "node-r8", "token-a", 1000, 1024); err != nil {
-		t.Fatalf("retried release token-a: %v", err)
-	}
-	fields, _ := redis.StringMap(conn.Do("HGETALL", rediskey.NodeReservation("node-r8")))
-	if fields["cpu_milli"] != "1000" || fields["creating"] != "1" {
-		t.Fatalf("retried release erased token-b's reservation: %v", fields)
-	}
-
-	if err := redisReleaseReservation(ctx, "node-r8", "token-b", 1000, 1024); err != nil {
-		t.Fatalf("release token-b: %v", err)
-	}
-	fields, _ = redis.StringMap(conn.Do("HGETALL", rediskey.NodeReservation("node-r8")))
-	if fields["cpu_milli"] != "0" || fields["creating"] != "0" {
-		t.Fatalf("hash not fully released: %v", fields)
-	}
-}
-
-// TestTryReserveNodeRedisFailClosed verifies reservation_redis_error_policy=
-// fail_closed: a Redis outage rolls the local reservation back and fails the
-// scheduling attempt instead of degrading to local-only accounting.
-func TestTryReserveNodeRedisFailClosed(t *testing.T) {
-	reservationTestEnv(t)
-	server := miniredis.RunT(t)
-	addr := server.Addr()
-	server.Close() // simulate Redis going away
-	cfg := config.GetConfig()
-	cfg.RedisConf = &config.RedisConf{Nodes: addr, MaxActive: 1, MaxIdle: 1, MaxRetry: 1, IdleTimeout: 1}
-	cfg.Scheduler.ReservationRedisErrorPolicy = config.ReservationRedisErrorFailClosed
-
-	origConn := reservationRedisConn
-	reservationRedisConn = func() *wrapredis.RedisWrap {
-		return wrapredis.GetRedisConnPoolWrap("reservation-fail-closed-test", cfg.RedisConf)
-	}
-	t.Cleanup(func() { reservationRedisConn = origConn })
-
-	l.cache.SetDefault("node-r9", reservationTestNode("node-r9"))
-	ctx := context.Background()
-
-	if _, err := TryReserveNode(ctx, "node-r9", 1000, 1024); err == nil {
-		t.Fatal("fail_closed policy must fail the reservation when Redis errors")
-	}
-	if amount := registryAmount(t, "node-r9"); amount != nil {
-		t.Fatalf("local reservation not rolled back under fail_closed: %+v", amount)
-	}
-	if got := cachedReservedNum(t, "node-r9"); got != 0 {
-		t.Fatalf("ReservedNum=%d want 0 after fail_closed rollback", got)
+	wg.Wait()
+	if registryAmount(t, n.ID()) != nil || cachedReservedNum(t, n.ID()) != 0 {
+		t.Fatal("concurrent release did not clear local accounting")
 	}
 }

@@ -43,14 +43,11 @@ scheduler:
 
 Custom Profiles always run the `node_safety`, `cpu`, `mem`, `disk`, `template_locality`, and `realtime_create_num` guards. They cannot be disabled or repeated as optional filters. `node_safety` checks health, metric freshness, the MVM limit, and CPU-load validity on both the normal and backoff paths.
 
-After a node is selected, CubeMaster re-reads it and atomically reserves the request's CPU and memory quota, one MVM slot, and one create-concurrency slot, so concurrent creates stop piling onto a node whose metrics have not caught up yet. A conflict reselects another node (bounded retries, with a short exponential backoff in between); the reservation is released as soon as the Cubelet create returns, on failure as well as success, where the next Cubelet metric report takes the accounting over. The count of a replica's in-flight reservations is exposed to plugins as `node.reserved`.
+After selection, CubeMaster re-reads the node under a process-local lock, checks capacity and reserves CPU, memory, MVM and create-concurrency slots. Conflicts trigger bounded re-selection with a short exponential backoff. The local reservation is released when Cubelet returns; metrics update independently, so a visibility gap may remain before the next report. Plugins see this replica's in-flight reservation count as `node.reserved`.
 
-Multiple CubeMaster replicas coordinate these reservations through per-node Redis counters. Each reservation carries a unique token recorded in a per-node token set, and the acquire/release Lua scripts are idempotent on that token, so a transport-level retry after a client-side timeout can neither double-charge an acquire nor double-subtract a release. Whatever a crashed replica leaves behind is reaped by a safety TTL (the create timeout plus one minute).
+Reservations are local to each CubeMaster process. Neither acquisition nor release accesses Redis. Synchronous cross-replica Redis reservations and `scheduler.reservation_redis_error_policy` have been removed; delete that obsolete setting from existing configuration. Redis remains in use for node metrics and post-create proxy metadata, among other functions.
 
-What happens when the Redis write itself fails is an explicit policy knob, `scheduler.reservation_redis_error_policy`:
-
-- `fail_open` (default): keep the local in-process reservation and rely on the `realtime_create_num` guard as backstop, matching the pre-reservation behavior. Note for multi-replica deployments: while a replica runs degraded, its in-flight pressure is invisible to the other replicas, so cross-replica over-commit protection is partially lost.
-- `fail_closed`: roll the local reservation back and fail the scheduling attempt. Recommended for multi-replica deployments that prefer failing creates over silently losing cross-replica accounting during a Redis outage.
+Multiple Masters still use reported metrics and the `realtime_create_num` estimate of local concurrency multiplied by Master count. They no longer atomically reserve capacity across replicas, so concurrent over-admission remains possible during metric propagation. Cubelet already limits create concurrency and individual sandbox cgroup usage; node-wide atomic quota admission is follow-up work and is not implemented by this change. Do not assume every excess CPU/memory request will be rejected by Cubelet.
 
 ## Plugin types
 

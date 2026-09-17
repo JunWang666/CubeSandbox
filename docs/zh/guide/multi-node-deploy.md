@@ -176,6 +176,18 @@ scheduler:
 
 更新 `cubemaster.yaml` 后，请按当前部署方式重启 CubeMaster，让调度器加载新的评分配置。
 
+## 本地预留与 Redis
+
+创建派发前的资源预留仅在当前 CubeMaster 进程内完成，不再执行同步 Redis reservation EVAL。本地容量复查、冲突重选和幂等释放仍然保留。旧配置中的 `scheduler.reservation_redis_error_policy` 应删除；该策略不再生效。
+
+多个 CubeMaster 仍通过节点指标及创建并发估算获得压力信息，但本地预留对其他 Master 不可见，不能保证跨副本原子容量接收。节点指标更新前仍可能出现超额派发。Cubelet 现有的创建并发限流和单沙箱资源限制不等同于节点总配额的原子检查；补齐后者属于后续工作。
+
+此变更仅撤掉 Redis 调度预留，不移除 Redis 服务：节点指标读取和创建成功后的代理路由元数据写入等仍依赖 Redis。因此不代表完整创建链路可以在 Redis 故障时正常工作。
+
+滚动升级期间，新版本不参与旧版本的 Redis 预留，不能把混合版本集群视为具有完整跨副本协调。全部 Master 升级后，旧 reservation key 不再被使用；不要在旧版本仍处理请求时删除这些 key。
+
+详见[调度配置](./cubemaster-scheduler-config.md)与[调度插件](./scheduler-plugin.md)。
+
 ## 从客户端连接集群
 
 客户端应用需要 CubeAPI 控制面地址，以及一条通过 CubeProxy 访问沙箱服务的数据面链路。根据客户端类型选择最简单的方式：

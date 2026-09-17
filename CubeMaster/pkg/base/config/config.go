@@ -283,20 +283,6 @@ type SchedulerConf struct {
 	// escape hatch for upgrades; new deployments should leave it off.
 	DisableFactoryProfiles bool `yaml:"disable_factory_profiles"`
 
-	// ReservationRedisErrorPolicy decides what happens when the cross-replica
-	// reservation write to Redis fails with a transport error:
-	//
-	//   - fail_open (default): keep the local in-process reservation and rely
-	//     on the realtime_create_num guard as backstop, matching the
-	//     pre-reservation behavior. In multi-replica deployments a degraded
-	//     replica then under-counts in-flight pressure the other replicas
-	//     cannot see.
-	//   - fail_closed: roll the local reservation back and fail the
-	//     scheduling attempt. Intended for multi-replica deployments that
-	//     prefer failing creates over silently losing cross-replica
-	//     accounting while Redis is down.
-	ReservationRedisErrorPolicy string `yaml:"reservation_redis_error_policy"`
-
 	// IgnoreRedisAllocation, when true, makes the scheduler ignore the
 	// per-node allocated CPU/Mem usage recorded in Redis (treat allocated as
 	// 0). A pointer is used so an unset value can default to false while still
@@ -751,16 +737,6 @@ type SoftDeletePurgeConf struct {
 // to start).
 const DefaultCubeEgressCAPath = "/etc/cube/ca/cube-root-ca.crt"
 
-// Values for SchedulerConf.ReservationRedisErrorPolicy.
-const (
-	// ReservationRedisErrorFailOpen keeps the local reservation when the
-	// Redis write fails (default, matches the pre-reservation behavior).
-	ReservationRedisErrorFailOpen = "fail_open"
-	// ReservationRedisErrorFailClosed rolls the local reservation back and
-	// fails the scheduling attempt when the Redis write fails.
-	ReservationRedisErrorFailClosed = "fail_closed"
-)
-
 type AppHookConfig struct {
 	PrestartHookByEnvKeys map[string][]*types.Hook `yaml:"prestart_hook_by_env_keys"`
 
@@ -1204,16 +1180,6 @@ func preHandleScheduler(config *Config) error {
 
 	if config.Scheduler.MetricUpdateTimeout == time.Duration(0) {
 		config.Scheduler.MetricUpdateTimeout = time.Hour
-	}
-
-	switch strings.ToLower(strings.TrimSpace(config.Scheduler.ReservationRedisErrorPolicy)) {
-	case "", ReservationRedisErrorFailOpen:
-		config.Scheduler.ReservationRedisErrorPolicy = ReservationRedisErrorFailOpen
-	case ReservationRedisErrorFailClosed:
-		config.Scheduler.ReservationRedisErrorPolicy = ReservationRedisErrorFailClosed
-	default:
-		return fmt.Errorf("scheduler.reservation_redis_error_policy must be %q or %q, got %q",
-			ReservationRedisErrorFailOpen, ReservationRedisErrorFailClosed, config.Scheduler.ReservationRedisErrorPolicy)
 	}
 
 	if config.Scheduler.LocalMetricUpdateTimeout == time.Duration(0) {
