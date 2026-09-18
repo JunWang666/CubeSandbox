@@ -280,10 +280,8 @@ func (s *SelectorCtx) GetReqRes() *RequestResource {
 }
 
 func (s *SelectorCtx) LeastRandomSelect(n int) *node.Node {
-	// The same SelectorCtx is reused across reservation-conflict reselects:
-	// clear items accumulated by the previous attempt first, otherwise a node
-	// that has since been filtered out (e.g. marked last-bad) can still be
-	// picked from the stale entries.
+	// Clear items accumulated by a previous selection attempt before reusing
+	// this selector context.
 	s.rSelect.RemoveAll()
 	added := 0
 	if s.resultWithScore.Len() == 0 {

@@ -58,7 +58,7 @@ CubeMaster 按如下优先级决定调度策略：
 运维需要知道的两个横切细节：
 
 - **Score 因子开关的位置**：内置 Score `real_time_weighted_average`、`image_score`、`multi_factor_weighted_average` 即使被 Profile 引用，其 `enable_weight_factors` / 因子权重仍从 legacy `scheduler.score.plugin_conf` 与 `scheduler.score.resource_weights` 读取。Profile 引用它们但缺少对应 legacy 配置块时，会在启动或热更新的编译期报错。出厂 Profile 内嵌了配套的 legacy score 子树，零配置部署无需额外处理。
-- **预留行为**：选定节点后，CubeMaster 会预留本次请求的 CPU/内存配额、一个 MVM 槽位和一个创建并发槽位，直到 Cubelet 创建返回，避免并发创建在节点指标更新前 herd 到同一节点。多副本部署通过 Redis 协调预留；`scheduler.reservation_redis_error_policy` 决定 Redis 写入失败时的行为——`fail_open`（默认：仅本地记账，与引入预留前一致）或 `fail_closed`（调度失败，多副本部署推荐）。完整语义见[可扩展调度插件](./scheduler-plugin.md)。
+- **预留行为**：创建路径已移除预留账本和同步 Redis reservation 检查。CubeMaster 使用本地节点快照执行准入并派发到 Cubelet；指标独立更新，上报窗口内多副本可能针对同一容量重复准入。旧的 `scheduler.reservation_redis_error_policy` 已废弃，应删除。完整语义与限制见[可扩展调度插件](./scheduler-plugin.md)。
 
 ## 关键 scheduler 字段
 

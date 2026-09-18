@@ -48,15 +48,12 @@ Guards 决定"能不能跑"，策略只决定可行节点之间的优先级。
 
 **Profile 组成**（`burst_balance`）：
 
-- Score：`real_time_weighted_average`（weight 1.0，配额水位）+
-  `create_concurrency_score`（weight 1.0，在途创建压力：Cubelet 上报的
-  `realtime_create_num` 与本 Master 记录在途创建按健康 Master 数折算后叠加，
-  占创建并发上限比例越低分越高）
+- Score：`real_time_weighted_average`（weight 1.0，配额水位）
 - 选点：`spread` top_n=3，在高分候选间按运行沙箱数打散
 - 失败策略：filter fail-closed / score default-score / no_candidate backoff
 
 **目标 Workload**：burst。高并发同规格请求的资源水位在选点前几乎相同，
-仅靠配额打分无法区分"正在排队创建"的节点，因此创建并发是独立打分维度。
+打散选点（top_n=3、按运行沙箱数最少）负责把突发放置摊开，而不是堆在同一节点。
 
 **质量指标**：
 
@@ -78,15 +75,13 @@ Guards 决定"能不能跑"，策略只决定可行节点之间的优先级。
 **Profile 组成**（`template_reuse`）：
 
 - Score：`image_score`（weight 0.7，模板本地性：节点持有该模板本地副本得满分）+
-  `template_local_pressure`（weight 0.2，同模板在该节点上的在途创建越少分越高，
-  数据来自创建路径登记的 localcache per-(node, template) 计数）+
   `real_time_weighted_average`（weight 0.3，资源水位兜底）
 - 选点：`spread` top_n=3
 - 失败策略：filter fail-closed / score default-score / no_candidate backoff
 
-**目标 Workload**：template_storm。只有"本地性"一个维度时，同模板突发请求
-会在少数副本节点上排队（副本内羊群）；`template_local_pressure` 把同模板创建
-压力在副本节点间分散，是"按同模板创建压力分散"的实现。
+**目标 Workload**：template_storm。本地性占主导时，同模板突发请求会在少数
+副本节点上排队（副本内羊群）；top_n=3 在持有本地副本的高分候选间打散，
+把突发摊到多个副本节点。
 
 **质量指标**：
 
@@ -156,8 +151,6 @@ cube-bench 的参数，不是 schedsim 的）——并由
 - **羊群度窗口**：schedsim 的 `herding_top1_share` 是整轮运行中命中最多
   节点的占比；生产侧 `scheduler_herding_top1_share` 是最近 100 次成功调度
   决策的滚动窗口。
-- **预留**：生产侧的调度与指标会算入在途预留（`node.reserved`）；仿真器
-  不建模"选定节点到 Cubelet 创建返回"之间的预留窗口。
 
 对照实验方法（同一输入、同一环境、不同策略）与三模式（真机实测为主、
 仿真为辅、真机 A/B）见《Cube 最终方案》模块三；量化对比结果见

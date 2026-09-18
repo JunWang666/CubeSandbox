@@ -177,6 +177,17 @@ For the complete CubeMaster scheduler reference, including Cubelet node reports,
 
 After updating `cubemaster.yaml`, restart CubeMaster with your normal deployment procedure so the scheduler loads the new scoring configuration.
 
+## Reservations and Redis
+
+CubeMaster no longer keeps a reservation ledger or performs a synchronous Redis reservation check before dispatch. Each replica uses its local node snapshot and admission checks, while metrics continue to propagate independently. During the reporting window, multiple Masters can therefore admit requests against the same apparent capacity; cross-replica atomic quota admission is not provided.
+
+The `scheduler.reservation_redis_error_policy` setting is obsolete and must be removed from existing configuration.
+
+Redis remains required by other scheduler paths, including node metric reads and post-create metadata writes. Cubelet-side node-wide admission is a separate follow-up design.
+
+
+See [scheduler configuration](./cubemaster-scheduler-config.md) and [scheduler plugins](./scheduler-plugin.md).
+
 ## Connect Clients to the Cluster
 
 Client applications need the CubeAPI control-plane address and a route to sandbox services through CubeProxy. Choose the simplest data-plane access method that fits your client:

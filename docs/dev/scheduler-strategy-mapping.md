@@ -55,19 +55,15 @@ Compatibility is pinned by tests at two levels:
 
 **Profile composition** (`burst_balance`):
 
-- Score: `real_time_weighted_average` (weight 1.0, quota watermark) +
-  `create_concurrency_score` (weight 1.0, in-flight create pressure: the
-  Cubelet-reported `realtime_create_num` plus this Master's local in-flight
-  count scaled by the number of healthy Masters; the lower the share of the
-  create-concurrency limit, the higher the score)
+- Score: `real_time_weighted_average` (weight 1.0, quota watermark)
 - Selection: `spread` with top_n=3, spreading among the top candidates by
   running sandbox count
 - Failure policy: filter fail-closed / score default-score / no_candidate backoff
 
 **Target workload**: burst. Under high concurrency, identically sized requests
-see nearly identical quota watermarks at selection time, so quota scoring alone
-cannot tell apart nodes already queuing creates — in-flight creation pressure is
-a separate scoring dimension.
+see nearly identical quota watermarks at selection time, so the spread picker
+(top_n=3, fewest running sandboxes) is what pushes burst placement apart
+instead of piling onto one node.
 
 **Quality metrics**:
 
@@ -92,18 +88,15 @@ compared to concentrated placement. See the
 **Profile composition** (`template_reuse`):
 
 - Score: `image_score` (weight 0.7, template locality: full score when the node
-  holds a local replica of the template) + `template_local_pressure`
-  (weight 0.2, fewer in-flight creates of the *same* template on the node →
-  higher score; fed by the localcache per-(node, template) counters registered
-  on the create path) + `real_time_weighted_average` (weight 0.3, resource
-  watermark backstop)
+  holds a local replica of the template) + `real_time_weighted_average`
+  (weight 0.3, resource watermark backstop)
 - Selection: `spread` with top_n=3
 - Failure policy: filter fail-closed / score default-score / no_candidate backoff
 
-**Target workload**: template_storm. With locality as the only dimension, a
-same-template burst queues on a few replica nodes (intra-replica herding);
-`template_local_pressure` spreads same-template create pressure across replica
-nodes — this is the "spread by same-template create pressure" requirement.
+**Target workload**: template_storm. With locality as the dominant dimension, a
+same-template burst would queue on a few replica nodes (intra-replica
+herding); top_n=3 spread among the best local-replica candidates is what
+distributes the burst across replica nodes.
 
 **Quality metrics**:
 
@@ -190,9 +183,6 @@ treat schedsim and Prometheus numbers as directly interchangeable:
   node's share of all successful placements in a run; production's
   `scheduler_herding_top1_share` is a rolling window over the last 100
   successful decisions.
-- **Reservations**: production scheduling and metrics account for in-flight
-  reservations (`node.reserved`); the simulator does not model the
-  reservation window between selection and Cubelet create.
 
 For the controlled-experiment method (same input, same environment, different
 strategy) and the three modes (real-cluster primary, simulator secondary,

@@ -26,7 +26,7 @@ scheduler:
       filters:
         - name: skip-high-create
           type: expr
-          expr: "node.creating + node.reserved < 8"
+          expr: "node.creating < 8"
       scores:
         - name: prefer-idle
           type: expr
@@ -39,18 +39,13 @@ scheduler:
         no_candidate: fail
 ```
 
-`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数与在途预留数之和最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
+`selection.method` 决定如何从评分结果中选出最终节点：`highest` 严格选取评分最高的节点；`spread` 在评分最高的前 `top_n` 个候选中确定性选取当前运行沙箱数最少的节点（占用相同时保持评分顺序），用于把放置摊开；`random`（缺省）在前 `top_n` 个候选中按分数加权随机。`top_n: -1` 表示候选范围为全部通过过滤的节点。
 
 自定义 Profile 固定执行 `node_safety`、`cpu`、`mem`、`disk`、`template_locality` 和 `realtime_create_num` Guards，配置不能关闭或重复声明这些安全约束。其中 `node_safety` 会在正常路径和 backoff 路径检查健康度、指标新鲜度、MVM 上限及 CPU load 合法性。
 
-选定节点后，CubeMaster 会重读该节点并原子预留本次请求的 CPU、内存配额、一个 MVM 槽位和一个创建并发槽位，避免并发创建在节点指标更新前反复落到同一节点。预留冲突会换节点有限重选（重试间有短暂指数退避）；Cubelet 创建调用返回后（无论成功或失败）即释放预留，成功场景由下一次节点指标上报接管记账。本副本持有的在途预留数以 `node.reserved` 暴露给插件。
+创建路径不再维护预留账本，也不再执行同步 Redis reservation。CubeMaster 使用本地节点快照执行准入并派发到 Cubelet；指标独立更新，上报窗口内多副本可能重复准入。旧配置中的 `scheduler.reservation_redis_error_policy` 已废弃，应删除。Redis 仍用于节点指标及创建成功后的代理元数据等功能。
 
-多 CubeMaster 副本通过按节点的 Redis 计数协调预留。每个预留携带唯一 token 并记录在按节点的 token 集合中，acquire/release 两个 Lua 脚本基于该 token 幂等：客户端超时后的传输层重试既不会重复记账，也不会重复扣减。副本崩溃残留的预留由安全 TTL（创建超时加一分钟）回收。
-
-Redis 写入本身失败时的行为由显式策略开关 `scheduler.reservation_redis_error_policy` 决定：
-
-- `fail_open`（默认）：保留进程内本地预留，以 `realtime_create_num`  guard 兜底，与引入预留机制前的行为一致。多副本部署注意：副本降级期间，其在途压力对其他副本不可见，跨副本的超卖保护会部分失效。
-- `fail_closed`：回滚本地预留并使本次调度失败。推荐多副本部署使用——宁愿在 Redis 故障期间拒绝创建，也不静默丢失跨副本记账。
+多 Master 继续依赖上报指标和 `realtime_create_num` 的本地并发数乘 Master 数估算，但不再提供跨副本原子容量预留。指标传播期间可能出现并发超额接收。Cubelet 已有创建并发限流和单沙箱 cgroup 限额；节点总配额的原子接收控制属于后续工作，本次未实现。不能假定所有超额 CPU/内存请求都会被 Cubelet 拒绝。
 
 ## 插件类型
 
@@ -60,7 +55,7 @@ Redis 写入本身失败时的行为由显式策略开关 `scheduler.reservation
 
 进程内 Go 插件实现现有 `filter.Selector` 或 `score.Selector` 接口，并在包初始化时调用 `plugin.RegisterGoFilter` / `plugin.RegisterGoScore`。CubeMaster 二进制需导入该包，因此新增 Go 插件后需要重新编译；重复名称会在启动时被拒绝。
 
-CEL 提供基于版本化 protobuf 的强类型只读对象 `node` 与 `request`，未知字段、错误类型运算和不合法返回类型会在 Profile 激活时被拒绝。常用节点字段包括 `cpu_util`、`cpu_load`、`quota_cpu`、`allocated_cpu`、`quota_mem_mb`、`allocated_mem_mb`、`creating`、`local_creating`、`reserved`、`mvm_num`、`labels`、`local_templates`、`template_local` 和 `snapshot_storage_writable`；请求字段包括 `instance_type`、`cpu_millis`、`memory_bytes`、`system_disk_size`、`template_id` 和 `labels`。
+CEL 提供基于版本化 protobuf 的强类型只读对象 `node` 与 `request`，未知字段、错误类型运算和不合法返回类型会在 Profile 激活时被拒绝。常用节点字段包括 `cpu_util`、`cpu_load`、`quota_cpu`、`allocated_cpu`、`quota_mem_mb`、`allocated_mem_mb`、`creating`、`local_creating`、`mvm_num`、`labels`、`local_templates`、`template_local` 和 `snapshot_storage_writable`；请求字段包括 `instance_type`、`cpu_millis`、`memory_bytes`、`system_disk_size`、`template_id` 和 `labels`。
 
 外部插件配置示例：
 
@@ -100,4 +95,4 @@ SOCKET=/tmp/cube-scheduler-example.sock go run ./examples/scheduler-plugin
 
 Profile 引用了上述 Score 但缺少对应 legacy 配置块时，会在**编译期被拒绝**（启动或热更新时报错），不存在静默空转的 Score。零配置注入的出厂 Profile 在 `scheduler_factory.yaml` 中自带配套的 legacy `scheduler.score` 子树，原因正在于此——自定义出厂 Profile 时，权重改在 Profile 条目上，但因子开关仍需保留（或调整）该 legacy 子树。
 
-当某个 Score 插件的评分维度对当前请求不适用时，可返回 `score.ErrNotApplicable` 显式跳过：不贡献分数与权重，也不按失败处理（即使在 `fail-closed` / `default-score` 策略下）。`template_local_pressure` 对不带 `template_id` 的请求即如此。相反，Profile 模式下返回空评分列表加 nil 错误属于违反插件契约，会触发配置的失败策略。
+当某个 Score 插件的评分维度对当前请求不适用时，可返回 `score.ErrNotApplicable` 显式跳过：不贡献分数与权重，也不按失败处理（即使在 `fail-closed` / `default-score` 策略下），例如只对带 `template_id` 的请求才有意义的维度。相反，Profile 模式下返回空评分列表加 nil 错误属于违反插件契约，会触发配置的失败策略。
